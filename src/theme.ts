@@ -484,10 +484,10 @@ export async function applyTheme(
 
   const op = Math.max(0.25, Math.min(1.0, opacity));
   const opExpanded = Math.min(1.0, Math.max(op + 0.18, 0.86));
-  // Large panels (calendar, command center, start menu, launcher) follow the
-  // user's opacity with a small boost for legibility instead of clamping to
-  // near-opaque, so liquid themes stay transparent at rest as well as on hover.
-  const opPanel = Math.min(1.0, Math.max(op + 0.12, 0.55));
+  // Large panels (calendar, command center, start menu, launcher) have their own
+  // opacity so liquid themes can keep them translucent at rest; it follows the
+  // background opacity until the user sets it explicitly.
+  const opPanel = Math.max(0.3, Math.min(1.0, safeFloat(localStorage.getItem('nectar-theme-opacity-panel'), op + 0.12)));
   let surface = '#000000';
   let preloadedSystemAccent: string | undefined;
   root.style.setProperty('--nectar-opacity', String(op));
@@ -668,6 +668,7 @@ export function initTheme(options: { backdrop?: boolean } = {}) {
     'nectar-icon-tile-shape',
     'nectar-icon-tint-excluded',
     'nectar-wallpaper-accent',
+    'nectar-theme-opacity-panel',
   ];
 
   // Sync settings.json in background to avoid flickers (deduplicated per window)
@@ -757,6 +758,7 @@ export function initTheme(options: { backdrop?: boolean } = {}) {
     'nectar-icon-tile-shape',
     'nectar-icon-tint-excluded',
     'nectar-wallpaper-accent',
+    'nectar-theme-opacity-panel',
   ];
 
   const sub = <T,>(ev: string, fn: (e: { payload: T }) => void) => {

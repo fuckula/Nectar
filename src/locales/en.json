@@ -245,6 +245,8 @@
   "appearance.palette.presets": "Quick colors",
   "appearance.opacity": "Background Opacity",
   "appearance.opacity.desc": "How see-through the surfaces are ({percent}%)",
+  "appearance.panelOpacity": "Panel Opacity",
+  "appearance.panelOpacity.desc": "How see-through the start menu, tray bar and launcher panels are ({percent}%)",
   "appearance.saturation": "Color Saturation",
   "appearance.saturation.desc": "How colorful the background is ({percent}%)",
   "appearance.brightness": "Background Brightness",

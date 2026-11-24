@@ -459,6 +459,8 @@ interface AppearanceTabProps {
   handleThemeColorChange: (color: string) => void;
   themeOpacity: number;
   handleOpacityChange: (val: number) => void;
+  themePanelOpacity: number;
+  handlePanelOpacityChange: (val: number) => void;
   themeSaturation: number;
   handleSaturationChange: (val: number) => void;
   themeBrightness: number;
@@ -498,6 +500,8 @@ export function AppearanceTab({
   handleThemeColorChange,
   themeOpacity,
   handleOpacityChange,
+  themePanelOpacity,
+  handlePanelOpacityChange,
   themeSaturation,
   handleSaturationChange,
   themeBrightness,
@@ -1256,6 +1260,23 @@ export function AppearanceTab({
             step="0.05"
             value={themeOpacity}
             onChange={(e) => handleOpacityChange(parseFloat(e.target.value))}
+            className="settings-slider"
+          />
+        </SettingRow>
+
+        <SettingRow
+          icon={Layers}
+          label={t("appearance.panelOpacity")}
+          desc={t("appearance.panelOpacity.desc", { percent: Math.round(themePanelOpacity * 100) })}
+          divider={false}
+        >
+          <input
+            type="range"
+            min="0.3"
+            max="1.0"
+            step="0.05"
+            value={themePanelOpacity}
+            onChange={(e) => handlePanelOpacityChange(parseFloat(e.target.value))}
             className="settings-slider"
           />
         </SettingRow>

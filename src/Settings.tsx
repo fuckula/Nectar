@@ -220,6 +220,8 @@ function SettingsApp() {
               handleThemeColorChange={settings.handleThemeColorChange}
               themeOpacity={settings.themeOpacity}
               handleOpacityChange={settings.handleOpacityChange}
+              themePanelOpacity={settings.themePanelOpacity}
+              handlePanelOpacityChange={settings.handlePanelOpacityChange}
               themeSaturation={settings.themeSaturation}
               handleSaturationChange={settings.handleSaturationChange}
               themeBrightness={settings.themeBrightness}

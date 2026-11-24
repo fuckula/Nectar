@@ -301,6 +301,9 @@ export function useSettings() {
   const [themeOpacity, setThemeOpacity] = useState(() =>
     Math.max(0.35, Math.min(1.0, readFiniteNumber(0.8)(localStorage.getItem("nectar-theme-opacity"))))
   );
+  const [themePanelOpacity, setThemePanelOpacity] = useState(() =>
+    Math.max(0.3, Math.min(1.0, readFiniteNumber(0.57)(localStorage.getItem("nectar-theme-opacity-panel"))))
+  );
   const [themeSaturation, setThemeSaturation] = useState(
     () => readFiniteNumber(0.5)(localStorage.getItem("nectar-theme-saturation"))
   );
@@ -586,6 +589,12 @@ export function useSettings() {
         (v) => Math.max(0.35, Math.min(1.0, readFiniteNumber(0.8)(v))),
         0.8
       );
+      apply(
+        getVal("nectar-theme-opacity-panel"),
+        setThemePanelOpacity,
+        (v) => Math.max(0.3, Math.min(1.0, readFiniteNumber(0.57)(v))),
+        0.57
+      );
       apply(getVal("nectar-theme-saturation"), setThemeSaturation, readFiniteNumber(0.5), 0.5);
       apply(getVal("nectar-theme-brightness"), setThemeBrightness, readFiniteNumber(0.15), 0.15);
       apply(getVal("nectar-theme-style"), setThemeStyle, (v) => v || "solid", "solid");
@@ -786,6 +795,8 @@ export function useSettings() {
     "nectar-theme-color": (v) => setThemeColor(normalizeHexOrDefault(v === null ? null : String(v), "#007aff")),
     "nectar-theme-opacity": (v) =>
       setThemeOpacity(Math.max(0.35, Math.min(1.0, readFiniteNumber(0.8)(v)))),
+    "nectar-theme-opacity-panel": (v) =>
+      setThemePanelOpacity(Math.max(0.3, Math.min(1.0, readFiniteNumber(0.57)(v)))),
     "nectar-theme-saturation": (v) => setThemeSaturation(readFiniteNumber(0.5)(v)),
     "nectar-theme-brightness": (v) => setThemeBrightness(readFiniteNumber(0.15)(v)),
     "nectar-theme-style": (v) => setThemeStyle(v ? String(v) : "solid"),
@@ -1511,6 +1522,12 @@ export function useSettings() {
     queueSettingsBatch({ "nectar-theme-opacity": String(clamped) }, { refreshTheme: true });
   };
 
+  const handlePanelOpacityChange = (value: number) => {
+    const clamped = Math.max(0.3, Math.min(1.0, value));
+    setThemePanelOpacity(clamped);
+    queueSettingsBatch({ "nectar-theme-opacity-panel": String(clamped) }, { refreshTheme: true });
+  };
+
   const handleSaturationChange = (value: number) => {
     setThemeSaturation(value);
     queueSettingsBatch({ "nectar-theme-saturation": String(value) }, { refreshTheme: true });
@@ -1954,6 +1971,8 @@ export function useSettings() {
     handleThemeColorChange,
     themeOpacity,
     handleOpacityChange,
+    themePanelOpacity,
+    handlePanelOpacityChange,
     themeSaturation,
     handleSaturationChange,
     themeBrightness,
