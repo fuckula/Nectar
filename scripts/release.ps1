@@ -70,6 +70,12 @@ Invoke-Step "Installing frontend dependencies" { bun install }
 Invoke-Step "Building Nectar (NSIS update installer)" { bun run tauri build --bundles nsis }
 
 $exe = Join-Path $root "src-tauri/target/release/nectar.exe"
+$wv2 = Join-Path $root "src-tauri/target/release/WebView2Loader.dll"
+if (-not (Test-Path $wv2)) {
+    $wv2Fallback = Join-Path $root "src-tauri/WebView2Loader.dll"
+    if (Test-Path $wv2Fallback) { $wv2 = $wv2Fallback }
+}
+$bundleFiles = if (Test-Path $wv2) { @($exe, $wv2) } else { @($exe) }
 $setup = Join-Path $root "src-tauri/target/release/bundle/nsis/nectar_${Version}_x64-setup.exe"
 foreach ($f in @($exe, $setup, "$setup.sig")) {
     if (-not (Test-Path $f)) { throw "Expected build output not found: $f" }
@@ -77,11 +83,11 @@ foreach ($f in @($exe, $setup, "$setup.sig")) {
 
 Write-Host "`n==> Packaging portable build" -ForegroundColor Cyan
 $portable = "nectar-$Version-portable-windows-x64.zip"
-Compress-Archive -Path $exe -DestinationPath (Join-Path $out $portable)
+Compress-Archive -Path $bundleFiles -DestinationPath (Join-Path $out $portable)
 
 Write-Host "`n==> Packaging installer payload" -ForegroundColor Cyan
 $payload = Join-Path $root "installer-app/src-tauri/payload.zip"
-Compress-Archive -Path $exe -DestinationPath $payload -Force
+Compress-Archive -Path $bundleFiles -DestinationPath $payload -Force
 
 Push-Location installer-app
 try {

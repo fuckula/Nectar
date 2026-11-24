@@ -1,11 +1,12 @@
 import { useSyncExternalStore } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { bridgeInvoke, bridgeListen } from "./utils/tauriBridge";
 import en from "./locales/en.json";
 
 type Messages = Record<string, string>;
 
 export const LANGUAGES: Record<string, { name: string }> = {
   en: { name: "English" },
+  ru: { name: "Русский" },
   tr: { name: "Türkçe" },
   de: { name: "Deutsch" },
   ar: { name: "العربية" },
@@ -25,6 +26,7 @@ function applyDirection(lang: string) {
 }
 
 const LAZY_LOCALES: Record<string, () => Promise<{ default: Messages }>> = {
+  ru: () => import("./locales/ru.json"),
   tr: () => import("./locales/tr.json"),
   de: () => import("./locales/de.json"),
   ar: () => import("./locales/ar.json"),
@@ -52,6 +54,12 @@ function loadIfNeeded(lang: string) {
 
 const STORAGE_KEY = "nectar-language";
 const listeners = new Set<() => void>();
+let localOverride = false;
+let syncStarted = false;
+
+function notify() {
+  listeners.forEach((l) => l());
+}
 
 function readPreference(): string {
   try {
@@ -67,15 +75,68 @@ function resolve(preference: string): string {
   return system in LANGUAGES ? system : "en";
 }
 
+function ensureLanguageSync() {
+  if (syncStarted || typeof window === "undefined") return;
+  syncStarted = true;
+
+  const applySetting = (val: unknown, isLiveEvent: boolean) => {
+    const prev = readPreference();
+    if (typeof val === "string" && val.trim() !== "") {
+      if (isLiveEvent) localOverride = true;
+      try {
+        localStorage.setItem(STORAGE_KEY, val);
+      } catch {
+        // Ignore storage errors
+      }
+      loadIfNeeded(resolve(val));
+      if (val !== prev) notify();
+    } else if (val === null || (isLiveEvent && (val === undefined || val === ""))) {
+      if (isLiveEvent) localOverride = true;
+      try {
+        localStorage.removeItem(STORAGE_KEY);
+      } catch {
+        // Ignore storage errors
+      }
+      loadIfNeeded(resolve("system"));
+      if (prev !== "system") notify();
+    }
+  };
+
+  bridgeInvoke<Record<string, unknown>>("load_settings")
+    .then((settings) => {
+      if (localOverride || !settings || typeof settings !== "object") return;
+      if (Object.prototype.hasOwnProperty.call(settings, STORAGE_KEY)) {
+        applySetting(settings[STORAGE_KEY], false);
+      }
+    })
+    .catch(() => {});
+
+  const onSettingChanged = (payload: { key: string; value: unknown } | null | undefined) => {
+    if (!payload || payload.key !== STORAGE_KEY) return;
+    applySetting(payload.value, true);
+  };
+
+  bridgeListen<{ key: string; value: unknown }>("settings-changed", onSettingChanged).catch(() => {});
+  bridgeListen<{ key: string; value: unknown }>("settings-external-changed", onSettingChanged).catch(() => {});
+  bridgeListen("settings-reset", () => applySetting(null, true)).catch(() => {});
+}
+
+ensureLanguageSync();
+
 export function getLanguagePreference(): string {
   return readPreference();
 }
 
 export function setLanguagePreference(value: string) {
-  localStorage.setItem(STORAGE_KEY, value);
-  invoke("save_setting", { key: STORAGE_KEY, value }).catch(console.error);
+  localOverride = true;
+  try {
+    localStorage.setItem(STORAGE_KEY, value);
+  } catch {
+    // Ignore storage errors
+  }
+  bridgeInvoke("save_setting", { key: STORAGE_KEY, value }).catch(() => {});
   loadIfNeeded(resolve(value));
-  listeners.forEach((l) => l());
+  notify();
 }
 
 export function t(key: string, params?: Record<string, string | number>): string {
@@ -109,6 +170,7 @@ export function timeAgo(ms: number | null, translate: (key: string, params?: Rec
 }
 
 function subscribe(listener: () => void) {
+  ensureLanguageSync();
   listeners.add(listener);
   loadIfNeeded(resolve(readPreference()));
   // Other windows change the setting through localStorage.

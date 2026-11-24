@@ -1,10 +1,13 @@
 export { useSettings } from "./useSettings";
 export { SettingRow } from "./SettingRow";
+export { ColorPalettePicker } from "./ColorPalettePicker";
 export { GeneralTab } from "./GeneralTab";
 export { AppearanceTab } from "./AppearanceTab";
 export { NotchTab } from "./NotchTab";
 export { CalendarSyncPage } from "./CalendarSyncPage";
 export { DockTab } from "./DockTab";
+export { LauncherTab } from "./LauncherTab";
+export { StartTab } from "./StartTab";
 export { OverlaysTab } from "./OverlaysTab";
 export { ProcessesTab } from "./ProcessesTab";
 export { AboutTab } from "./AboutTab";

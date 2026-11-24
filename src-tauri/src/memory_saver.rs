@@ -1,4 +1,3 @@
-
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
@@ -13,29 +12,51 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-const SETTLE_MS: i64 = 3_000;
-
-const RETRIM_MS: i64 = 2_000;
-
-const MEDIA_RETRIM_MS: i64 = 15_000;
-
+const SETTLE_MS: i64 = 4_000;
+const LONG_IDLE_RETRIM_MS: i64 = 180_000;
 const STARTUP_GRACE_MS: i64 = 8_000;
 
 static BUSY: AtomicBool = AtomicBool::new(false);
-
 static LAST_INTERACTION_MS: AtomicI64 = AtomicI64::new(0);
-
+static INTERACTION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static TRIM_SOON: AtomicBool = AtomicBool::new(false);
-
 static STARTED_AT_MS: AtomicI64 = AtomicI64::new(0);
 
+#[derive(Debug, Default)]
+pub struct IdleTrimState {
+    last_trimmed_seq: u64,
+    last_trim_ms: i64,
+}
+
+impl IdleTrimState {
+    pub fn should_trim(&mut self, interaction_seq: u64, now_ms: i64, forced: bool) -> bool {
+        if forced {
+            self.last_trimmed_seq = interaction_seq;
+            self.last_trim_ms = now_ms;
+            return true;
+        }
+        if self.last_trimmed_seq != interaction_seq {
+            self.last_trimmed_seq = interaction_seq;
+            self.last_trim_ms = now_ms;
+            return true;
+        }
+        if now_ms.saturating_sub(self.last_trim_ms) >= LONG_IDLE_RETRIM_MS {
+            self.last_trim_ms = now_ms;
+            return true;
+        }
+        false
+    }
+}
+
 pub fn init() {
-    STARTED_AT_MS.store(crate::utils::get_now_ms(), Ordering::Relaxed);
-    LAST_INTERACTION_MS.store(crate::utils::get_now_ms(), Ordering::Relaxed);
+    let now = crate::utils::get_now_ms();
+    STARTED_AT_MS.store(now, Ordering::Relaxed);
+    LAST_INTERACTION_MS.store(now, Ordering::Relaxed);
 }
 
 pub fn mark_interaction() {
     LAST_INTERACTION_MS.store(crate::utils::get_now_ms(), Ordering::Relaxed);
+    INTERACTION_SEQ.fetch_add(1, Ordering::Relaxed);
     TRIM_SOON.store(false, Ordering::Relaxed);
 }
 
@@ -45,6 +66,11 @@ pub fn set_busy(busy: bool) {
 
 pub fn trim_soon() {
     TRIM_SOON.store(true, Ordering::Relaxed);
+}
+
+pub fn trim_now() -> u32 {
+    mark_interaction();
+    trim_tree() as u32
 }
 
 fn system_idle_ms() -> i64 {
@@ -152,28 +178,27 @@ pub fn trim_tree() -> usize {
     trimmed
 }
 
-fn ram_saver_enabled(app: &tauri::AppHandle) -> bool {
-    crate::utils::get_setting_str(app, "nectar-ram-saver")
-        .map(|v| v == "true")
-        .unwrap_or(false)
-}
-
-pub fn start_reclaim_worker(app: tauri::AppHandle) {
+pub fn start_reclaim_worker(_app: tauri::AppHandle) {
     std::thread::Builder::new()
         .name("nectar-mem".into())
         .spawn(move || {
-            let mut last_trim = 0i64;
+            let mut trim_state = IdleTrimState::default();
 
             loop {
-                std::thread::sleep(Duration::from_millis(1_000));
+                let ram_saver = crate::state::RAM_SAVER_ENABLED.load(Ordering::Relaxed);
+                let sleep_ms = if ram_saver { 2_000 } else { 5_000 };
+                std::thread::sleep(Duration::from_millis(sleep_ms));
+
+                if crate::state::SHUTTING_DOWN.load(Ordering::Relaxed) {
+                    continue;
+                }
 
                 let now = crate::utils::get_now_ms();
-
                 if now.saturating_sub(STARTED_AT_MS.load(Ordering::Relaxed)) < STARTUP_GRACE_MS {
                     continue;
                 }
 
-                if !ram_saver_enabled(&app) {
+                if !ram_saver {
                     continue;
                 }
 
@@ -196,25 +221,38 @@ pub fn start_reclaim_worker(app: tauri::AppHandle) {
                 let since_interaction = now.saturating_sub(LAST_INTERACTION_MS.load(Ordering::Relaxed));
                 let idle = since_interaction.min(system_idle_ms());
 
-                if idle < SETTLE_MS {
+                if !forced && idle < SETTLE_MS {
                     continue;
                 }
 
-                let retrim = if crate::state::ANY_MEDIA_PLAYING.load(Ordering::Relaxed) {
-                    MEDIA_RETRIM_MS
-                } else {
-                    RETRIM_MS
-                };
-                if !forced && now.saturating_sub(last_trim) < retrim {
-                    continue;
+                let seq = INTERACTION_SEQ.load(Ordering::Relaxed);
+                if trim_state.should_trim(seq, now, forced) {
+                    let _ = trim_tree();
                 }
-
-                last_trim = now;
-                let trimmed = trim_tree();
-                crate::diagnostics::log(&format!(
-                    "idle reclaim: trimmed {trimmed} processes"
-                ));
             }
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_saver_idle_state() {
+        let mut state = IdleTrimState::default();
+        assert!(state.should_trim(1, 10_000, false));
+        // Repeated polls in the same idle episode must NOT thrash EmptyWorkingSet every 2s.
+        assert!(!state.should_trim(1, 12_000, false));
+        assert!(!state.should_trim(1, 100_000, false));
+        // Long idle gentle retrim triggers after 180s.
+        assert!(state.should_trim(1, 190_000, false));
+        assert!(!state.should_trim(1, 195_000, false));
+        // New user interaction sequence resets so next idle trims cleanly once.
+        assert!(state.should_trim(2, 200_000, false));
+        assert!(!state.should_trim(2, 202_000, false));
+        // Forced trim-on-hide always succeeds once.
+        assert!(state.should_trim(2, 203_000, true));
+        assert!(!state.should_trim(2, 205_000, false));
+    }
 }

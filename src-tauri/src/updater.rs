@@ -1,24 +1,35 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_updater::{UpdaterBuilder, UpdaterExt};
 
 /// Minimum time between background update checks. Manual checks bypass this.
+#[allow(dead_code)]
 const CHECK_INTERVAL_SECS: i64 = 24 * 60 * 60;
 /// Network timeout for a single manifest request.
+#[allow(dead_code)]
 const CHECK_TIMEOUT_SECS: u64 = 10;
 /// A release must be at least this old before auto-update installs it, so a
 /// broken release cannot reach everyone within minutes of being published.
+#[allow(dead_code)]
 const MIN_AUTO_INSTALL_AGE_SECS: i64 = 24 * 60 * 60;
+#[allow(dead_code)]
 const STATE_FILE: &str = "update-state.json";
+#[allow(dead_code)]
 const RELEASES_API: &str = "https://api.github.com/repos/kua8/Nectar/releases?per_page=10";
+/// Custom Nectar fork protection: blocks upstream `kua8/Nectar` checks & silent overwrites.
+pub const UPSTREAM_UPDATER_DISABLED: bool = true;
 
-/// Serializes manifest requests so concurrent callers share a single network hit.
+pub fn is_disabled_for_fork() -> bool {
+    UPSTREAM_UPDATER_DISABLED
+}
+
+#[allow(dead_code)]
 static CHECK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[allow(dead_code)]
 static UPDATE_BUSY: AtomicBool = AtomicBool::new(false);
 static LAST_CHECK: Mutex<Option<UpdateCheckResult>> = Mutex::new(None);
 
@@ -43,48 +54,7 @@ struct PersistedUpdateState {
     channel: String,
 }
 
-fn prerelease_channel(app: &AppHandle) -> bool {
-    crate::utils::get_setting_str(app, "nectar-update-channel").as_deref() == Some("prerelease")
-}
-
-fn channel_name(app: &AppHandle) -> &'static str {
-    if prerelease_channel(app) { "prerelease" } else { "stable" }
-}
-
-/// Manifest of the newest release, pre-releases included (GitHub's `latest` skips them).
-async fn newest_release_manifest() -> Option<tauri::Url> {
-    let client = reqwest::Client::builder()
-        .user_agent("Nectar")
-        .timeout(Duration::from_secs(CHECK_TIMEOUT_SECS))
-        .build()
-        .ok()?;
-    let body = client.get(RELEASES_API).send().await.ok()?.text().await.ok()?;
-    let releases: Vec<serde_json::Value> = serde_json::from_str(&body).ok()?;
-    releases
-        .iter()
-        .filter(|release| release["draft"] != true)
-        .find_map(|release| {
-            release["assets"].as_array()?.iter().find_map(|asset| {
-                (asset["name"] == "latest.json")
-                    .then(|| asset["browser_download_url"].as_str())
-                    .flatten()
-                    .and_then(|url| url.parse().ok())
-            })
-        })
-}
-
-/// Updater for the chosen channel, falling back to stable if the release list cannot be read.
-async fn channel_updater(app: &AppHandle) -> UpdaterBuilder {
-    let builder = app.updater_builder();
-    if !prerelease_channel(app) {
-        return builder;
-    }
-    match newest_release_manifest().await {
-        Some(url) => builder.endpoints(vec![url]).unwrap_or_else(|_| app.updater_builder()),
-        None => builder,
-    }
-}
-
+#[allow(dead_code)]
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -92,6 +62,7 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+#[allow(dead_code)]
 fn state_path(app: &AppHandle) -> Option<PathBuf> {
     app.path()
         .app_config_dir()
@@ -99,6 +70,7 @@ fn state_path(app: &AppHandle) -> Option<PathBuf> {
         .map(|dir| dir.join(STATE_FILE))
 }
 
+#[allow(dead_code)]
 fn read_state(app: &AppHandle) -> PersistedUpdateState {
     state_path(app)
         .and_then(|path| std::fs::read_to_string(path).ok())
@@ -106,17 +78,7 @@ fn read_state(app: &AppHandle) -> PersistedUpdateState {
         .unwrap_or_default()
 }
 
-fn write_state(app: &AppHandle, state: &PersistedUpdateState) {
-    if let Some(path) = state_path(app) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(content) = serde_json::to_string(state) {
-            let _ = std::fs::write(path, content);
-        }
-    }
-}
-
+#[allow(dead_code)]
 fn result_from_state(state: &PersistedUpdateState) -> UpdateCheckResult {
     if state.version.is_empty() {
         return UpdateCheckResult::default();
@@ -129,19 +91,7 @@ fn result_from_state(state: &PersistedUpdateState) -> UpdateCheckResult {
     }
 }
 
-/// Returns a cached result only when the last check is recent and was made
-/// against the version currently running (so updating invalidates the cache).
-fn cached_result(app: &AppHandle) -> Option<UpdateCheckResult> {
-    let state = read_state(app);
-    if state.last_check == 0 || now_secs() - state.last_check >= CHECK_INTERVAL_SECS {
-        return None;
-    }
-    if state.app_version != app.package_info().version.to_string() || state.channel != channel_name(app) {
-        return None;
-    }
-    Some(result_from_state(&state))
-}
-
+#[allow(dead_code)]
 pub fn release_is_old_enough(result: &UpdateCheckResult) -> bool {
     match result.date.as_deref().and_then(parse_rfc3339_utc) {
         Some(published) => now_secs() - published >= MIN_AUTO_INSTALL_AGE_SECS,
@@ -149,211 +99,23 @@ pub fn release_is_old_enough(result: &UpdateCheckResult) -> bool {
     }
 }
 
-/// Checks for an update at most once per `CHECK_INTERVAL_SECS` unless `force`
-/// is set. Development builds skip the automatic network check because their
-/// version never tracks releases; manual checks still work.
-pub async fn check(app: &AppHandle, force: bool) -> Result<UpdateCheckResult, String> {
-    if !force {
-        if let Some(cached) = cached_result(app) {
-            return Ok(cached);
-        }
-        #[cfg(debug_assertions)]
-        {
-            return Ok(UpdateCheckResult::default());
-        }
-    }
-
-    let _guard = CHECK_LOCK.lock().await;
-
-    // Another caller may have completed a check while we waited for the lock.
-    if !force {
-        if let Some(cached) = cached_result(app) {
-            return Ok(cached);
-        }
-    }
-
-    let updater = channel_updater(app).await.build().map_err(|e| e.to_string())?;
-    let update = tokio::time::timeout(Duration::from_secs(CHECK_TIMEOUT_SECS), updater.check())
-        .await
-        .map_err(|_| "update check timed out".to_string())?
-        .map_err(|e| e.to_string())?;
-
-    let result = match &update {
-        Some(update) => UpdateCheckResult {
-            available: true,
-            version: Some(update.version.clone()),
-            date: update
-                .raw_json
-                .get("pub_date")
-                .and_then(|value| value.as_str())
-                .map(str::to_string),
-            body: update.body.clone(),
-        },
-        None => UpdateCheckResult::default(),
-    };
-
-    write_state(
-        app,
-        &PersistedUpdateState {
-            last_check: now_secs(),
-            app_version: app.package_info().version.to_string(),
-            version: result.version.clone().unwrap_or_default(),
-            date: result.date.clone().unwrap_or_default(),
-            channel: channel_name(app).to_string(),
-        },
-    );
-    if let Ok(mut cached) = LAST_CHECK.lock() {
-        *cached = Some(result.clone());
-    }
-    Ok(result)
+/// Checks for an update — disabled on this custom Nectar fork.
+pub async fn check(_app: &AppHandle, _force: bool) -> Result<UpdateCheckResult, String> {
+    Ok(UpdateCheckResult::default())
 }
 
-/// Downloads and installs the available update. On Windows the updater plugin
-/// launches the NSIS installer and terminates this process, which then
-/// relaunches the app; on other platforms this returns after restarting.
-pub async fn install(app: &AppHandle) -> Result<(), String> {
-    if !is_installed_copy() {
-        crate::diagnostics::log("update: this copy is not installed (portable or development build), opening the release page instead of running the installer");
-        let _ = tauri_plugin_opener::open_url(RELEASES_PAGE, None::<&str>);
-        let _ = app.emit("auto-update-status", serde_json::json!({ "status": "done" }));
-        return Ok(());
-    }
-    if UPDATE_BUSY.swap(true, Ordering::SeqCst) {
-        return Err("an update is already in progress".to_string());
-    }
-    let result = install_inner(app).await;
-    UPDATE_BUSY.store(false, Ordering::SeqCst);
-    if let Err(e) = &result {
-        crate::diagnostics::log(&format!("update install failed: {e}"));
-    }
-    result
+/// Downloads and installs an update — disabled on this custom Nectar fork.
+pub async fn install(_app: &AppHandle) -> Result<(), String> {
+    Err("Upstream auto-updates are disabled on this custom Nectar fork.".to_string())
 }
 
-const RELEASES_PAGE: &str = "https://github.com/kua8/Nectar/releases/latest";
-
-fn is_installed_copy() -> bool {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(PathBuf::from))
-        .is_some_and(|dir| crate::uninstall_registry::install_scope(&dir).is_some())
-}
-
-fn installer_scope_args() -> Vec<String> {
-    let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)) else { return Vec::new() };
-    let Some(all_users) = crate::uninstall_registry::install_scope(&dir) else { return Vec::new() };
-    vec![
-        if all_users { "/ALLUSERS" } else { "/CURRENTUSER" }.to_string(),
-        format!("/D={}", dir.display()),
-    ]
-}
-
-fn install_needs_unavailable_elevation() -> bool {
-    let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)) else { return false };
-    crate::uninstall_registry::install_scope(&dir) == Some(true) && !crate::native_uninstall::is_elevated()
-}
-
-async fn install_inner(app: &AppHandle) -> Result<(), String> {
-    // Hold the check lock so a concurrent check cannot mutate state mid-install.
-    let _guard = CHECK_LOCK.lock().await;
-
-    let hook_handle = app.clone();
-    let updater = channel_updater(app)
-        .await
-        .installer_args(installer_scope_args())
-        .on_before_exit(move || {
-            crate::state::SHUTTING_DOWN.store(true, Ordering::Relaxed);
-            let _ = hook_handle.emit("auto-update-status", serde_json::json!({ "status": "installing" }));
-            hook_handle.cleanup_before_exit();
-        })
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let update = updater
-        .check()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "no update available".to_string())?;
-
-    let _ = app.emit("auto-update-status", serde_json::json!({ "status": "downloading", "progress": 0 }));
-
-    let progress_handle = app.clone();
-    let downloaded = Arc::new(AtomicU64::new(0));
-    let downloaded_cb = downloaded.clone();
-    update
-        .download_and_install(
-            move |chunk_len, total| {
-                let current = downloaded_cb.fetch_add(chunk_len as u64, Ordering::Relaxed) + chunk_len as u64;
-                if let Some(total) = total {
-                    if total > 0 {
-                        let progress = (current.saturating_mul(100) / total) as u32;
-                        let _ = progress_handle.emit(
-                            "auto-update-status",
-                            serde_json::json!({ "status": "downloading", "progress": progress }),
-                        );
-                    }
-                }
-            },
-            || {},
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Windows: `download_and_install` launches the installer and exits inside
-    // the plugin, so this is only reached on other platforms.
-    #[cfg(not(windows))]
-    {
-        let _ = app.emit("auto-update-status", serde_json::json!({ "status": "done" }));
-        app.restart()
-    }
-
-    #[cfg(windows)]
-    Ok(())
-}
-
-/// Startup entry point: always checks so the UI can show an update badge, and
-/// auto-installs only when the user enabled it and the release has aged.
+/// Startup entry point: upstream checks disabled for custom fork safety.
 pub async fn run_startup_check(app: AppHandle) {
-    let auto_update = crate::utils::get_setting_str(&app, "nectar-auto-update").as_deref() == Some("true");
-
-    if auto_update {
-        let _ = app.emit("auto-update-status", serde_json::json!({ "status": "checking" }));
-    }
-
-    let ready_to_install = |result: &UpdateCheckResult| prerelease_channel(&app) || release_is_old_enough(result);
-
-    let result = match check(&app, false).await {
-        Ok(result) => result,
-        Err(_) => {
-            if auto_update {
-                let _ = app.emit("auto-update-status", serde_json::json!({ "status": "done" }));
-            }
-            return;
-        }
-    };
-
-    let _ = app.emit("update-available", &result);
-
-    if !result.available {
-        if auto_update {
-            let _ = app.emit("auto-update-status", serde_json::json!({ "status": "done" }));
-        }
+    if UPSTREAM_UPDATER_DISABLED {
+        let _ = app.emit("update-available", &UpdateCheckResult::default());
         return;
     }
-
-    if auto_update && ready_to_install(&result) && !is_installed_copy() {
-        crate::diagnostics::log("auto-update: skipping silent install, this copy is not installed (portable or development build); leaving update available");
-        let _ = app.emit("auto-update-status", serde_json::json!({ "status": "done" }));
-    } else if auto_update && ready_to_install(&result) && install_needs_unavailable_elevation() {
-        crate::diagnostics::log("auto-update: skipping silent install, all-users install needs elevation this process doesn't have; leaving update available for manual install");
-        let _ = app.emit("auto-update-status", serde_json::json!({ "status": "done" }));
-    } else if auto_update && ready_to_install(&result) {
-        // On Windows this never returns: the installer exits the process.
-        if install(&app).await.is_err() {
-            let _ = app.emit("auto-update-status", serde_json::json!({ "status": "done" }));
-        }
-    } else if auto_update {
-        let _ = app.emit("auto-update-status", serde_json::json!({ "status": "done" }));
-    }
+    let _ = Duration::from_secs(CHECK_TIMEOUT_SECS);
 }
 
 #[tauri::command]
@@ -369,13 +131,16 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn get_update_state(app: AppHandle) -> UpdateCheckResult {
+pub fn get_update_state(_app: AppHandle) -> UpdateCheckResult {
+    if UPSTREAM_UPDATER_DISABLED {
+        return UpdateCheckResult::default();
+    }
     if let Ok(cached) = LAST_CHECK.lock() {
         if let Some(result) = cached.as_ref() {
             return result.clone();
         }
     }
-    result_from_state(&read_state(&app))
+    UpdateCheckResult::default()
 }
 
 fn parse_rfc3339_utc(value: &str) -> Option<i64> {
@@ -432,5 +197,11 @@ mod tests {
     fn computes_civil_days() {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(2026, 9, 13), 20_709);
+    }
+
+    #[test]
+    fn updater_is_disabled_for_fork() {
+        assert!(super::UPSTREAM_UPDATER_DISABLED);
+        assert!(super::is_disabled_for_fork());
     }
 }

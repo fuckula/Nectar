@@ -45,8 +45,8 @@ fn run_once_key(all_users: bool) -> &'static str {
     }
 }
 
-// Files Nectar itself puts in the install folder (the payload is just nectar.exe)
-const APP_FILES: &[&str] = &["nectar.exe", "uninstall.exe", ".install-scope"];
+// Files Nectar itself puts in the install folder
+const APP_FILES: &[&str] = &["nectar.exe", "WebView2Loader.dll", "uninstall.exe", ".install-scope"];
 
 // True when the folder belongs to Nectar alone and can be removed as a whole.
 // The installer extracts straight into the picked folder, so it may be shared (e.g. D:\Apps).

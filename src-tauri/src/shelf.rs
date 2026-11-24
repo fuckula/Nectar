@@ -9,7 +9,7 @@ use windows::core::{implement, Ref, BOOL};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, POINTL};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{
-    CoInitializeEx, IDataObject, COINIT_APARTMENTTHREADED, DVASPECT_CONTENT, FORMATETC,
+    CoInitializeEx, CoUninitialize, IDataObject, COINIT_APARTMENTTHREADED, DVASPECT_CONTENT, FORMATETC,
     TYMED_HGLOBAL,
 };
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
@@ -18,15 +18,32 @@ use windows::Win32::System::Ole::{
     CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE,
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
-use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
+use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::EnumChildWindows;
 const MAX_TEXT_UNITS: usize = 1 << 17;
 struct TargetStore(#[allow(dead_code)] Vec<IDropTarget>);
 unsafe impl Send for TargetStore {}
 
+struct StaApartmentGuard(bool);
+
+impl StaApartmentGuard {
+    fn init() -> Self {
+        let ok = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
+        Self(ok)
+    }
+}
+
+impl Drop for StaApartmentGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
 static SHELF_DROP_TARGETS: Mutex<Option<TargetStore>> = Mutex::new(None);
 enum DragPayload {
-    Files(Vec<String>, HDROP),
+    Files(Vec<String>),
     Text(String),
 }
 
@@ -42,12 +59,12 @@ struct ShelfDropTarget {
 
 impl ShelfDropTarget {
     unsafe fn extract(data: &IDataObject) -> Option<DragPayload> {
-        if let Some((paths, hdrop)) = unsafe { Self::extract_files(data) } {
-            return Some(DragPayload::Files(paths, hdrop));
+        if let Some(paths) = unsafe { Self::extract_files(data) } {
+            return Some(DragPayload::Files(paths));
         }
         unsafe { Self::extract_text(data) }.map(DragPayload::Text)
     }
-    unsafe fn extract_files(data: &IDataObject) -> Option<(Vec<String>, HDROP)> {
+    unsafe fn extract_files(data: &IDataObject) -> Option<Vec<String>> {
         let format = FORMATETC {
             cfFormat: CF_HDROP.0,
             ptd: std::ptr::null_mut(),
@@ -55,11 +72,11 @@ impl ShelfDropTarget {
             lindex: -1,
             tymed: TYMED_HGLOBAL.0 as u32,
         };
-        let medium = data.GetData(&format).ok()?;
+        let mut medium = data.GetData(&format).ok()?;
         let hdrop = HDROP(medium.u.hGlobal.0 as _);
         let count = DragQueryFileW(hdrop, 0xFFFFFFFF, None);
         if count == 0 {
-            unsafe { DragFinish(hdrop) };
+            ReleaseStgMedium(&mut medium);
             return None;
         }
         let mut paths = Vec::with_capacity(count as usize);
@@ -69,7 +86,8 @@ impl ShelfDropTarget {
             DragQueryFileW(hdrop, i, Some(&mut buf));
             paths.push(String::from_utf16_lossy(&buf[..len]));
         }
-        Some((paths, hdrop))
+        ReleaseStgMedium(&mut medium);
+        Some(paths)
     }
     unsafe fn extract_text(data: &IDataObject) -> Option<String> {
         let format = FORMATETC {
@@ -132,11 +150,6 @@ impl IDropTarget_Impl for ShelfDropTarget_Impl {
             let has_files = pdata
                 .as_ref()
                 .and_then(|data| unsafe { ShelfDropTarget::extract(data) })
-                .map(|payload| {
-                    if let DragPayload::Files(_, hdrop) = payload {
-                        unsafe { DragFinish(hdrop) };
-                    }
-                })
                 .is_some();
             unsafe {
                 *self.enter_valid.get() = has_files;
@@ -168,12 +181,11 @@ impl IDropTarget_Impl for ShelfDropTarget_Impl {
 
         let point = unsafe { self.client_point(pt) };
         match payload {
-            DragPayload::Files(paths, hdrop) => {
+            DragPayload::Files(paths) => {
                 let _ = self.app.emit(
                     "shelf-drag-enter",
                     serde_json::json!({ "label": self.label, "paths": paths, "position": { "x": point.x, "y": point.y } }),
                 );
-                unsafe { DragFinish(hdrop) };
             }
             DragPayload::Text(text) => {
                 let _ = self.app.emit(
@@ -234,11 +246,10 @@ impl IDropTarget_Impl for ShelfDropTarget_Impl {
                 .as_ref()
                 .and_then(|data| unsafe { ShelfDropTarget::extract(data) });
             match payload {
-                Some(DragPayload::Files(paths, hdrop)) => {
+                Some(DragPayload::Files(paths)) => {
                     let _ = self
                         .app
                         .emit("shelf-drag-drop", serde_json::json!({ "label": self.label, "paths": paths }));
-                    unsafe { DragFinish(hdrop) };
                 }
                 Some(DragPayload::Text(text)) => {
                     let _ = self
@@ -265,6 +276,7 @@ pub fn setup(app: &AppHandle) {
         BOOL(1)
     }
 
+    let _sta = StaApartmentGuard::init();
     let mut all_targets: Vec<IDropTarget> = Vec::new();
     for (label, win) in app.webview_windows() {
         let dock = crate::state::is_dock_label(&label);
@@ -273,7 +285,6 @@ pub fn setup(app: &AppHandle) {
         }
         let Ok(hwnd) = win.hwnd() else { continue };
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             let mut ctx = Ctx { app: app.clone(), label, dock, targets: Vec::new() };
             inject(hwnd, app, &ctx.label, dock, &mut ctx.targets);
             let _ = EnumChildWindows(Some(hwnd), Some(child_proc), LPARAM(&mut ctx as *mut Ctx as isize));

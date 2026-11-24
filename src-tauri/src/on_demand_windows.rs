@@ -1,10 +1,9 @@
-
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 pub const SETTINGS: &str = "settings";
 pub const CALENDAR: &str = "calendar";
@@ -12,12 +11,22 @@ pub const CALENDAR: &str = "calendar";
 static SETTINGS_BUILDING: AtomicBool = AtomicBool::new(false);
 static CALENDAR_BUILDING: AtomicBool = AtomicBool::new(false);
 static WAITING_FOR_PAINT: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
+static PENDING_SETTINGS_TAB: Mutex<Option<String>> = Mutex::new(None);
 
 const PAINT_WAIT: Duration = Duration::from_millis(2500);
 
 fn take_waiting(label: &str) -> bool {
-    let Ok(mut guard) = WAITING_FOR_PAINT.lock() else { return false };
+    let Ok(mut guard) = WAITING_FOR_PAINT.lock() else {
+        return false;
+    };
     guard.as_mut().is_some_and(|set| set.remove(label))
+}
+
+fn is_waiting(label: &str) -> bool {
+    let Ok(guard) = WAITING_FOR_PAINT.lock() else {
+        return false;
+    };
+    guard.as_ref().is_some_and(|set| set.contains(label))
 }
 
 fn start_waiting(label: &'static str) {
@@ -72,6 +81,12 @@ fn building_flag(label: &str) -> Option<&'static AtomicBool> {
     }
 }
 
+fn hide_window(win: &WebviewWindow) {
+    let _ = win.hide();
+    crate::webview_memory::set_low_memory(win, true);
+    crate::memory_saver::trim_soon();
+}
+
 fn build(app: &AppHandle, spec: &Spec) -> Option<WebviewWindow> {
     let window = WebviewWindowBuilder::new(app, spec.label, WebviewUrl::App(spec.url.into()))
         .title(spec.title)
@@ -94,24 +109,25 @@ fn build(app: &AppHandle, spec: &Spec) -> Option<WebviewWindow> {
         .ok()?;
 
     #[cfg(target_os = "windows")]
-    {
+    if spec.label != SETTINGS {
         let _ = window_vibrancy::apply_acrylic(&window, Some((10, 10, 15, 20)));
     }
     if let Ok(hwnd) = window.hwnd() {
-        crate::active_look::keep_active_look(hwnd);
+        let hwnd_raw = hwnd.0 as isize;
+        let _ = app.run_on_main_thread(move || {
+            crate::active_look::keep_active_look(windows::Win32::Foundation::HWND(hwnd_raw as *mut _));
+        });
     }
 
     let win = window.clone();
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
-            let _ = win.hide();
-            set_memory_level(&win, true);
-            set_suspended(&win, true);
-            crate::memory_saver::trim_soon();
+            hide_window(&win);
         }
     });
 
+    crate::services::attach_webview_crash_watcher(app, &window);
     Some(window)
 }
 
@@ -119,12 +135,16 @@ pub fn open(app: &AppHandle, label: &str) {
     crate::memory_saver::mark_interaction();
 
     if let Some(win) = app.get_webview_window(label) {
-        present(&win);
+        present_on_main(app, win);
         return;
     }
 
-    let Some(spec) = spec_for(label) else { return };
-    let Some(flag) = building_flag(label) else { return };
+    let Some(spec) = spec_for(label) else {
+        return;
+    };
+    let Some(flag) = building_flag(label) else {
+        return;
+    };
 
     if flag.swap(true, Ordering::SeqCst) {
         return;
@@ -132,85 +152,123 @@ pub fn open(app: &AppHandle, label: &str) {
 
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Some(win) = build(&app, spec) {
-            start_waiting(spec.label);
+        start_waiting(spec.label);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let app_for_build = app.clone();
+        let built = if app
+            .run_on_main_thread(move || {
+                let _ = tx.send(build(&app_for_build, spec));
+            })
+            .is_ok()
+        {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                Ok(Ok(win)) => win,
+                Ok(Err(_)) => None,
+                Err(_) => {
+                    crate::diagnostics::log(&format!(
+                        "on_demand_windows: build timed out for {}",
+                        spec.label
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(win) = built {
             tokio::time::sleep(PAINT_WAIT).await;
             if take_waiting(spec.label) {
-                present(&win);
+                present_on_main(&app, win);
             }
+        } else {
+            let _ = take_waiting(spec.label);
         }
         flag.store(false, Ordering::SeqCst);
     });
 }
 
+pub fn open_settings_with_tab(app: &AppHandle, tab: Option<String>) {
+    let clean_tab = tab
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+
+    if let Some(win) = app.get_webview_window(SETTINGS) {
+        if is_waiting(SETTINGS) {
+            if let Ok(mut pending) = PENDING_SETTINGS_TAB.lock() {
+                *pending = clean_tab;
+            }
+            present_on_main(app, win);
+            return;
+        }
+        if let Ok(mut pending) = PENDING_SETTINGS_TAB.lock() {
+            *pending = None;
+        }
+        present_on_main(app, win);
+        if let Some(target_tab) = clean_tab {
+            let _ = app.emit_to(SETTINGS, "settings-navigate", target_tab);
+        }
+        return;
+    }
+
+    if let Ok(mut pending) = PENDING_SETTINGS_TAB.lock() {
+        *pending = clean_tab;
+    }
+    open(app, SETTINGS);
+}
+
+fn present_on_main(app: &AppHandle, win: WebviewWindow) {
+    let _ = app.run_on_main_thread(move || {
+        present(&win);
+    });
+}
+
 fn present(win: &WebviewWindow) {
-    set_suspended(win, false);
-    set_memory_level(win, false);
+    crate::webview_memory::set_low_memory(win, false);
     let _ = win.show();
-    let _ = win.unminimize();
-    let _ = win.set_focus();
     if let Ok(hwnd) = win.hwnd() {
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{
-                SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+                IsIconic, ShowWindow, SW_RESTORE, SW_SHOW,
             };
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = ShowWindow(hwnd, SW_RESTORE);
-            let _ = SetForegroundWindow(hwnd);
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            } else {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+            }
         }
+        let raw_hwnd = hwnd.0 as isize;
+        let _ = std::thread::Builder::new()
+            .name("nectar-ondemand-fg".into())
+            .spawn(move || {
+                let _ = crate::utils::force_foreground(windows::Win32::Foundation::HWND(
+                    raw_hwnd as *mut _,
+                ));
+            });
     }
-}
-
-fn set_memory_level(win: &WebviewWindow, low: bool) {
-    let _ = win.with_webview(move |webview| unsafe {
-        use webview2_com::Microsoft::Web::WebView2::Win32::{
-            ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
-            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
-        };
-        use windows_core::Interface;
-
-        let Ok(core) = webview.controller().CoreWebView2() else {
-            return;
-        };
-        let Ok(core) = core.cast::<ICoreWebView2_19>() else {
-            return;
-        };
-        let level = if low {
-            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
-        } else {
-            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
-        };
-        let _ = core.SetMemoryUsageTargetLevel(level);
-    });
-}
-
-fn set_suspended(win: &WebviewWindow, suspend: bool) {
-    let _ = win.with_webview(move |webview| unsafe {
-        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_3;
-        use windows_core::Interface;
-
-        let Ok(core) = webview.controller().CoreWebView2() else {
-            return;
-        };
-        let Ok(core) = core.cast::<ICoreWebView2_3>() else {
-            return;
-        };
-
-        if suspend {
-            let _ = core.TrySuspend(
-                &webview2_com::TrySuspendCompletedHandler::create(Box::new(|_, _| Ok(()))),
-            );
-        } else {
-            let _ = core.Resume();
-        }
-    });
+    let _ = win.set_focus();
 }
 
 #[tauri::command]
 pub fn on_demand_window_ready(app: AppHandle, window: tauri::Window) {
-    if take_waiting(window.label()) {
-        if let Some(win) = app.get_webview_window(window.label()) {
+    let label = window.label();
+    if take_waiting(label) {
+        if let Some(win) = app.get_webview_window(label) {
             present(&win);
         }
+    }
+    if label == SETTINGS {
+        if let Some(tab) = PENDING_SETTINGS_TAB.lock().ok().and_then(|mut g| g.take()) {
+            let _ = app.emit_to(SETTINGS, "settings-navigate", tab);
+        }
+    }
+}
+
+#[tauri::command]
+pub fn hide_on_demand_window(app: AppHandle, label: String) {
+    if spec_for(&label).is_none() {
+        return;
+    }
+    if let Some(win) = app.get_webview_window(&label) {
+        hide_window(&win);
     }
 }

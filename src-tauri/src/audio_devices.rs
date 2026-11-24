@@ -6,7 +6,7 @@ use windows::Win32::Media::Audio::{
     DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ};
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
 
 const CPOLICY_CONFIG_CLIENT: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
 const IID_POLICY_CONFIG: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
@@ -32,17 +32,25 @@ unsafe fn device_id(device: &IMMDevice) -> Option<String> {
 unsafe fn device_name(device: &IMMDevice) -> String {
     let Ok(store) = device.OpenPropertyStore(STGM_READ) else { return "Audio device".into() };
     let Ok(mut value) = store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME) else { return "Audio device".into() };
-    let name = PropVariantToStringAlloc(&value)
-        .ok()
-        .map(|s| String::from_utf16_lossy(s.as_wide()))
-        .unwrap_or_else(|| "Audio device".into());
+    let name = match PropVariantToStringAlloc(&value) {
+        Ok(pwstr) => {
+            let s = if !pwstr.is_null() {
+                String::from_utf16_lossy(pwstr.as_wide())
+            } else {
+                "Audio device".into()
+            };
+            CoTaskMemFree(Some(pwstr.0 as *const _));
+            s
+        }
+        Err(_) => "Audio device".into(),
+    };
     let _ = PropVariantClear(&mut value);
     name
 }
 
 fn list_devices() -> Result<Vec<AudioDevice>, String> {
+    let _com = crate::utils::ComApartmentGuard::init_mta();
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
         let default = enumerator
             .GetDefaultAudioEndpoint(eRender, eConsole)
@@ -62,8 +70,8 @@ fn list_devices() -> Result<Vec<AudioDevice>, String> {
 fn set_default(id: &str) -> Result<(), String> {
     type SetDefaultEndpoint = unsafe extern "system" fn(*mut std::ffi::c_void, PCWSTR, ERole) -> HRESULT;
     type Release = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+    let _com = crate::utils::ComApartmentGuard::init_mta();
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let unknown: IUnknown = CoCreateInstance(&CPOLICY_CONFIG_CLIENT, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
         let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
         unknown.query(&IID_POLICY_CONFIG, &mut raw).ok().map_err(|e| e.to_string())?;

@@ -1,4 +1,5 @@
-import { useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useLayoutEffect, useRef, type CSSProperties, type ReactNode } from "react";
+import { useSurfaceMetrics } from "../hooks/useSurfaceMetrics";
 
 export type SurfaceEdge = "top" | "bottom" | "left" | "right";
 
@@ -10,6 +11,9 @@ interface Props {
   radius: number;
   // Radius of the corners on the screen-edge side when there is no flare (a floating surface)
   edgeRadius?: number;
+  // Clamp bounds passed to scaledRadius (raw unscaled base radii should be supplied)
+  minRadius?: number;
+  maxRadius?: number;
   // Drawn inside the fill layer, so it is clipped to the same silhouette, flares included
   children?: ReactNode;
   // Hides the outline while the surface is still growing, so it cannot trail the fill
@@ -62,42 +66,73 @@ function silhouette(edge: SurfaceEdge, w: number, h: number, f: number, r: numbe
   return { closed: false, d: `M ${P(w, -f)} ${arc(f, 1, w - f, i)} H ${X(rr)} ${arc(a, 0, i, rr)} V ${Y(h - rr)} ${arc(a, 0, rr, h - i)} H ${X(w - f)} ${arc(f, 1, w, h + f)}` };
 }
 
-export function SurfaceShape({ edge, flare, radius, edgeRadius = 0, children, settling = false }: Props) {
-  const ref = useRef<SVGSVGElement>(null);
-  const [size, setSize] = useState({ w: 0, h: 0 });
+export function SurfaceShape({
+  edge,
+  flare,
+  radius,
+  edgeRadius = 0,
+  minRadius = 12,
+  maxRadius = 36,
+  children,
+  settling = false,
+}: Props) {
+  const { scaledRadius } = useSurfaceMetrics();
+  const effectiveRadius = radius > 0 ? scaledRadius(radius, minRadius, maxRadius) : 0;
+  const effectiveEdgeRadius = edgeRadius > 0 ? scaledRadius(edgeRadius, minRadius, maxRadius) : 0;
 
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const measure = () => setSize((prev) => (prev.w === el.clientWidth && prev.h === el.clientHeight ? prev : { w: el.clientWidth, h: el.clientHeight }));
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
+  const svgRef = useRef<SVGSVGElement>(null);
+  const fillRef = useRef<HTMLDivElement>(null);
+  const pathRef = useRef<SVGPathElement>(null);
 
-  const { w, h } = size;
   const horizontal = edge === "top" || edge === "bottom";
   const ox = horizontal ? flare : 0;
   const oy = horizontal ? 0 : flare;
-  const ready = w > 0 && h > 0;
 
-  const fill = ready ? silhouette(edge, w, h, flare, radius, edgeRadius, 0, ox, oy) : null;
-  const line = ready ? silhouette(edge, w, h, flare, radius, edgeRadius, INSET, 0, 0) : null;
+  useLayoutEffect(() => {
+    const svg = svgRef.current;
+    const fillEl = fillRef.current;
+    const pathEl = pathRef.current;
+    if (!svg || !fillEl || !pathEl) return;
+
+    let lastW = -1;
+    let lastH = -1;
+
+    const apply = (force = false) => {
+      const w = svg.clientWidth;
+      const h = svg.clientHeight;
+      if (!force && w === lastW && h === lastH) return;
+      lastW = w;
+      lastH = h;
+      if (w <= 0 || h <= 0) {
+        fillEl.style.clipPath = "inset(0 0 100% 0)";
+        pathEl.setAttribute("d", "");
+        return;
+      }
+      const fill = silhouette(edge, w, h, flare, effectiveRadius, effectiveEdgeRadius, 0, ox, oy);
+      const line = silhouette(edge, w, h, flare, effectiveRadius, effectiveEdgeRadius, INSET, 0, 0);
+      fillEl.style.clipPath = `path('${fill.d}${fill.closed ? "" : " Z"}')`;
+      pathEl.setAttribute("d", line.d);
+    };
+
+    apply(true);
+    const observer = new ResizeObserver(() => apply(false));
+    observer.observe(svg);
+    return () => observer.disconnect();
+  }, [edge, flare, effectiveRadius, effectiveEdgeRadius, ox, oy]);
 
   const fillStyle: CSSProperties = {
     left: horizontal ? -flare : 0,
     right: horizontal ? -flare : 0,
     top: horizontal ? 0 : -flare,
     bottom: horizontal ? 0 : -flare,
-    clipPath: fill ? `path('${fill.d}${fill.closed ? "" : " Z"}')` : "inset(0 0 100% 0)",
+    clipPath: "inset(0 0 100% 0)",
   };
 
   return (
     <>
-      <div className="surface-fill" style={fillStyle} aria-hidden="true">{children}</div>
-      <svg ref={ref} className={`edge-outline${settling ? " settling" : ""}`} aria-hidden>
-        {line && <path d={line.d} />}
+      <div ref={fillRef} className="surface-fill" style={fillStyle} aria-hidden="true">{children}</div>
+      <svg ref={svgRef} className={`edge-outline${settling ? " settling" : ""}`} aria-hidden>
+        <path ref={pathRef} d="" />
       </svg>
     </>
   );

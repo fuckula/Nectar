@@ -124,7 +124,11 @@ export function NotchClock({
             </div>
 
             <div className="timer-controls-new">
-              <button onClick={onToggleTimer} className="timer-btn primary">
+              <button
+                onClick={onToggleTimer}
+                className="timer-btn primary"
+                disabled={!isTimerRunning && timerSeconds === 0}
+              >
                 {isTimerRunning ? t("clock.pause") : t("clock.start")}
               </button>
               <button onClick={onResetTimer} className="timer-btn secondary">

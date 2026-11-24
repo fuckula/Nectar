@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { isGameModeMuteAgentsActive } from "./hooks/useGameMode";
 
 export type SoundState = "needs_input" | "done" | "error";
 
@@ -33,7 +34,7 @@ export function stateSoundOn(state: SoundState) {
 
 export async function playAgentSound(state: SoundState, force = false) {
   try {
-    if (!force && (localStorage.getItem("nectar-agent-sounds") === "false" || !stateSoundOn(state))) return;
+    if (!force && (isGameModeMuteAgentsActive() || localStorage.getItem("nectar-agent-sounds") === "false" || !stateSoundOn(state))) return;
     const audio = new Audio(await sourceFor(state));
     audio.volume = 0.6;
     await audio.play();

@@ -80,7 +80,12 @@ function Zone({ kind, items, onRemove }: { kind: CcKind; items: string[]; onRemo
   const t = useT();
   const { setNodeRef, isOver } = useDroppable({ id: `zone-${kind}` });
   return (
-    <div ref={setNodeRef} id={`zone-${kind}`} className={`widget-config-zone ${isOver ? "widget-config-zone--over" : ""}`}>
+    <div
+      ref={setNodeRef}
+      id={`zone-${kind}`}
+      data-setting-key={`notch.cc${kind.charAt(0).toUpperCase()}${kind.slice(1)}`}
+      className={`widget-config-zone ${isOver ? "widget-config-zone--over" : ""}`}
+    >
       <span className="widget-config-side">{t(ZONE_LABEL[kind])}</span>
       <div className="widget-config-chips">
         <SortableContext items={items} strategy={horizontalListSortingStrategy}>

@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { X } from "lucide-react";
 import { useT } from "../i18n";
+import { bridgeInvoke } from "../utils/tauriBridge";
 
 const NAMED: Record<string, string> = {
   Space: "Space", Enter: "Enter", Tab: "Tab", Backspace: "Backspace", Delete: "Delete", Insert: "Insert",
@@ -28,10 +29,32 @@ export function ShortcutRecorder({ value, onCommit }: { value: string; onCommit:
   const t = useT();
   const [recording, setRecording] = useState(false);
   const [held, setHeld] = useState<string[]>([]);
+  const pausedRef = useRef(false);
+
+  const setPaused = (paused: boolean) => {
+    if (pausedRef.current === paused) return;
+    pausedRef.current = paused;
+    bridgeInvoke("set_hotkeys_paused", { paused }).catch(() => {});
+  };
+
+  useEffect(() => {
+    return () => {
+      if (pausedRef.current) {
+        pausedRef.current = false;
+        bridgeInvoke("set_hotkeys_paused", { paused: false }).catch(() => {});
+      }
+    };
+  }, []);
+
+  const start = () => {
+    setRecording(true);
+    setPaused(true);
+  };
 
   const stop = () => {
     setRecording(false);
     setHeld([]);
+    setPaused(false);
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLButtonElement>) => {
@@ -59,7 +82,7 @@ export function ShortcutRecorder({ value, onCommit }: { value: string; onCommit:
       <button
         type="button"
         className={`shortcut-input shortcut-record${recording ? " recording" : ""}`}
-        onClick={() => setRecording(true)}
+        onClick={start}
         onKeyDown={onKeyDown}
         onKeyUp={(e) => recording && setHeld(modifiersOf(e))}
         onBlur={stop}

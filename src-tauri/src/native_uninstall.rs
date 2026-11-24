@@ -134,8 +134,8 @@ fn remove_registry(all_users: bool) {
     }
 }
 
-// Files Nectar itself puts in the install folder (the payload is just nectar.exe)
-const APP_FILES: &[&str] = &["nectar.exe", "uninstall.exe", ".install-scope"];
+// Files Nectar itself puts in the install folder
+const APP_FILES: &[&str] = &["nectar.exe", "WebView2Loader.dll", "uninstall.exe", ".install-scope"];
 
 // True when the folder belongs to Nectar alone and can be removed as a whole
 fn is_dedicated_install_dir(dir: &Path) -> bool {
@@ -283,6 +283,7 @@ mod tests {
     fn shared_folder_cleanup_only_targets_app_files() {
         let cmd = remove_app_files_command(Path::new(r"D:\Apps"), r"HKCU:\RunOnce");
         assert!(cmd.contains(r"'D:\Apps\nectar.exe'"));
+        assert!(cmd.contains(r"'D:\Apps\WebView2Loader.dll'"));
         assert!(cmd.contains(r"'D:\Apps\uninstall.exe'"));
         assert!(!cmd.contains("-Recurse"));
         assert!(!cmd.contains("rd /s"));

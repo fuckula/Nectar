@@ -24,6 +24,7 @@ struct ThumbnailRecord {
     handle: isize,
     dest_hwnd: isize,
     rect: RECT,
+    client_area_only: bool,
 }
 
 static ACTIVE_THUMBNAILS: OnceLock<Mutex<HashMap<isize, ThumbnailRecord>>> = OnceLock::new();
@@ -72,9 +73,8 @@ pub fn set_live_thumbnails(
     let target_hwnds: std::collections::HashSet<isize> = targets.iter().map(|t| t.hwnd).collect();
 
     let to_remove: Vec<isize> = map
-        .keys()
-        .copied()
-        .filter(|k| !target_hwnds.contains(k))
+        .iter()
+        .filter_map(|(&k, rec)| (rec.dest_hwnd == dest_hwnd_val && !target_hwnds.contains(&k)).then_some(k))
         .collect();
 
     for src_hwnd_val in to_remove {
@@ -91,6 +91,9 @@ pub fn set_live_thumbnails(
         let raw_hwnd = HWND(target.hwnd as *mut _);
         let src_hwnd = unsafe {
             if !IsWindow(Some(raw_hwnd)).as_bool() {
+                if let Some(record) = map.remove(&target.hwnd) {
+                    let _ = DwmUnregisterThumbnail(record.handle);
+                }
                 continue;
             }
             let root = GetAncestor(raw_hwnd, GA_ROOT);
@@ -108,11 +111,22 @@ pub fn set_live_thumbnails(
             bottom: target.y + target.height.max(1),
         };
 
+        // DWM binds destination HWND immutably on registration: if moving across monitors/docks,
+        // unregister and re-register cleanly instead of trying to retarget via UpdateProperties.
+        let need_reregister = map
+            .get(&target.hwnd)
+            .is_some_and(|rec| rec.dest_hwnd != dest_hwnd_val);
+        if need_reregister {
+            if let Some(old) = map.remove(&target.hwnd) {
+                unsafe {
+                    let _ = DwmUnregisterThumbnail(old.handle);
+                }
+            }
+        }
+
         if let Some(existing) = map.get_mut(&target.hwnd) {
             let fitted = fit_rect(existing.handle, rc_dest);
-            if existing.rect != fitted || existing.dest_hwnd != dest_hwnd_val {
-                existing.dest_hwnd = dest_hwnd_val;
-                existing.rect = fitted;
+            if existing.rect != fitted || existing.client_area_only != client_area_only {
                 let props = DWM_THUMBNAIL_PROPERTIES {
                     dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
                     rcDestination: fitted,
@@ -121,43 +135,51 @@ pub fn set_live_thumbnails(
                     fVisible: BOOL(1),
                     fSourceClientAreaOnly: if client_area_only { BOOL(1) } else { BOOL(0) },
                 };
-                unsafe {
-                    let _ = DwmUpdateThumbnailProperties(existing.handle, &props);
+                if unsafe { DwmUpdateThumbnailProperties(existing.handle, &props) }.is_ok() {
+                    existing.rect = fitted;
+                    existing.client_area_only = client_area_only;
+                    successfully_active.push(target.hwnd);
+                } else if let Some(broken) = map.remove(&target.hwnd) {
+                    unsafe {
+                        let _ = DwmUnregisterThumbnail(broken.handle);
+                    }
                 }
+            } else {
+                successfully_active.push(target.hwnd);
             }
-            successfully_active.push(target.hwnd);
         } else {
             unsafe {
-                match DwmRegisterThumbnail(dest_hwnd, src_hwnd) {
-                    Ok(handle) => {
-                        if IsIconic(raw_hwnd).as_bool() {
-                            let size = DwmQueryThumbnailSourceSize(handle).unwrap_or_default();
-                            if size.cx < 64 || size.cy < 64 {
-                                let _ = DwmUnregisterThumbnail(handle);
-                                continue;
-                            }
+                if let Ok(handle) = DwmRegisterThumbnail(dest_hwnd, src_hwnd) {
+                    if IsIconic(raw_hwnd).as_bool() {
+                        let size = DwmQueryThumbnailSourceSize(handle).unwrap_or_default();
+                        if size.cx < 64 || size.cy < 64 {
+                            let _ = DwmUnregisterThumbnail(handle);
+                            continue;
                         }
-                        let fitted = fit_rect(handle, rc_dest);
-                        let props = DWM_THUMBNAIL_PROPERTIES {
-                            dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
-                            rcDestination: fitted,
-                            rcSource: RECT::default(),
-                            opacity: OPACITY.load(std::sync::atomic::Ordering::Relaxed),
-                            fVisible: BOOL(1),
-                            fSourceClientAreaOnly: if client_area_only { BOOL(1) } else { BOOL(0) },
-                        };
-                        let _ = DwmUpdateThumbnailProperties(handle, &props);
+                    }
+                    let fitted = fit_rect(handle, rc_dest);
+                    let props = DWM_THUMBNAIL_PROPERTIES {
+                        dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
+                        rcDestination: fitted,
+                        rcSource: RECT::default(),
+                        opacity: OPACITY.load(std::sync::atomic::Ordering::Relaxed),
+                        fVisible: BOOL(1),
+                        fSourceClientAreaOnly: if client_area_only { BOOL(1) } else { BOOL(0) },
+                    };
+                    if DwmUpdateThumbnailProperties(handle, &props).is_ok() {
                         map.insert(
                             target.hwnd,
                             ThumbnailRecord {
                                 handle,
                                 dest_hwnd: dest_hwnd_val,
                                 rect: fitted,
+                                client_area_only,
                             },
                         );
                         successfully_active.push(target.hwnd);
+                    } else {
+                        let _ = DwmUnregisterThumbnail(handle);
                     }
-                    Err(_) => {}
                 }
             }
         }
@@ -184,6 +206,23 @@ pub fn set_opacity(opacity: u8) -> Result<(), String> {
     Ok(())
 }
 
+pub fn clear_thumbnails_for_dest(dest_hwnd_val: isize) -> Result<(), String> {
+    let mut map = get_map().lock().map_err(|e| e.to_string())?;
+    let keys: Vec<isize> = map
+        .iter()
+        .filter_map(|(&k, rec)| (rec.dest_hwnd == dest_hwnd_val).then_some(k))
+        .collect();
+    for k in keys {
+        if let Some(record) = map.remove(&k) {
+            unsafe {
+                let _ = DwmUnregisterThumbnail(record.handle);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub fn clear_all_thumbnails() -> Result<(), String> {
     let mut map = get_map().lock().map_err(|e| e.to_string())?;
     for (_, record) in map.drain() {

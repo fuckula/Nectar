@@ -5,6 +5,7 @@ import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import { AnimatePresence, Reorder } from "framer-motion";
 import { Trash2 } from "lucide-react";
 import { useT } from "../i18n";
+import { useSurfaceMetrics } from "../hooks/useSurfaceMetrics";
 
 export type ShelfItem = {
   id: string;
@@ -36,50 +37,98 @@ type ShelfCallbacks = {
   onDrop: () => void;
 };
 
-export function useShelf(windowLabel: string, enabled: boolean, persist: boolean, cb: ShelfCallbacks) {
+export function useShelf(
+  windowLabel: string,
+  enabled: boolean,
+  persist: boolean,
+  cb: ShelfCallbacks,
+  settingsLoaded = true
+) {
   const [items, setItems] = useState<ShelfItem[]>(() => (persist ? readSaved() : []));
   const [dropActive, setDropActive] = useState(false);
   const cbRef = useRef(cb);
   cbRef.current = cb;
+  const hydratedPersistRef = useRef(persist);
+  const prunedOnceRef = useRef(false);
+  const thumbRequestedRef = useRef<Set<string>>(new Set());
+  const retryTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  const mountedRef = useRef(true);
 
   useEffect(() => {
+    mountedRef.current = true;
+    const timers = retryTimersRef.current;
+    return () => {
+      mountedRef.current = false;
+      timers.forEach((id) => clearTimeout(id));
+      timers.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!settingsLoaded) return;
+    if (persist && !hydratedPersistRef.current) {
+      hydratedPersistRef.current = true;
+      setItems((prev) => (prev.length > 0 ? prev : readSaved()));
+      return;
+    }
+    hydratedPersistRef.current = persist;
     if (!persist) {
+      prunedOnceRef.current = false;
       try { localStorage.removeItem(STORAGE_KEY); } catch { /* storage unavailable */ }
       return;
     }
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(items.map(({ thumb, preview, ...rest }) => rest))); } catch { /* storage unavailable */ }
-  }, [items, persist]);
+  }, [items, persist, settingsLoaded]);
 
   useEffect(() => {
-    if (!persist) return;
+    if (!settingsLoaded || !persist || prunedOnceRef.current) return;
     const files = items.filter((i) => i.kind === "file" && i.path).map((i) => i.path as string);
     if (files.length === 0) return;
+    prunedOnceRef.current = true;
     invoke<string[]>("shelf_prune", { paths: files }).then((alive) => {
+      if (!mountedRef.current) return;
       const keep = new Set(alive);
       setItems((prev) => prev.filter((i) => i.kind !== "file" || keep.has(i.path as string)));
     }).catch(() => { });
-  }, []);
+  }, [items, persist, settingsLoaded]);
 
   // Explorer has no cached thumbnail for a fresh file yet (videos especially), so ask again a few times
   const loadThumb = useCallback((id: string, path: string, attempt = 0) => {
+    if (!mountedRef.current) return;
     invoke<string | null>("shelf_thumbnail", { path }).then((thumb) => {
+      if (!mountedRef.current) return;
       if (thumb) {
         setItems((prev) => prev.map((i) => (i.id === id ? { ...i, thumb } : i)));
         return;
       }
       invoke<string | null>("shelf_text_preview", { path }).then((preview) => {
+        if (!mountedRef.current) return;
         if (preview) {
           setItems((prev) => prev.map((i) => (i.id === id ? { ...i, preview } : i)));
         } else if (attempt < 3) {
-          setTimeout(() => loadThumb(id, path, attempt + 1), 600 * (attempt + 1));
+          const timer = setTimeout(() => {
+            retryTimersRef.current.delete(timer);
+            loadThumb(id, path, attempt + 1);
+          }, 600 * (attempt + 1));
+          retryTimersRef.current.add(timer);
         }
       }).catch(() => { });
     }).catch(() => { });
   }, []);
 
   useEffect(() => {
-    items.forEach((i) => { if (i.kind === "file" && i.path && !i.thumb && !i.preview) loadThumb(i.id, i.path); });
-  }, []);
+    if (!settingsLoaded) return;
+    const activeIds = new Set(items.map((i) => i.id));
+    for (const id of Array.from(thumbRequestedRef.current)) {
+      if (!activeIds.has(id)) thumbRequestedRef.current.delete(id);
+    }
+    items.forEach((i) => {
+      if (i.kind === "file" && i.path && !i.thumb && !i.preview && !thumbRequestedRef.current.has(i.id)) {
+        thumbRequestedRef.current.add(i.id);
+        loadThumb(i.id, i.path);
+      }
+    });
+  }, [items, settingsLoaded, loadThumb]);
 
   const add = useCallback((paths?: string[], text?: string) => {
     const fresh: ShelfItem[] = [];
@@ -96,8 +145,7 @@ export function useShelf(windowLabel: string, enabled: boolean, persist: boolean
       const rest = prev.filter((i) => !(i.path && taken.has(i.path)));
       return [...fresh, ...rest].slice(0, MAX_ITEMS);
     });
-    fresh.forEach((i) => { if (i.path) loadThumb(i.id, i.path); });
-  }, [loadThumb]);
+  }, []);
 
   useEffect(() => {
     if (!enabled || !windowLabel) return;
@@ -105,30 +153,51 @@ export function useShelf(windowLabel: string, enabled: boolean, persist: boolean
     if (!isNotch) return;
     invoke("setup_shelf_drop").catch(() => { });
 
-    const unlistens: Promise<() => void>[] = [
-      listen<{ label: string }>("shelf-drag-enter", (e) => {
-        if (e.payload.label === windowLabel) {
-          setDropActive(true);
-          cbRef.current.onDragEnter();
-        }
-      }),
-      listen<{ label: string }>("shelf-drag-leave", (e) => {
-        if (e.payload.label === windowLabel) {
-          setDropActive(false);
-          cbRef.current.onDragLeave();
-        }
-      }),
-      listen<{ label: string; paths?: string[]; text?: string }>("shelf-drag-drop", (e) => {
-        add(e.payload.paths, e.payload.text);
+    let cancelled = false;
+    const cleanups: Array<() => void> = [];
+    const sub = <T,>(ev: string, handler: (payload: T) => void) => {
+      listen<T>(ev, (e) => {
+        if (!cancelled) handler(e.payload);
+      })
+        .then((fn) => {
+          if (cancelled) fn();
+          else cleanups.push(fn);
+        })
+        .catch(() => {});
+    };
+
+    sub<{ label: string }>("shelf-drag-enter", (payload) => {
+      if (payload.label === windowLabel) {
+        setDropActive(true);
+        cbRef.current.onDragEnter();
+      }
+    });
+    sub<{ label: string }>("shelf-drag-leave", (payload) => {
+      if (payload.label === windowLabel) {
         setDropActive(false);
-        if (e.payload.label === windowLabel) cbRef.current.onDrop();
-      }),
-    ];
-    return () => { unlistens.forEach((u) => u.then((fn) => fn())); };
+        cbRef.current.onDragLeave();
+      }
+    });
+    sub<{ label: string; paths?: string[]; text?: string }>("shelf-drag-drop", (payload) => {
+      add(payload.paths, payload.text);
+      setDropActive(false);
+      if (payload.label === windowLabel) cbRef.current.onDrop();
+    });
+
+    return () => {
+      cancelled = true;
+      cleanups.forEach((fn) => fn());
+    };
   }, [enabled, windowLabel, add]);
 
-  const remove = useCallback((id: string) => setItems((prev) => prev.filter((i) => i.id !== id)), []);
-  const clear = useCallback(() => setItems([]), []);
+  const remove = useCallback((id: string) => {
+    thumbRequestedRef.current.delete(id);
+    setItems((prev) => prev.filter((i) => i.id !== id));
+  }, []);
+  const clear = useCallback(() => {
+    thumbRequestedRef.current.clear();
+    setItems([]);
+  }, []);
 
   return { items, dropActive, reorder: setItems, remove, clear };
 }
@@ -152,14 +221,28 @@ const extOf = (name: string) => {
 
 export function NotchShelf({ items, dropActive, onReorder, onRemove, onClear, onDragOutStart, onDragOutEnd }: Props) {
   const t = useT();
+  const { scaleSpring, scaleDuration } = useSurfaceMetrics();
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [resetKey, setResetKey] = useState(0);
   const panelRef = useRef<HTMLDivElement>(null);
   const dragState = useRef<{ out: boolean } | null>(null);
   const dragIcon = useRef<string | null>(null);
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    invoke<string | null>("shelf_drag_icon").then((icon) => { dragIcon.current = icon; }).catch(() => { });
+    let cancelled = false;
+    invoke<string | null>("shelf_drag_icon")
+      .then((icon) => {
+        if (!cancelled) dragIcon.current = icon;
+      })
+      .catch(() => { });
+    return () => {
+      cancelled = true;
+      if (copiedTimerRef.current !== null) {
+        clearTimeout(copiedTimerRef.current);
+        copiedTimerRef.current = null;
+      }
+    };
   }, []);
 
   const beginDrag = async (item: ShelfItem) => {
@@ -179,9 +262,13 @@ export function NotchShelf({ items, dropActive, onReorder, onRemove, onClear, on
     if (item.kind === "file" && item.path) {
       invoke("shelf_open", { path: item.path }).catch(() => { });
     } else if (item.text) {
-      navigator.clipboard.writeText(item.text).then(() => {
+      invoke("copy_text_to_clipboard", { text: item.text }).then(() => {
         setCopiedId(item.id);
-        setTimeout(() => setCopiedId((cur) => (cur === item.id ? null : cur)), 1200);
+        if (copiedTimerRef.current !== null) clearTimeout(copiedTimerRef.current);
+        copiedTimerRef.current = setTimeout(() => {
+          copiedTimerRef.current = null;
+          setCopiedId((cur) => (cur === item.id ? null : cur));
+        }, 1200);
       }).catch(() => { });
     }
   };
@@ -208,9 +295,9 @@ export function NotchShelf({ items, dropActive, onReorder, onRemove, onClear, on
                     title={item.kind === "text" ? item.text : item.path}
                     initial={{ opacity: 0, scale: 0.5, y: -10 }}
                     animate={{ opacity: 1, scale: 1, y: 0 }}
-                    exit={{ opacity: 0, scale: 0.5, transition: { duration: 0.12 } }}
+                    exit={{ opacity: 0, scale: 0.5, transition: { duration: scaleDuration(0.12) } }}
                     whileDrag={{ scale: 1.1, zIndex: 5 }}
-                    transition={CARD_SPRING}
+                    transition={scaleSpring(CARD_SPRING)}
                     onDragStart={() => { dragState.current = { out: false }; }}
                     onDrag={(_, info) => {
                       const state = dragState.current;

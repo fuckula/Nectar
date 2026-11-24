@@ -80,9 +80,12 @@ body,
     flex-direction: column;
     align-items: center;
     padding: 28px 36px;
-    background: var(--nectar-bg, rgba(0, 0, 0, 0.8));
-    border: 1px solid var(--nectar-border, rgba(255, 255, 255, 0.1));
-    border-radius: 20px;
+    background: var(--shell-popover-bg, var(--nectar-bg, rgba(0, 0, 0, 0.8)));
+    border: 1px solid var(--shell-popover-border, var(--nectar-border, rgba(255, 255, 255, 0.1)));
+    border-radius: var(--shell-radius, 20px);
+    box-shadow: var(--shell-popover-shadow, 0 20px 48px rgba(0, 0, 0, 0.58));
+    backdrop-filter: blur(var(--nectar-popover-blur, 16px)) saturate(140%);
+    -webkit-backdrop-filter: blur(var(--nectar-popover-blur, 16px)) saturate(140%);
 }
 
 .update-splash-logo {
@@ -94,7 +97,7 @@ body,
 
 .update-splash-text {
     color: var(--nectar-text, rgba(255, 255, 255, 0.9));
-    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-family: var(--nectar-font-sans, "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
     font-size: 14px;
     font-weight: 500;
     margin-bottom: 16px;
@@ -139,7 +142,7 @@ body,
   border-left: none;
   border-top: none;
   border-bottom: none;
-  width: 42px;
+  width: var(--overlay-pill-width, 42px);
   height: 196px;
   position: relative;
   pointer-events: auto;
@@ -204,7 +207,7 @@ body,
   align-items: center;
   justify-content: space-between;
   height: 100%;
-  width: 42px;
+  width: var(--overlay-pill-width, 42px);
   align-self: flex-start;
   flex-shrink: 0;
 }
@@ -246,6 +249,7 @@ body,
   border-radius: 20px;
   position: relative;
   overflow: hidden;
+  touch-action: none;
 }
 
 .volume-notch-fill {
@@ -296,12 +300,7 @@ body,
 .volume-notch-action-percent {
   font-size: 10px;
   font-weight: 700;
-  font-family:
-    "Inter",
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
+  font-family: var(--nectar-font-sans, "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
   letter-spacing: -0.02em;
 }
 
@@ -333,7 +332,7 @@ body,
 
 .volume-mixer-panel {
   position: absolute;
-  left: 42px;
+  left: var(--overlay-pill-width, 42px);
   top: 0;
   bottom: 0;
   /* Overridden inline with the dynamic width (grows with the app count). */
@@ -373,18 +372,13 @@ body,
   align-items: center;
   gap: 2px;
   padding: 0 4px;
-  border: none;
+  border: 1px solid transparent;
   border-radius: 6px;
   background: transparent;
   color: var(--nectar-text-muted, rgba(255, 255, 255, 0.6));
   font-size: 10px;
   font-weight: 600;
-  font-family:
-    "Inter",
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
+  font-family: var(--nectar-font-sans, "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
   text-align: left;
   min-width: 0;
 }
@@ -392,12 +386,16 @@ body,
 .volume-panel-header.clickable {
   cursor: pointer;
   transition:
-    background 0.16s ease,
+    background 0.16s var(--nectar-ease, ease),
+    border-color 0.16s var(--nectar-ease, ease),
+    box-shadow 0.16s var(--nectar-ease, ease),
     color 0.16s ease;
 }
 
 .volume-panel-header.clickable:hover {
-  background: var(--nectar-group-bg, rgba(255, 255, 255, 0.06));
+  background: var(--shell-popover-hover-bg, var(--nectar-group-bg, rgba(255, 255, 255, 0.06)));
+  border-color: var(--shell-popover-hover-border, transparent);
+  box-shadow: var(--shell-popover-hover-shadow, none);
   color: var(--nectar-text, white);
 }
 
@@ -434,29 +432,30 @@ body,
   min-height: 26px;
   flex-shrink: 0;
   padding: 0 8px;
-  border: none;
+  border: 1px solid transparent;
   border-radius: 8px;
   background: transparent;
   color: var(--nectar-text, white);
   font-size: 11px;
   font-weight: 500;
-  font-family:
-    "Inter",
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
+  font-family: var(--nectar-font-sans, "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
   text-align: left;
   cursor: pointer;
-  transition: background 0.16s ease;
+  transition:
+    background 0.16s var(--nectar-ease, ease),
+    border-color 0.16s var(--nectar-ease, ease),
+    box-shadow 0.16s var(--nectar-ease, ease);
 }
 
 .volume-device-row:hover {
-  background: var(--nectar-group-bg, rgba(255, 255, 255, 0.06));
+  background: var(--shell-popover-hover-bg, var(--nectar-group-bg, rgba(255, 255, 255, 0.06)));
+  border-color: var(--shell-popover-hover-border, transparent);
+  box-shadow: var(--shell-popover-hover-shadow, none);
 }
 
 .volume-device-row.selected {
-  background: var(--nectar-border, rgba(255, 255, 255, 0.12));
+  background: color-mix(in srgb, var(--shell-accent, #0a84ff) 18%, var(--nectar-group-bg, rgba(255, 255, 255, 0.08)));
+  border-color: color-mix(in srgb, var(--shell-accent, #0a84ff) 34%, transparent);
   font-weight: 600;
   cursor: default;
 }
@@ -481,12 +480,7 @@ body,
   color: var(--nectar-text-muted, rgba(255, 255, 255, 0.6));
   font-size: 11px;
   font-weight: 500;
-  font-family:
-    "Inter",
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
+  font-family: var(--nectar-font-sans, "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
   text-align: center;
   grid-column: 1 / -1;
   display: flex;
@@ -513,6 +507,7 @@ body,
   background: rgba(255, 255, 255, 0.2);
   border-radius: 20px;
   overflow: hidden;
+  touch-action: none;
 }
 
 .volume-mixer-fill {
@@ -561,12 +556,7 @@ body,
   color: var(--nectar-text, white);
   font-size: 9px;
   font-weight: 700;
-  font-family:
-    "Inter",
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
+  font-family: var(--nectar-font-sans, "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
   transition: opacity 0.16s ease;
 }
 
@@ -588,12 +578,7 @@ body,
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.02em;
-  font-family:
-    "Inter",
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
+  font-family: var(--nectar-font-sans, "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
   opacity: 0;
   transition: opacity 0.16s ease;
 }
@@ -628,7 +613,7 @@ body,
     border-radius: 18px 0 0 18px;
     border: 1px solid var(--nectar-border, rgba(255, 255, 255, 0.1));
     border-right: none;
-    width: 42px;
+    width: var(--overlay-pill-width, 42px);
     height: 196px;
     position: relative;
     pointer-events: auto;
@@ -680,6 +665,7 @@ body,
     position: relative;
     overflow: hidden;
     margin-top: 4px;
+    touch-action: none;
 }
 
 .brightness-notch-fill {
@@ -762,7 +748,7 @@ body,
 
 .side-right .volume-mixer-panel {
   left: auto;
-  right: 42px;
+  right: var(--overlay-pill-width, 42px);
 }
 
 .brightness-notch-wrapper.side-left {
@@ -796,4 +782,94 @@ body,
   background:
     radial-gradient(circle at 13px 13px, transparent 12px, var(--nectar-border, rgba(255, 255, 255, 0.1)) 12.7px, var(--nectar-border, rgba(255, 255, 255, 0.1)) 13.3px, transparent 14px),
     var(--nectar-bg, rgba(0, 0, 0, 0.8));
+}
+
+/* Wave 8B: Vertical positioning synced with Rust compute_overlay_hitbox (14%/86% edges) */
+.overlay-container[data-vpos="top"] .volume-notch-wrapper,
+.overlay-container[data-vpos="top"] .brightness-notch-wrapper {
+  top: calc(14% + 98px);
+}
+
+.overlay-container[data-vpos="bottom"] .volume-notch-wrapper,
+.overlay-container[data-vpos="bottom"] .brightness-notch-wrapper {
+  top: calc(86% - 98px);
+}
+
+/* Pill thickness variants (slim: 34px, default: 42px, wide: 52px) */
+.overlay-container[data-overlay-style="slim"] .volume-notch-bar,
+.overlay-container[data-overlay-style="slim"] .brightness-notch-bar {
+  width: 7px;
+}
+
+.overlay-container[data-overlay-style="wide"] .volume-notch-bar,
+.overlay-container[data-overlay-style="wide"] .brightness-notch-bar {
+  width: 13px;
+}
+
+/* Accent slider fill */
+.overlay-container.accent-fill .volume-notch-fill,
+.overlay-container.accent-fill .volume-mixer-fill,
+.overlay-container.accent-fill .brightness-notch-fill {
+  background: var(--nectar-accent, #0a84ff);
+}
+
+/* Light Mode parity for Mixer, Devices, Header & Buttons */
+.light-mode .volume-notch-device,
+.light-mode .volume-notch-action,
+.light-mode .volume-mixer-action {
+  color: rgba(15, 23, 42, 0.88);
+}
+
+.light-mode .brightness-notch-icon {
+  color: rgba(15, 23, 42, 0.9);
+}
+
+.light-mode .volume-panel-header {
+  color: rgba(15, 23, 42, 0.62);
+}
+
+.light-mode .volume-panel-header.clickable:hover {
+  background: var(--shell-popover-hover-bg, rgba(15, 23, 42, 0.06));
+  border-color: var(--shell-popover-hover-border, transparent);
+  box-shadow: var(--shell-popover-hover-shadow, none);
+  color: var(--nectar-text, #16161a);
+}
+
+.light-mode .volume-device-row {
+  color: var(--nectar-text, #16161a);
+}
+
+.light-mode .volume-device-row:hover {
+  background: var(--shell-popover-hover-bg, rgba(15, 23, 42, 0.06));
+  border-color: var(--shell-popover-hover-border, transparent);
+  box-shadow: var(--shell-popover-hover-shadow, none);
+}
+
+.light-mode .volume-device-row.selected {
+  background: color-mix(in srgb, var(--shell-accent, #0f172a) 15%, rgba(15, 23, 42, 0.05));
+  border-color: color-mix(in srgb, var(--shell-accent, #0f172a) 32%, transparent);
+}
+
+.light-mode .volume-mixer-empty {
+  color: rgba(15, 23, 42, 0.58);
+}
+
+.light-mode .volume-mixer-bar {
+  background: rgba(15, 23, 42, 0.14);
+}
+
+.light-mode .volume-mixer-action-fallback {
+  background: rgba(15, 23, 42, 0.1);
+  color: #16161a;
+}
+
+:root.reduced-motion .volume-notch-device,
+:root.reduced-motion .volume-notch-action,
+:root.reduced-motion .volume-panel-header,
+:root.reduced-motion .volume-device-row,
+:root.reduced-motion .volume-mixer-action,
+:root.reduced-motion .volume-mixer-action img,
+:root.reduced-motion .volume-mixer-action-fallback,
+:root.reduced-motion .volume-mixer-action-pct {
+  transition-duration: 0.01ms !important;
 }

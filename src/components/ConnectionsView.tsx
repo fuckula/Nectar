@@ -29,6 +29,8 @@ interface Props {
   onBack: () => void;
   onOpenWindowsSettings: () => void;
   tip?: (text: string | undefined) => Record<string, unknown>;
+  bluetoothAvailable?: boolean | null;
+  onPasswordPromptChange?: (active: boolean) => void;
 }
 
 const REFRESH_MS = 6000;
@@ -52,24 +54,90 @@ interface AudioSession {
   is_muted: boolean;
 }
 
+const APP_VOLUME_THROTTLE_MS = 50;
+
 function AppVolumes() {
   const t = useT();
   const [sessions, setSessions] = useState<AudioSession[] | null>(null);
   const dragging = useRef(false);
+  const lastSentAtRef = useRef<Map<number, number>>(new Map());
+  const pendingVolumesRef = useRef<Map<number, number>>(new Map());
+  const throttleTimersRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
+
+  const sendVolumeIpc = useCallback((pid: number, volume: number) => {
+    lastSentAtRef.current.set(pid, Date.now());
+    pendingVolumesRef.current.delete(pid);
+    invoke("set_app_volume", { pid, volume }).catch(() => {});
+  }, []);
+
+  const scheduleVolumeIpc = useCallback((pid: number, volume: number) => {
+    const now = Date.now();
+    const last = lastSentAtRef.current.get(pid) ?? 0;
+    const elapsed = now - last;
+    if (elapsed >= APP_VOLUME_THROTTLE_MS && !throttleTimersRef.current.has(pid)) {
+      sendVolumeIpc(pid, volume);
+      return;
+    }
+    pendingVolumesRef.current.set(pid, volume);
+    if (!throttleTimersRef.current.has(pid)) {
+      const timer = setTimeout(() => {
+        throttleTimersRef.current.delete(pid);
+        const pending = pendingVolumesRef.current.get(pid);
+        if (pending !== undefined) {
+          sendVolumeIpc(pid, pending);
+        }
+      }, Math.max(0, APP_VOLUME_THROTTLE_MS - elapsed));
+      throttleTimersRef.current.set(pid, timer);
+    }
+  }, [sendVolumeIpc]);
+
+  const flushVolumeIpc = useCallback((pid: number) => {
+    const timer = throttleTimersRef.current.get(pid);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      throttleTimersRef.current.delete(pid);
+    }
+    const pending = pendingVolumesRef.current.get(pid);
+    if (pending !== undefined) {
+      sendVolumeIpc(pid, pending);
+    }
+  }, [sendVolumeIpc]);
 
   useEffect(() => {
+    let alive = true;
     const load = () => {
       if (dragging.current) return;
-      invoke<AudioSession[]>("get_audio_sessions").then(setSessions).catch(() => setSessions((prev) => prev ?? []));
+      invoke<AudioSession[]>("get_audio_sessions")
+        .then((res) => { if (alive) setSessions(res); })
+        .catch(() => { if (alive) setSessions((prev) => prev ?? []); });
     };
     load();
     const timer = setVisibleInterval(load, 2000);
-    return () => clearInterval(timer);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+      throttleTimersRef.current.forEach((tId) => clearTimeout(tId));
+      throttleTimersRef.current.clear();
+      pendingVolumesRef.current.forEach((vol, pid) => {
+        invoke("set_app_volume", { pid, volume: vol }).catch(() => {});
+      });
+      pendingVolumesRef.current.clear();
+    };
   }, []);
 
   const setVolume = (pid: number, volume: number) => {
     setSessions((prev) => prev?.map((s) => (s.pid === pid ? { ...s, volume, is_muted: volume === 0 } : s)) ?? prev);
-    invoke("set_app_volume", { pid, volume }).catch(() => {});
+    scheduleVolumeIpc(pid, volume);
+  };
+
+  const releaseCapture = (el: HTMLInputElement, pointerId: number) => {
+    try {
+      if (el.hasPointerCapture(pointerId)) {
+        el.releasePointerCapture(pointerId);
+      }
+    } catch {
+      // Ignore if pointer capture is unsupported or already released
+    }
   };
 
   return (
@@ -88,9 +156,27 @@ function AppVolumes() {
               value={s.is_muted ? 0 : s.volume}
               className="cc-classic-input"
               onChange={(e) => setVolume(s.pid, parseFloat(e.target.value))}
-              onPointerDown={(e) => { e.stopPropagation(); dragging.current = true; }}
-              onPointerUp={() => { dragging.current = false; }}
-              onPointerCancel={() => { dragging.current = false; }}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                dragging.current = true;
+                try {
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                } catch {}
+              }}
+              onPointerUp={(e) => {
+                dragging.current = false;
+                releaseCapture(e.currentTarget, e.pointerId);
+                flushVolumeIpc(s.pid);
+              }}
+              onPointerCancel={(e) => {
+                dragging.current = false;
+                releaseCapture(e.currentTarget, e.pointerId);
+                flushVolumeIpc(s.pid);
+              }}
+              onLostPointerCapture={() => {
+                dragging.current = false;
+                flushVolumeIpc(s.pid);
+              }}
               onClick={(e) => e.stopPropagation()}
             />
             <div className="cc-classic-fill" style={{ width: `${(s.is_muted ? 0 : s.volume) * 100}%` }} />
@@ -101,7 +187,14 @@ function AppVolumes() {
   );
 }
 
-export function ConnectionsView({ kind, onBack, onOpenWindowsSettings, tip = () => ({}) }: Props) {
+export function ConnectionsView({
+  kind,
+  onBack,
+  onOpenWindowsSettings,
+  tip = () => ({}),
+  bluetoothAvailable = null,
+  onPasswordPromptChange,
+}: Props) {
   const [networks, setNetworks] = useState<WifiNetwork[] | null>(null);
   const [devices, setDevices] = useState<BluetoothDeviceInfo[] | null>(null);
   const [outputs, setOutputs] = useState<OutputDevice[] | null>(null);
@@ -110,22 +203,71 @@ export function ConnectionsView({ kind, onBack, onOpenWindowsSettings, tip = () 
   const [passwordFor, setPasswordFor] = useState<string | null>(null);
   const [password, setPassword] = useState("");
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  const passwordInputRef = useRef<HTMLInputElement>(null);
+  const onPasswordPromptChangeRef = useRef(onPasswordPromptChange);
+  onPasswordPromptChangeRef.current = onPasswordPromptChange;
+  const mountedRef = useRef(true);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (refreshTimerRef.current !== null) {
+        clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (kind !== "wifi") {
+      setPasswordFor(null);
+      setPassword("");
+    }
+  }, [kind]);
 
   useEffect(() => {
     if (passwordFor === null) return;
-    invoke("set_window_keyboard_focus", { enabled: true }).catch(() => {});
+    onPasswordPromptChangeRef.current?.(true);
+    invoke("set_window_keyboard_focus", { enabled: true })
+      .catch(() => {})
+      .finally(() => {
+        passwordInputRef.current?.focus();
+      });
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        setPasswordFor(null);
+        setPassword("");
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+
     return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
       invoke("set_window_keyboard_focus", { enabled: false }).catch(() => {});
+      onPasswordPromptChangeRef.current?.(false);
     };
   }, [passwordFor]);
 
   const refresh = useCallback(async () => {
     try {
-      if (kind === "wifi") setNetworks(await invoke<WifiNetwork[]>("wifi_scan"));
-      else if (kind === "audio") setOutputs(await invoke<OutputDevice[]>("get_audio_devices"));
-      else setDevices(await invoke<BluetoothDeviceInfo[]>("bluetooth_devices"));
-      setError("");
+      if (kind === "wifi") {
+        const res = await invoke<WifiNetwork[]>("wifi_scan");
+        if (mountedRef.current) setNetworks(res);
+      } else if (kind === "audio") {
+        const res = await invoke<OutputDevice[]>("get_audio_devices");
+        if (mountedRef.current) setOutputs(res);
+      } else {
+        const res = await invoke<BluetoothDeviceInfo[]>("bluetooth_devices");
+        if (mountedRef.current) setDevices(res);
+      }
+      if (mountedRef.current) setError("");
     } catch (e) {
+      if (!mountedRef.current) return;
       setError(String(e));
       if (kind === "wifi") setNetworks((prev) => prev ?? []);
       else if (kind === "audio") setOutputs((prev) => prev ?? []);
@@ -146,10 +288,16 @@ export function ConnectionsView({ kind, onBack, onOpenWindowsSettings, tip = () 
     try {
       await action();
     } catch (e) {
-      setError(String(e));
+      if (mountedRef.current) setError(String(e));
     } finally {
-      setBusy("");
-      setTimeout(() => void refresh(), 1200);
+      if (mountedRef.current) {
+        setBusy("");
+        if (refreshTimerRef.current !== null) clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = setTimeout(() => {
+          refreshTimerRef.current = null;
+          if (mountedRef.current) void refresh();
+        }, 1200);
+      }
     }
   };
 
@@ -182,7 +330,15 @@ export function ConnectionsView({ kind, onBack, onOpenWindowsSettings, tip = () 
   return (
     <div className="cv-root" onClick={(e) => e.stopPropagation()}>
       <div className="cv-header">
-        <button className="cv-back" onClick={onBack} aria-label={t("common.back")}>
+        <button
+          className="cv-back"
+          onClick={() => {
+            setPasswordFor(null);
+            setPassword("");
+            onBack();
+          }}
+          aria-label={t("common.back")}
+        >
           <ChevronLeft size={16} />
         </button>
         <span className="cv-title">{title}</span>
@@ -191,7 +347,12 @@ export function ConnectionsView({ kind, onBack, onOpenWindowsSettings, tip = () 
 
       <div className="cv-list">
         {loading && <div className="cv-hint">{kind === "wifi" ? t("connections.scanning") : t("connections.loading")}</div>}
-        {!loading && empty && !error && <div className="cv-hint">{emptyText}</div>}
+        {kind === "bluetooth" && !loading && bluetoothAvailable === false && (
+          <div className="cv-hint">{t("connections.bluetoothUnavailable")}</div>
+        )}
+        {!loading && empty && !error && !(kind === "bluetooth" && bluetoothAvailable === false) && (
+          <div className="cv-hint">{emptyText}</div>
+        )}
 
         {kind === "audio" && outputs?.map((o) => (
           <div
@@ -235,9 +396,23 @@ export function ConnectionsView({ kind, onBack, onOpenWindowsSettings, tip = () 
             {passwordFor === n.ssid && (
               <form className="cv-password" onSubmit={submitPassword}>
                 <input
+                  ref={passwordInputRef}
                   type="password"
                   autoFocus
                   value={password}
+                  onMouseDown={() => {
+                    invoke("set_window_keyboard_focus", { enabled: true })
+                      .catch(() => {})
+                      .finally(() => passwordInputRef.current?.focus());
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setPasswordFor(null);
+                      setPassword("");
+                    }
+                  }}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder={t("connections.password")}
                   spellCheck={false}
@@ -249,24 +424,53 @@ export function ConnectionsView({ kind, onBack, onOpenWindowsSettings, tip = () 
         ))}
 
         {kind === "bluetooth" && devices?.map((d) => (
-          <div key={d.id} className={`cv-row${d.connected ? " connected" : ""}`}>
+          <div
+            key={d.id}
+            className={`cv-row${d.connected ? " connected" : ""}`}
+            onClick={() => {
+              invoke("open_bluetooth_settings").catch(() => {});
+            }}
+          >
             <Bluetooth size={13} className="cv-bt-icon" />
             <span className="cv-name">{d.name}</span>
             <span className="cv-status">{d.connected ? t("connections.connected") : t("connections.paired")}</span>
             {confirmRemove === d.id ? (
               <button
                 className="cv-action danger"
-                onClick={() => { setConfirmRemove(null); void run(d.id, () => invoke("bluetooth_unpair", { id: d.id })); }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setConfirmRemove(null);
+                  void run(d.id, () => invoke("bluetooth_unpair", { id: d.id }));
+                }}
               >
                 {t("connections.removeConfirm")}
               </button>
             ) : (
-              <button className="cv-icon-btn" {...tip(t("connections.removeDevice"))} onClick={() => setConfirmRemove(d.id)}>
+              <button
+                className="cv-icon-btn"
+                {...tip(t("connections.removeDevice"))}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setConfirmRemove(d.id);
+                }}
+              >
                 <X size={12} />
               </button>
             )}
           </div>
         ))}
+
+        {kind === "bluetooth" && !loading && (
+          <button
+            type="button"
+            className="cv-settings-btn"
+            onClick={() => {
+              invoke("open_bluetooth_settings").catch(() => {});
+            }}
+          >
+            {t("connections.openBluetoothSettings")}
+          </button>
+        )}
       </div>
 
       {error && <div className="cv-error">{error}</div>}

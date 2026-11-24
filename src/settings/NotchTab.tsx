@@ -34,6 +34,8 @@ import {
   BellRing,
   Globe,
   Volume2,
+  Type,
+  Eye,
 } from "lucide-react";
 import { DEFAULT_PANEL_ORDER, type CcLayout, type PanelId } from "../panelOrder";
 import { ControlCenterConfig } from "../components/ControlCenterConfig";
@@ -56,7 +58,17 @@ import { DualClockPicker } from "../components/DualClockPicker";
 import { zoneOffsetLabel } from "../dualClock";
 import type { WidgetConfig, MonitorInfo, MonitorMode } from "./types";
 import { usePerMonitor } from "./usePerMonitor";
+import { useSyncedSetting } from "./useSyncedSetting";
 import { useT } from "../i18n";
+
+const parseClockFont = (v: unknown): string => {
+  const s = String(v ?? "default");
+  return s === "mono" || s === "rounded" || s === "bold" ? s : "default";
+};
+const parseIdleOpacity = (v: unknown): number => {
+  const n = typeof v === "number" ? v : parseFloat(String(v ?? "1"));
+  return Number.isFinite(n) ? Math.min(1.0, Math.max(0.4, Math.round(n * 100) / 100)) : 1.0;
+};
 
 interface NotchTabProps {
   notchMode: string;
@@ -216,6 +228,8 @@ export function NotchTab({
   onOpenCalendarSync,
 }: NotchTabProps) {
   const t = useT();
+  const [clockFont, setClockFont] = useSyncedSetting("nectar-notch-clock-font", parseClockFont, (v) => v);
+  const [idleOpacity, setIdleOpacity] = useSyncedSetting("nectar-notch-idle-opacity", parseIdleOpacity, (v) => String(v), { debounceMs: 120 });
   const caldav = useCaldav();
   const sources = (caldav.account ? 1 : 0) + caldav.links.length;
   const perMonitor = usePerMonitor(notchMode, notchModeByMonitor, replaceNotchModes, monitors);
@@ -289,6 +303,40 @@ export function NotchTab({
             />
           </SettingRow>
         ))}
+
+        <SettingRow icon={Type} label={t("notch.clockFont")} desc={t("notch.clockFont.desc")} settingKey="notch.clockFont">
+          <Dropdown
+            value={clockFont}
+            onChange={(val) => void setClockFont(val)}
+            options={[
+              { value: "default", label: t("notch.clockFont.default") },
+              { value: "mono", label: t("notch.clockFont.mono") },
+              { value: "rounded", label: t("notch.clockFont.rounded") },
+              { value: "bold", label: t("notch.clockFont.bold") },
+            ]}
+          />
+        </SettingRow>
+
+        <SettingRow
+          icon={Eye}
+          label={t("notch.idleOpacity")}
+          desc={t("notch.idleOpacity.desc", { percent: Math.round(idleOpacity * 100) })}
+          settingKey="notch.idleOpacity"
+          divider={false}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <input
+              type="range"
+              min="0.4"
+              max="1.0"
+              step="0.05"
+              value={idleOpacity}
+              onChange={(e) => void setIdleOpacity(parseFloat(e.target.value))}
+              className="settings-slider"
+            />
+            <span className="setting-value-badge">{Math.round(idleOpacity * 100)}%</span>
+          </div>
+        </SettingRow>
 
       </SettingSection>
 

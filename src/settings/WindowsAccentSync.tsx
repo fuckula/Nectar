@@ -1,38 +1,64 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { SwatchBook } from "lucide-react";
 import { SettingRow } from "./SettingRow";
 import { useT } from "../i18n";
+import { bridgeInvoke } from "../utils/tauriBridge";
+import { useSyncedSetting } from "./useSyncedSetting";
 
 const KEY = "nectar-sync-windows-accent";
+const parseSync = (raw: unknown): boolean => raw === true || raw === "true";
 
 export function WindowsAccentSync({ color }: { color: string }) {
   const t = useT();
-  const [on, setOn] = useState(() => localStorage.getItem(KEY) === "true");
+  const [on, saveOn] = useSyncedSetting(KEY, parseSync, String);
   const [error, setError] = useState("");
-  const first = useRef(true);
+  const prevColorRef = useRef(color);
+  const onRef = useRef(on);
+  onRef.current = on;
+  const pendingHexRef = useRef<string | null>(null);
+  const timerRef = useRef<number | null>(null);
 
   useEffect(() => {
-    if (first.current) {
-      first.current = false;
-      return;
-    }
+    return () => {
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+        timerRef.current = null;
+        const pendingHex = pendingHexRef.current;
+        pendingHexRef.current = null;
+        if (pendingHex && onRef.current) {
+          bridgeInvoke("sync_windows_accent", { hex: pendingHex }).catch(() => {});
+        }
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (prevColorRef.current === color) return;
+    prevColorRef.current = color;
     if (!on) return;
-    const timer = setTimeout(() => invoke("sync_windows_accent", { hex: color }).catch(() => { }), 400);
-    return () => clearTimeout(timer);
-  }, [color]);
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+    }
+    pendingHexRef.current = color;
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      pendingHexRef.current = null;
+      if (onRef.current) {
+        bridgeInvoke("sync_windows_accent", { hex: color }).catch(() => {});
+      }
+    }, 400);
+  }, [color, on]);
 
   const toggle = () => {
     const next = !on;
     setError("");
-    setOn(next);
-    localStorage.setItem(KEY, String(next));
-    invoke("save_setting", { key: KEY, value: String(next) }).catch(() => { });
-    (next ? invoke("sync_windows_accent", { hex: color }) : invoke("restore_windows_accent")).catch((e) => {
+    saveOn(next);
+    (next
+      ? bridgeInvoke("sync_windows_accent", { hex: color })
+      : bridgeInvoke("restore_windows_accent")
+    ).catch((e) => {
       setError(String(e));
-      setOn(!next);
-      localStorage.setItem(KEY, String(!next));
-      invoke("save_setting", { key: KEY, value: String(!next) }).catch(() => { });
+      saveOn(!next);
     });
   };
 

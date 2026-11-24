@@ -17,12 +17,24 @@ export interface MonitorInfo {
 
 export type MonitorMode = "primary" | "all" | "specific";
 
-export type SettingsTab = "general" | "appearance" | "notch" | "dock" | "overlays" | "about" | "diagnostics" | "calendar-sync";
+export type TrayHostStatus = "active" | "blocked_by_zbid" | "stopped";
+
+export interface HotkeyStatus {
+  notch_ok: boolean;
+  notch_shortcut: string;
+  launcher_ok: boolean;
+  launcher_shortcut: string;
+  traybar_ok: boolean;
+  traybar_shortcut: string;
+}
+
+export type SettingsTab = "general" | "appearance" | "notch" | "dock" | "launcher" | "start" | "overlays" | "about" | "diagnostics" | "calendar-sync";
 
 export interface SettingRowProps {
   icon: ComponentType<SVGProps<SVGSVGElement> & { size?: number; strokeWidth?: number }>;
   label: string;
   desc?: string;
+  settingKey?: string;
   action?: boolean;
   danger?: boolean;
   divider?: boolean;

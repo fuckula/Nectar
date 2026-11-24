@@ -567,14 +567,18 @@ pub async fn ics_add_link(app: AppHandle, url: String, name: String) -> Result<c
 }
 
 #[tauri::command]
-pub fn ics_remove_link(app: AppHandle, id: String) -> Result<calendar_sync::CalendarState, String> {
-    if let Ok(entry) = secret(&id) {
-        let _ = entry.delete_credential();
-    }
-    let links: Vec<LinkMeta> = list_links(&app).into_iter().filter(|l| l.id != id).collect();
-    write_links(&app, &links)?;
-    calendar_sync::drop_source(&app, &link_key(&id));
-    Ok(calendar_sync::emit_state(&app))
+pub async fn ics_remove_link(app: AppHandle, id: String) -> Result<calendar_sync::CalendarState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Ok(entry) = secret(&id) {
+            let _ = entry.delete_credential();
+        }
+        let links: Vec<LinkMeta> = list_links(&app).into_iter().filter(|l| l.id != id).collect();
+        write_links(&app, &links)?;
+        calendar_sync::drop_source(&app, &link_key(&id));
+        Ok(calendar_sync::emit_state(&app))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]

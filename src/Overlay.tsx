@@ -1,10 +1,16 @@
 import { StrictMode, useState, useEffect, useRef, useCallback, useLayoutEffect } from "react";
+import type { CSSProperties } from "react";
 import { createRoot } from "react-dom/client";
 import { motion, AnimatePresence } from "framer-motion";
+import { NectarMotionProvider } from "./components/NectarMotionProvider";
+import { useSurfaceMetrics } from "./hooks/useSurfaceMetrics";
 import { listen, emit } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { useSettingsSync } from "./hooks/useSettingsSync";
+import { clearSettingsPreservingOnboarding, hydrateSettingsFromBackend } from "./utils/settingsHydration";
 import { useTrailingThrottle } from "./hooks/useTrailingThrottle";
+import { useGameMode } from "./hooks/useGameMode";
+import { isAppTintExcluded } from "./utils/iconTint";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Check, ChevronRight } from "lucide-react";
@@ -36,22 +42,29 @@ function MixerTile({
   session,
   onVolumeChange,
   onMuteToggle,
-  draggingRef
+  draggingRef,
+  tintExcluded,
 }: {
   session: AudioSession;
   onVolumeChange: (pid: number, volume: number) => void;
   onMuteToggle: (pid: number) => void;
   draggingRef: { current: number | null };
+  tintExcluded: boolean;
 }) {
   const t = useT();
+  const { scaleSpring } = useSurfaceMetrics();
   const [icon, setIcon] = useState<string | null>(null);
   const [showPercentage, setShowPercentage] = useState(false);
   const barRef = useRef<HTMLDivElement>(null);
-  const percentageTimeoutRef = useRef<any>(null);
+  const activePointerIdRef = useRef<number | null>(null);
+  const percentageTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastPercentageRef = useRef<number | null>(null);
 
   useEffect(() => {
-    if (!session.process_path) return;
+    if (!session.process_path) {
+      setIcon(null);
+      return;
+    }
     let alive = true;
     invoke<string | null>("get_app_icon", {
       path: session.process_path,
@@ -67,6 +80,18 @@ function MixerTile({
     };
   }, [session.process_path, session.name]);
 
+  useEffect(() => {
+    return () => {
+      if (draggingRef.current === session.pid) {
+        draggingRef.current = null;
+      }
+      if (percentageTimeoutRef.current) {
+        clearTimeout(percentageTimeoutRef.current);
+        percentageTimeoutRef.current = null;
+      }
+    };
+  }, [session.pid, draggingRef]);
+
   const percentage = Math.round((session.is_muted ? 0 : session.volume) * 100);
 
   // Show the percentage instead of the logo while the volume changes.
@@ -76,30 +101,66 @@ function MixerTile({
     if (previous === null || previous === percentage) return;
     setShowPercentage(true);
     if (percentageTimeoutRef.current) clearTimeout(percentageTimeoutRef.current);
-    percentageTimeoutRef.current = setTimeout(() => setShowPercentage(false), 1200);
+    percentageTimeoutRef.current = setTimeout(() => {
+      percentageTimeoutRef.current = null;
+      setShowPercentage(false);
+    }, 1200);
     return () => {
-      if (percentageTimeoutRef.current) clearTimeout(percentageTimeoutRef.current);
+      if (percentageTimeoutRef.current) {
+        clearTimeout(percentageTimeoutRef.current);
+        percentageTimeoutRef.current = null;
+      }
     };
   }, [percentage]);
 
   const volumeFromY = (clientY: number) => {
     if (!barRef.current) return;
     const rect = barRef.current.getBoundingClientRect();
+    if (rect.height <= 0) return;
     const relativeY = rect.bottom - clientY;
     onVolumeChange(session.pid, Math.max(0, Math.min(1, relativeY / rect.height)));
   };
 
-  const handleMouseDown = (e: React.MouseEvent) => {
+  const releaseCapture = (el: HTMLDivElement, pointerId: number) => {
+    try {
+      if (el.hasPointerCapture(pointerId)) {
+        el.releasePointerCapture(pointerId);
+      }
+    } catch {
+      // Ignore if capture is unsupported or already released
+    }
+  };
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    activePointerIdRef.current = e.pointerId;
     draggingRef.current = session.pid;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {}
     volumeFromY(e.clientY);
-    const handleMouseMove = (moveE: MouseEvent) => volumeFromY(moveE.clientY);
-    const handleMouseUp = () => {
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (activePointerIdRef.current !== e.pointerId) return;
+    volumeFromY(e.clientY);
+  };
+
+  const handlePointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (activePointerIdRef.current === e.pointerId) {
+      activePointerIdRef.current = null;
+    }
+    if (draggingRef.current === session.pid) {
       draggingRef.current = null;
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
-    };
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", handleMouseUp);
+    }
+    releaseCapture(e.currentTarget, e.pointerId);
+  };
+
+  const handleLostCapture = () => {
+    activePointerIdRef.current = null;
+    if (draggingRef.current === session.pid) {
+      draggingRef.current = null;
+    }
   };
 
   return (
@@ -107,8 +168,11 @@ function MixerTile({
       <div
         ref={barRef}
         className="volume-mixer-bar"
-        onMouseDown={handleMouseDown}
-        onTouchStart={(e) => volumeFromY(e.touches[0].clientY)}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerEnd}
+        onPointerCancel={handlePointerEnd}
+        onLostPointerCapture={handleLostCapture}
         onWheel={(e) => {
           if (localStorage.getItem("nectar-notch-scroll-volume") !== "true") return;
           e.stopPropagation();
@@ -123,7 +187,7 @@ function MixerTile({
           className="volume-mixer-fill"
           initial={false}
           animate={{ height: `${percentage}%` }}
-          transition={{ type: "spring", stiffness: 300, damping: 35 }}
+          transition={scaleSpring({ type: "spring", stiffness: 300, damping: 35 })}
         />
       </div>
       <button
@@ -134,7 +198,13 @@ function MixerTile({
         title={session.is_muted ? t("overlay.unmute") : t("overlay.mute")}
       >
         {icon ? (
-          <img src={icon} alt="" draggable={false} />
+          <img
+            src={icon}
+            alt=""
+            className={tintExcluded ? undefined : "nectar-tintable-icon"}
+            data-tint-excluded={tintExcluded ? "true" : undefined}
+            draggable={false}
+          />
         ) : (
           <span className="volume-mixer-action-fallback">
             {session.name.charAt(0).toUpperCase()}
@@ -176,7 +246,9 @@ function VolumeNotch({
   onVolumeChange,
   mixerExpanded,
   onMixerExpandedChange,
-  side
+  side,
+  pillWidth,
+  tintExclusionsVer: _tintExclusionsVer,
 }: {
   volume: number;
   isMuted: boolean;
@@ -184,11 +256,15 @@ function VolumeNotch({
   mixerExpanded: boolean;
   onMixerExpandedChange: (expanded: boolean) => void;
   side: Side;
+  pillWidth: number;
+  tintExclusionsVer: number;
 }) {
   const t = useT();
+  const { scaleSpring, scaleDuration } = useSurfaceMetrics();
   const dir = side === "right" ? -1 : 1;
   const percentage = Math.round(volume * 100);
   const barRef = useRef<HTMLDivElement>(null);
+  const activeBarPointerRef = useRef<number | null>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef<number | null>(null);
 
@@ -395,30 +471,46 @@ function VolumeNotch({
     [sessions]
   );
 
-  const handleBarInteraction = (e: React.MouseEvent | React.TouchEvent) => {
+  const volumeFromY = (clientY: number) => {
     if (!barRef.current) return;
     const rect = barRef.current.getBoundingClientRect();
-    const clientY = "touches" in e ? e.touches[0].clientY : e.clientY;
+    if (rect.height <= 0) return;
     const relativeY = rect.bottom - clientY;
     const newVolume = Math.max(0, Math.min(1, relativeY / rect.height));
     onVolumeChange(newVolume);
   };
 
-  const handleMouseDown = (e: React.MouseEvent) => {
-    handleBarInteraction(e);
-    const handleMouseMove = (moveE: MouseEvent) => {
-      if (!barRef.current) return;
-      const rect = barRef.current.getBoundingClientRect();
-      const relativeY = rect.bottom - moveE.clientY;
-      const newVolume = Math.max(0, Math.min(1, relativeY / rect.height));
-      onVolumeChange(newVolume);
-    };
-    const handleMouseUp = () => {
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
-    };
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", handleMouseUp);
+  const releaseBarCapture = (el: HTMLDivElement, pointerId: number) => {
+    try {
+      if (el.hasPointerCapture(pointerId)) {
+        el.releasePointerCapture(pointerId);
+      }
+    } catch {}
+  };
+
+  const handleBarPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    activeBarPointerRef.current = e.pointerId;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {}
+    volumeFromY(e.clientY);
+  };
+
+  const handleBarPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (activeBarPointerRef.current !== e.pointerId) return;
+    volumeFromY(e.clientY);
+  };
+
+  const handleBarPointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (activeBarPointerRef.current === e.pointerId) {
+      activeBarPointerRef.current = null;
+    }
+    releaseBarCapture(e.currentTarget, e.pointerId);
+  };
+
+  const handleBarLostCapture = () => {
+    activeBarPointerRef.current = null;
   };
 
   return (
@@ -434,25 +526,25 @@ function VolumeNotch({
               x: -64 * dir,
               opacity: 0,
               y: "-50%",
-              transition: { duration: 0.22, ease: [0.32, 0.72, 0, 1] }
+              transition: { duration: scaleDuration(0.22), ease: [0.32, 0.72, 0, 1] }
             }
           : {
               scaleX: 0,
               scaleY: 0.8,
               opacity: 0,
               y: "-50%",
-              transition: { duration: 0.2, ease: [0.32, 0.72, 0, 1] }
+              transition: { duration: scaleDuration(0.2), ease: [0.32, 0.72, 0, 1] }
             }
       }
-      transition={{ type: "spring", stiffness: 450, damping: 30, mass: 0.7 }}
+      transition={scaleSpring({ type: "spring", stiffness: 450, damping: 30, mass: 0.7 })}
     >
       <div className="volume-notch-flares" />
-      <SurfaceShape edge={side} flare={13} radius={18} />
+      <SurfaceShape edge={side} flare={13} radius={18} minRadius={6} maxRadius={26} />
       <motion.div
         ref={shellRef}
         className="volume-notch"
-        animate={{ width: mixerExpanded ? 42 + panelWidth : 42 }}
-        transition={{ type: "spring", bounce: 0, duration: 0.35 }}
+        animate={{ width: mixerExpanded ? pillWidth + panelWidth : pillWidth }}
+        transition={scaleSpring({ type: "spring", bounce: 0, duration: 0.35 })}
         onAnimationComplete={reportPanelBounds}
       >
         <motion.div
@@ -463,8 +555,8 @@ function VolumeNotch({
           }}
           initial={{ opacity: 0, x: -10 * dir }}
           animate={{ opacity: 1, x: 0 }}
-          exit={{ opacity: 0, x: -5 * dir, transition: { duration: 0.15 } }}
-          transition={{ delay: 0.05, duration: 0.2, ease: "easeOut" }}
+          exit={{ opacity: 0, x: -5 * dir, transition: { duration: scaleDuration(0.15) } }}
+          transition={{ delay: scaleDuration(0.05), duration: scaleDuration(0.2), ease: "easeOut" }}
         >
           <button
             className={`volume-notch-device ${mixerExpanded && view === "devices" ? "active" : ""}`}
@@ -479,15 +571,18 @@ function VolumeNotch({
           <div
             ref={barRef}
             className="volume-notch-bar"
-            onMouseDown={handleMouseDown}
-            onTouchStart={handleBarInteraction}
+            onPointerDown={handleBarPointerDown}
+            onPointerMove={handleBarPointerMove}
+            onPointerUp={handleBarPointerEnd}
+            onPointerCancel={handleBarPointerEnd}
+            onLostPointerCapture={handleBarLostCapture}
             style={{ cursor: "pointer" }}
           >
             <motion.div
               className="volume-notch-fill"
               initial={false}
               animate={{ height: isMuted ? "0%" : `${percentage}%` }}
-              transition={{ type: "spring", stiffness: 300, damping: 35 }}
+              transition={scaleSpring({ type: "spring", stiffness: 300, damping: 35 })}
             />
           </div>
           <button
@@ -521,8 +616,8 @@ function VolumeNotch({
                 opacity: 0,
                 x: -18 * dir,
                 transition: {
-                  x: { duration: 0.28, ease: [0.32, 0.72, 0, 1] },
-                  opacity: { duration: 0.18, delay: 0.1 }
+                  x: { duration: scaleDuration(0.28), ease: [0.32, 0.72, 0, 1] },
+                  opacity: { duration: scaleDuration(0.18), delay: scaleDuration(0.1) }
                 }
               }}
             >
@@ -544,7 +639,7 @@ function VolumeNotch({
                 </div>
               )}
               {view === "devices" ? (
-                <div className="volume-device-list">
+                <div className="volume-device-list nectar-menu-pop">
                   {devices.length === 0 ? (
                     <div className="volume-mixer-empty">
                       {!devicesLoaded
@@ -590,6 +685,7 @@ function VolumeNotch({
                         onVolumeChange={handleAppVolumeChange}
                         onMuteToggle={handleAppMuteToggle}
                         draggingRef={draggingRef}
+                        tintExcluded={isAppTintExcluded(session.process_path || session.name)}
                       />
                     ))
                   )}
@@ -605,54 +701,77 @@ function VolumeNotch({
 
 // ─── Brightness Notch ───────────────────────────────────────────────────────
 
-const SunIcon = ({ brightness }: { brightness: number }) => (
-  <motion.div
-    className="brightness-icon-container"
-    animate={{ rotate: (brightness / 100) * 180 }}
-    transition={{ type: "spring", stiffness: 200, damping: 25 }}
-  >
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <circle cx="12" cy="12" r="5" stroke="currentColor" strokeWidth="2.5" />
-      <path d="M12 2V4M12 20V22M4.93 4.93L6.34 6.34M17.66 17.66L19.07 19.07M2 12H4M20 12H22M4.93 19.07L6.34 17.66M17.66 6.34L19.07 4.93" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
-    </svg>
-  </motion.div>
-);
+const SunIcon = ({ brightness }: { brightness: number }) => {
+  const { scaleSpring } = useSurfaceMetrics();
+  return (
+    <motion.div
+      className="brightness-icon-container"
+      animate={{ rotate: (brightness / 100) * 180 }}
+      transition={scaleSpring({ type: "spring", stiffness: 200, damping: 25 })}
+    >
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="12" cy="12" r="5" stroke="currentColor" strokeWidth="2.5" />
+        <path d="M12 2V4M12 20V22M4.93 4.93L6.34 6.34M17.66 17.66L19.07 19.07M2 12H4M20 12H22M4.93 19.07L6.34 17.66M17.66 6.34L19.07 4.93" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+      </svg>
+    </motion.div>
+  );
+};
 
 function BrightnessNotch({
   brightness,
   onBrightnessChange,
   side,
+  pillWidth,
 }: {
   brightness: number;
   onBrightnessChange: (val: number) => void;
   side: Side;
+  pillWidth: number;
 }) {
+  const { scaleSpring, scaleDuration } = useSurfaceMetrics();
   const barRef = useRef<HTMLDivElement>(null);
+  const activeBarPointerRef = useRef<number | null>(null);
 
-  const handleBarInteraction = (e: React.MouseEvent | React.TouchEvent) => {
+  const brightnessFromY = (clientY: number) => {
     if (!barRef.current) return;
     const rect = barRef.current.getBoundingClientRect();
-    const clientY = 'touches' in e ? e.touches[0].clientY : e.clientY;
+    if (rect.height <= 0) return;
     const relativeY = rect.bottom - clientY;
     const newBrightness = Math.max(0, Math.min(100, (relativeY / rect.height) * 100));
     onBrightnessChange(newBrightness);
   };
 
-  const handleMouseDown = (e: React.MouseEvent) => {
-    handleBarInteraction(e);
-    const handleMouseMove = (moveE: MouseEvent) => {
-      if (!barRef.current) return;
-      const rect = barRef.current.getBoundingClientRect();
-      const relativeY = rect.bottom - moveE.clientY;
-      const newBrightness = Math.max(0, Math.min(100, (relativeY / rect.height) * 100));
-      onBrightnessChange(newBrightness);
-    };
-    const handleMouseUp = () => {
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
-    };
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('mouseup', handleMouseUp);
+  const releaseBarCapture = (el: HTMLDivElement, pointerId: number) => {
+    try {
+      if (el.hasPointerCapture(pointerId)) {
+        el.releasePointerCapture(pointerId);
+      }
+    } catch {}
+  };
+
+  const handleBarPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    activeBarPointerRef.current = e.pointerId;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {}
+    brightnessFromY(e.clientY);
+  };
+
+  const handleBarPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (activeBarPointerRef.current !== e.pointerId) return;
+    brightnessFromY(e.clientY);
+  };
+
+  const handleBarPointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (activeBarPointerRef.current === e.pointerId) {
+      activeBarPointerRef.current = null;
+    }
+    releaseBarCapture(e.currentTarget, e.pointerId);
+  };
+
+  const handleBarLostCapture = () => {
+    activeBarPointerRef.current = null;
   };
 
   return (
@@ -661,11 +780,11 @@ function BrightnessNotch({
       style={{ transformOrigin: `${side} center` }}
       initial={{ scaleX: 0, scaleY: 0.5, opacity: 0, y: "-50%" }}
       animate={{ scaleX: 1, scaleY: 1, opacity: 1, y: "-50%" }}
-      exit={{ scaleX: 0, scaleY: 0.8, opacity: 0, y: "-50%", transition: { duration: 0.2, ease: [0.32, 0.72, 0, 1] } }}
-      transition={{ type: "spring", stiffness: 450, damping: 30, mass: 0.7 }}
+      exit={{ scaleX: 0, scaleY: 0.8, opacity: 0, y: "-50%", transition: { duration: scaleDuration(0.2), ease: [0.32, 0.72, 0, 1] } }}
+      transition={scaleSpring({ type: "spring", stiffness: 450, damping: 30, mass: 0.7 })}
     >
-      <SurfaceShape edge={side} flare={13} radius={18} />
-      <div className="brightness-notch">
+      <SurfaceShape edge={side} flare={13} radius={18} minRadius={6} maxRadius={26} />
+      <div className="brightness-notch" style={{ width: pillWidth }}>
         <motion.div
           className="brightness-notch-content-group"
           onWheel={(e) => {
@@ -674,15 +793,24 @@ function BrightnessNotch({
           }}
           initial={{ opacity: 0, x: side === "right" ? 10 : -10 }}
           animate={{ opacity: 1, x: 0 }}
-          exit={{ opacity: 0, x: side === "right" ? 5 : -5, transition: { duration: 0.15 } }}
-          transition={{ delay: 0.05, duration: 0.2, ease: "easeOut" }}
+          exit={{ opacity: 0, x: side === "right" ? 5 : -5, transition: { duration: scaleDuration(0.15) } }}
+          transition={{ delay: scaleDuration(0.05), duration: scaleDuration(0.2), ease: "easeOut" }}
         >
-          <div ref={barRef} className="brightness-notch-bar" onMouseDown={handleMouseDown} onTouchStart={handleBarInteraction} style={{ cursor: 'pointer' }}>
+          <div
+            ref={barRef}
+            className="brightness-notch-bar"
+            onPointerDown={handleBarPointerDown}
+            onPointerMove={handleBarPointerMove}
+            onPointerUp={handleBarPointerEnd}
+            onPointerCancel={handleBarPointerEnd}
+            onLostPointerCapture={handleBarLostCapture}
+            style={{ cursor: 'pointer' }}
+          >
             <motion.div
               className="brightness-notch-fill"
               initial={false}
               animate={{ height: `${brightness}%` }}
-              transition={{ type: "spring", stiffness: 300, damping: 35 }}
+              transition={scaleSpring({ type: "spring", stiffness: 300, damping: 35 })}
             />
           </div>
           <div className="brightness-notch-icon">
@@ -698,6 +826,11 @@ function BrightnessNotch({
 
 function OverlayApp() {
   const t = useT();
+  const { shouldSuppressToasts } = useGameMode();
+  const shouldSuppressToastsRef = useRef(shouldSuppressToasts);
+  shouldSuppressToastsRef.current = shouldSuppressToasts;
+  const [tintExclusionsVer, setTintExclusionsVer] = useState(0);
+
   useEffect(() => {
     return initTheme();
   }, []);
@@ -723,6 +856,23 @@ function OverlayApp() {
 
   // Shared state
   const [scale, setScale] = useState(() => parseFloat(localStorage.getItem("nectar-scale") || "1.0"));
+  const [overlayVpos, setOverlayVpos] = useState<"top" | "center" | "bottom">(() => {
+    const v = localStorage.getItem("nectar-overlay-vpos");
+    return v === "top" || v === "bottom" ? v : "center";
+  });
+  const [overlayStyle, setOverlayStyle] = useState<"slim" | "default" | "wide">(() => {
+    const v = localStorage.getItem("nectar-overlay-style");
+    return v === "slim" || v === "wide" ? v : "default";
+  });
+  const [overlayTimeoutMs, setOverlayTimeoutMs] = useState<number>(() => {
+    const n = parseInt(localStorage.getItem("nectar-overlay-timeout-ms") || "2000", 10);
+    return Number.isFinite(n) ? Math.min(5000, Math.max(1000, n)) : 2000;
+  });
+  const overlayTimeoutMsRef = useRef(overlayTimeoutMs);
+  overlayTimeoutMsRef.current = overlayTimeoutMs;
+  const [overlayAccentFill, setOverlayAccentFill] = useState<boolean>(
+    () => localStorage.getItem("nectar-overlay-accent-fill") === "true"
+  );
   const timeoutRef = useRef<any>(null);
   const hideWindowTimeoutRef = useRef<any>(null);
   const splashActiveRef = useRef(false);
@@ -740,127 +890,223 @@ function OverlayApp() {
     if (timeoutRef.current) clearTimeout(timeoutRef.current);
     timeoutRef.current = setTimeout(() => {
       if (!splashActiveRef.current) setMode('idle');
-    }, 2000);
+    }, overlayTimeoutMsRef.current);
   }, []);
 
-  // Load scale from settings
+  // Hydrate overlay settings from backend settings.json
   useEffect(() => {
-    invoke("load_settings").then((settings: any) => {
-      if (settings && settings["nectar-notch-scroll-volume"] !== undefined) {
-        localStorage.setItem("nectar-notch-scroll-volume", String(settings["nectar-notch-scroll-volume"]));
+    let cancelled = false;
+    const readBool = (val: unknown, fallback = true) =>
+      val === null || val === undefined ? fallback : val !== false && String(val) !== "false";
+
+    hydrateSettingsFromBackend().then((settings) => {
+      if (cancelled || !settings) return;
+      if (settings["nectar-scale"] != null) {
+        const parsed = parseFloat(String(settings["nectar-scale"]));
+        if (!Number.isNaN(parsed)) setScale(parsed);
       }
-      if (settings && settings["nectar-scale"] !== undefined) {
-        setScale(parseFloat(settings["nectar-scale"]));
+      if (Object.prototype.hasOwnProperty.call(settings, "nectar-volume-overlay-enabled")) {
+        setVolumeOverlayEnabled(readBool(settings["nectar-volume-overlay-enabled"], true));
       }
-      if (settings && settings["nectar-brightness-overlay-enabled"] !== undefined) {
-        setBrightnessOverlayEnabled(settings["nectar-brightness-overlay-enabled"] === "true");
+      if (Object.prototype.hasOwnProperty.call(settings, "nectar-volume-edge-enabled")) {
+        setVolumeEdgeEnabled(readBool(settings["nectar-volume-edge-enabled"], true));
       }
-      if (settings && settings["nectar-volume-side"] !== undefined) setVolumeSide(asSide(String(settings["nectar-volume-side"]), "left"));
-      if (settings && settings["nectar-brightness-side"] !== undefined) setBrightnessSide(asSide(String(settings["nectar-brightness-side"]), "right"));
-      if (settings && settings["nectar-volume-overlay-enabled"] !== undefined) {
-        setVolumeOverlayEnabled(settings["nectar-volume-overlay-enabled"] === "true");
+      if (Object.prototype.hasOwnProperty.call(settings, "nectar-brightness-overlay-enabled")) {
+        setBrightnessOverlayEnabled(readBool(settings["nectar-brightness-overlay-enabled"], true));
       }
-    }).catch(console.error);
+      if (Object.prototype.hasOwnProperty.call(settings, "nectar-brightness-edge-enabled")) {
+        setBrightnessEdgeEnabled(readBool(settings["nectar-brightness-edge-enabled"], true));
+      }
+      if (settings["nectar-volume-side"] != null) {
+        setVolumeSide(asSide(String(settings["nectar-volume-side"]), "left"));
+      }
+      if (settings["nectar-brightness-side"] != null) {
+        setBrightnessSide(asSide(String(settings["nectar-brightness-side"]), "right"));
+      }
+      if (settings["nectar-overlay-vpos"] != null) {
+        const vp = String(settings["nectar-overlay-vpos"]);
+        setOverlayVpos(vp === "top" || vp === "bottom" ? vp : "center");
+      }
+      if (settings["nectar-overlay-style"] != null) {
+        const st = String(settings["nectar-overlay-style"]);
+        setOverlayStyle(st === "slim" || st === "wide" ? st : "default");
+      }
+      if (settings["nectar-overlay-timeout-ms"] != null) {
+        const ms = Number(settings["nectar-overlay-timeout-ms"]);
+        if (Number.isFinite(ms)) setOverlayTimeoutMs(Math.min(5000, Math.max(1000, ms)));
+      }
+      if (Object.prototype.hasOwnProperty.call(settings, "nectar-overlay-accent-fill")) {
+        setOverlayAccentFill(readBool(settings["nectar-overlay-accent-fill"], false));
+      }
+      setTintExclusionsVer((v) => v + 1);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
-    invoke<number>("get_brightness").then((value) => setBrightness(value)).catch(() => {});
+    let cancelled = false;
+    invoke<number>("get_brightness")
+      .then((value) => { if (!cancelled) setBrightness(value); })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Seed the HUD with the live volume, the worker's first event fires before we can listen.
   useEffect(() => {
+    let cancelled = false;
     invoke<{ volume: number; is_muted: boolean }>("get_volume_state")
       .then((state) => {
+        if (cancelled) return;
         setVolume(state.volume);
         setIsMuted(state.is_muted);
       })
       .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+    };
   }, []);
 
   // ── Splash Detection ──
+  const splashFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const splashCompleteTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
+
   useEffect(() => {
+    let cancelled = false;
     const showSplash = async () => {
       splashActiveRef.current = true;
       splashPlayingRef.current = true;
       try { await invoke('set_splash_fullscreen', { fullscreen: true }); } catch { /* keep going */ }
-      for (let i = 0; i < 30 && document.visibilityState !== 'visible'; i++) {
+      for (let i = 0; i < 30 && document.visibilityState !== 'visible' && !cancelled; i++) {
         await new Promise((r) => setTimeout(r, 50));
       }
+      if (cancelled) return;
       await new Promise((r) => setTimeout(r, 200));
-      setMode('splash');
+      if (!cancelled) setMode('splash');
     };
-    setTimeout(() => onSplashCompleteRef.current(), 5500);
+    splashFallbackTimerRef.current = setTimeout(() => onSplashCompleteRef.current(), 5500);
 
-    showSplash();
-    getVersion().then((v) => localStorage.setItem("nectar-app-version", v)).catch(() => {});
+    void showSplash();
+    getVersion()
+      .then((v) => { if (!cancelled) localStorage.setItem("nectar-app-version", v); })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (splashFallbackTimerRef.current) {
+        clearTimeout(splashFallbackTimerRef.current);
+        splashFallbackTimerRef.current = null;
+      }
+      splashCompleteTimersRef.current.forEach((id) => clearTimeout(id));
+      splashCompleteTimersRef.current = [];
+    };
   }, []);
 
   const onSplashComplete = useCallback(() => {
     if (splashDoneRef.current) return;
     splashDoneRef.current = true;
-    localStorage.setItem("nectar-first-run", "done");
-    setTimeout(() => {
+    if (splashFallbackTimerRef.current) {
+      clearTimeout(splashFallbackTimerRef.current);
+      splashFallbackTimerRef.current = null;
+    }
+    try {
+      localStorage.setItem("nectar-first-run", "done");
+    } catch {}
+    const finishTimer = setTimeout(() => {
       splashActiveRef.current = false;
       splashPlayingRef.current = false;
       setMode('idle');
-      invoke('set_splash_fullscreen', { fullscreen: false });
+      invoke('set_splash_fullscreen', { fullscreen: false }).catch(() => {});
       const pending = pendingUpdateRef.current;
       pendingUpdateRef.current = null;
       if (pending && pending.status !== 'done') applyUpdateStatusRef.current(pending);
     }, 300);
-    emit('splash-done');
-    [800, 2000, 4000].forEach((ms) => setTimeout(() => emit('splash-done'), ms));
+    splashCompleteTimersRef.current.push(finishTimer);
+    emit('splash-done').catch(() => {});
+    [800, 2000, 4000].forEach((ms) => {
+      const id = setTimeout(() => { emit('splash-done').catch(() => {}); }, ms);
+      splashCompleteTimersRef.current.push(id);
+    });
   }, []);
   onSplashCompleteRef.current = onSplashComplete;
 
   // ── Event Listeners ──
   useEffect(() => {
+    let cancelled = false;
     const preventContext = (e: MouseEvent) => e.preventDefault();
     document.addEventListener('contextmenu', preventContext);
 
-    const volPromise = listen("volume-change", (event: any) => {
-      if (splashActiveRef.current || !volumeOverlayEnabled) return;
-      invoke("hide_native_osd");
+    let stopVol: (() => void) | undefined;
+    let stopVolEdge: (() => void) | undefined;
+    let stopBright: (() => void) | undefined;
+    let stopBrightEdge: (() => void) | undefined;
+    let stopUpdate: (() => void) | undefined;
+    let stopReset: (() => void) | undefined;
+
+    listen("volume-change", (event: any) => {
+      if (cancelled || splashActiveRef.current || !volumeOverlayEnabled || shouldSuppressToastsRef.current) return;
+      invoke("hide_native_osd").catch(() => {});
       const { volume: newVolume, is_muted } = event.payload;
       setVolume(newVolume);
       setIsMuted(is_muted);
       setMode('volume');
       resetHideTimeout();
-    });
+    })
+      .then((fn) => { if (cancelled) fn(); else stopVol = fn; })
+      .catch(() => {});
 
-    const volEdgePromise = listen<boolean>("volume-edge-hover", (event) => {
-      if (splashActiveRef.current || !volumeOverlayEnabled || !volumeEdgeEnabled) return;
+    listen<boolean>("volume-edge-hover", (event) => {
+      if (cancelled || splashActiveRef.current || !volumeOverlayEnabled || !volumeEdgeEnabled || shouldSuppressToastsRef.current) return;
       if (event.payload) {
         setMode('volume');
         if (timeoutRef.current) clearTimeout(timeoutRef.current);
       } else {
         if (timeoutRef.current) clearTimeout(timeoutRef.current);
-        timeoutRef.current = setTimeout(() => setMode('idle'), mixerExpandedRef.current ? 700 : 1500);
+        timeoutRef.current = setTimeout(() => setMode('idle'), mixerExpandedRef.current ? 700 : overlayTimeoutMsRef.current);
       }
-    });
+    })
+      .then((fn) => { if (cancelled) fn(); else stopVolEdge = fn; })
+      .catch(() => {});
 
-    const brightPromise = listen("brightness-change", (event: any) => {
-      if (splashActiveRef.current || !brightnessOverlayEnabled) return;
-      invoke("hide_native_osd");
+    listen("brightness-change", (event: any) => {
+      if (cancelled || splashActiveRef.current || !brightnessOverlayEnabled || shouldSuppressToastsRef.current) return;
+      invoke("hide_native_osd").catch(() => {});
       const { brightness: newBrightness } = event.payload;
       setBrightness(newBrightness);
       setMode('brightness');
       resetHideTimeout();
-    });
+    })
+      .then((fn) => { if (cancelled) fn(); else stopBright = fn; })
+      .catch(() => {});
 
-    const brightEdgePromise = listen<boolean>("brightness-edge-hover", (event) => {
-      if (splashActiveRef.current || !brightnessOverlayEnabled || !brightnessEdgeEnabled) return;
+    listen<boolean>("brightness-edge-hover", (event) => {
+      if (cancelled || splashActiveRef.current || !brightnessOverlayEnabled || !brightnessEdgeEnabled || shouldSuppressToastsRef.current) return;
       if (event.payload) {
-        invoke<number>("get_brightness").then((value) => setBrightness(value)).catch(() => {});
+        invoke<number>("get_brightness").then((value) => { if (!cancelled) setBrightness(value); }).catch(() => {});
         setMode('brightness');
         if (timeoutRef.current) clearTimeout(timeoutRef.current);
       } else {
         if (timeoutRef.current) clearTimeout(timeoutRef.current);
-        timeoutRef.current = setTimeout(() => setMode('idle'), 1500);
+        timeoutRef.current = setTimeout(() => setMode('idle'), overlayTimeoutMsRef.current);
       }
-    });
+    })
+      .then((fn) => { if (cancelled) fn(); else stopBrightEdge = fn; })
+      .catch(() => {});
 
     const applyUpdateStatus = ({ status, progress }: { status: string; progress?: number }) => {
+      if (cancelled) return;
       setUpdateStatus(status);
       if (progress !== undefined) setUpdateProgress(progress);
 
@@ -869,52 +1115,91 @@ function OverlayApp() {
           updatingRef.current = true;
           splashActiveRef.current = true;
           setMode('updating');
-          invoke('set_splash_fullscreen', { fullscreen: true });
+          invoke('set_splash_fullscreen', { fullscreen: true }).catch(() => {});
         }
       } else if (status === 'done') {
         updatingRef.current = false;
         splashActiveRef.current = false;
         setMode('idle');
-        invoke('set_splash_fullscreen', { fullscreen: false });
+        invoke('set_splash_fullscreen', { fullscreen: false }).catch(() => {});
       }
     };
     applyUpdateStatusRef.current = applyUpdateStatus;
 
-    const autoUpdatePromise = listen<{ status: string; progress?: number }>("auto-update-status", (event) => {
+    listen<{ status: string; progress?: number }>("auto-update-status", (event) => {
+      if (cancelled) return;
       if (splashPlayingRef.current) {
         pendingUpdateRef.current = event.payload;
         return;
       }
       applyUpdateStatus(event.payload);
-    });
+    })
+      .then((fn) => { if (cancelled) fn(); else stopUpdate = fn; })
+      .catch(() => {});
 
-    const settingsResetPromise = listen("settings-reset", () => {
-      localStorage.clear();
+    listen("settings-reset", () => {
+      if (cancelled) return;
+      clearSettingsPreservingOnboarding();
       window.location.reload();
-    });
+    })
+      .then((fn) => { if (cancelled) fn(); else stopReset = fn; })
+      .catch(() => {});
 
     return () => {
-      volPromise.then(fn => fn());
-      volEdgePromise.then(fn => fn());
-      brightPromise.then(fn => fn());
-      brightEdgePromise.then(fn => fn());
-      autoUpdatePromise.then(fn => fn());
-      settingsResetPromise.then(fn => fn());
+      cancelled = true;
+      stopVol?.();
+      stopVolEdge?.();
+      stopBright?.();
+      stopBrightEdge?.();
+      stopUpdate?.();
+      stopReset?.();
       document.removeEventListener('contextmenu', preventContext);
     };
   }, [volumeOverlayEnabled, volumeEdgeEnabled, brightnessOverlayEnabled, brightnessEdgeEnabled, resetHideTimeout]);
 
   useSettingsSync(
     {
-      "nectar-volume-overlay-enabled": setVolumeOverlayEnabled,
-      "nectar-volume-edge-enabled": setVolumeEdgeEnabled,
-      "nectar-brightness-overlay-enabled": setBrightnessOverlayEnabled,
-      "nectar-brightness-edge-enabled": setBrightnessEdgeEnabled,
-      "nectar-volume-side": (v: string) => setVolumeSide(asSide(v, "left")),
-      "nectar-brightness-side": (v: string) => setBrightnessSide(asSide(v, "right")),
-      "nectar-scale": setScale,
+      "nectar-volume-overlay-enabled": (v) => setVolumeOverlayEnabled(v !== false && v !== "false"),
+      "nectar-volume-edge-enabled": (v) => setVolumeEdgeEnabled(v !== false && v !== "false"),
+      "nectar-brightness-overlay-enabled": (v) => setBrightnessOverlayEnabled(v !== false && v !== "false"),
+      "nectar-brightness-edge-enabled": (v) => setBrightnessEdgeEnabled(v !== false && v !== "false"),
+      "nectar-volume-side": (v) => setVolumeSide(asSide(v == null ? null : String(v), "left")),
+      "nectar-brightness-side": (v) => setBrightnessSide(asSide(v == null ? null : String(v), "right")),
+      "nectar-scale": (v) => setScale(typeof v === "number" && !Number.isNaN(v) ? v : 1.0),
+      "nectar-overlay-vpos": (v) => {
+        const s = String(v ?? "center");
+        setOverlayVpos(s === "top" || s === "bottom" ? s : "center");
+      },
+      "nectar-overlay-style": (v) => {
+        const s = String(v ?? "default");
+        setOverlayStyle(s === "slim" || s === "wide" ? s : "default");
+      },
+      "nectar-overlay-timeout-ms": (v) => {
+        const n = Number(v);
+        setOverlayTimeoutMs(Number.isFinite(n) ? Math.min(5000, Math.max(1000, n)) : 2000);
+      },
+      "nectar-overlay-accent-fill": (v) => setOverlayAccentFill(v === true || v === "true"),
+      "nectar-icon-tint-excluded": () => setTintExclusionsVer((v) => v + 1),
+    },
+    undefined,
+    {
+      onReset: () => setTintExclusionsVer((v) => v + 1),
     }
   );
+
+  // Side effects: reset overlay mode to idle when overlay is disabled or Game Mode suppresses OSD
+  useEffect(() => {
+    if (splashActiveRef.current || updatingRef.current) return;
+    if (shouldSuppressToasts && (mode === 'volume' || mode === 'brightness')) {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      mixerExpandedRef.current = false;
+      setMixerExpanded(false);
+      setMode('idle');
+    }
+  }, [shouldSuppressToasts, mode]);
 
   // Side effects: reset overlay mode to idle when overlay is disabled
   useEffect(() => {
@@ -943,8 +1228,9 @@ function OverlayApp() {
             await appWindow.hide();
           }, 400);
         } else {
-          // Position the window first, then show
+          // Position the window first, wake WebView2 from low-memory mode, then show
           await invoke('sync_overlay_position');
+          await invoke('set_window_low_memory', { low: false }).catch(() => {});
           await appWindow.show();
         }
       } catch (e) {
@@ -1013,9 +1299,15 @@ function OverlayApp() {
   }, [resetHideTimeout, sendBrightness]);
 
   const isLeft = mode === 'volume';
+  const pillWidth = overlayStyle === "slim" ? 34 : overlayStyle === "wide" ? 52 : 42;
 
   return (
-    <div className="overlay-container">
+    <div
+      className={`overlay-container${overlayAccentFill ? " accent-fill" : ""}`}
+      data-vpos={overlayVpos}
+      data-overlay-style={overlayStyle}
+      style={{ '--overlay-pill-width': `${pillWidth}px` } as CSSProperties}
+    >
       {/* Splash Screen */}
       <AnimatePresence>
         {mode === 'splash' && (
@@ -1063,7 +1355,7 @@ function OverlayApp() {
             exit={{ opacity: 0 }}
             transition={{ duration: 0.3 }}
           >
-            <div className="update-splash-card">
+            <div className="update-splash-card nectar-menu-pop">
               <img src="/nectar.png" className="update-splash-logo" alt="Nectar" />
               <p className="update-splash-text">
                 {updateStatus === 'checking' && t("overlay.update.checking")}
@@ -1100,6 +1392,8 @@ function OverlayApp() {
                 mixerExpanded={mixerExpanded}
                 onMixerExpandedChange={handleMixerExpandedChange}
                 side={volumeSide}
+                pillWidth={pillWidth}
+                tintExclusionsVer={tintExclusionsVer}
                 key="volume-island"
               />
             )}
@@ -1108,6 +1402,7 @@ function OverlayApp() {
                 brightness={brightness}
                 onBrightnessChange={handleBrightnessChange}
                 side={brightnessSide}
+                pillWidth={pillWidth}
                 key="brightness-island"
               />
             )}
@@ -1120,6 +1415,8 @@ function OverlayApp() {
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <OverlayApp />
+    <NectarMotionProvider>
+      <OverlayApp />
+    </NectarMotionProvider>
   </StrictMode>
 );

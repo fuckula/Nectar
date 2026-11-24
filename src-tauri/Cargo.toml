@@ -44,6 +44,8 @@ windows = { version = "0.61", features = [
   "Win32_System_Ole",
   "Win32_System_Memory",
   "Win32_System_Power",
+  "Win32_System_DataExchange",
+  "Win32_System_Shutdown",
   "Win32_System_SystemServices",
   "Storage_Streams",
   "Win32_System_Console",
@@ -68,6 +70,8 @@ windows = { version = "0.61", features = [
   "Win32_NetworkManagement_Ndis",
   "Win32_Networking_WinSock",
   "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Kernel",
   "Win32_System_ProcessStatus",
   "Graphics_Capture",
   "Graphics_DirectX",
@@ -102,4 +106,9 @@ chrono-tz = "0.10"
 
 [profile.release]
 strip = true
+lto = "thin"
+codegen-units = 1
+
+[patch.crates-io]
+webview2-com-sys = { path = "vendor/webview2-com-sys" }
 

@@ -55,7 +55,7 @@ pub fn start(app: AppHandle) {
             return;
         }
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, Some(hwnd), 0, 0).as_bool() {
+        while GetMessageW(&mut msg, Some(hwnd), 0, 0).0 > 0 {
             DispatchMessageW(&msg);
         }
     });

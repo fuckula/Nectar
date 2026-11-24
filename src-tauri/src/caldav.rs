@@ -415,7 +415,7 @@ pub async fn caldav_connect(
         ("nectar-caldav-username", username),
         ("nectar-caldav-enabled", "true".to_string()),
     ] {
-        crate::commands::save_setting(app.clone(), key.to_string(), serde_json::Value::String(value))?;
+        crate::commands::save_setting_sync(&app, key, serde_json::Value::String(value))?;
     }
 
     calendar_sync::put_source(
@@ -432,19 +432,23 @@ pub async fn caldav_connect(
 }
 
 #[tauri::command]
-pub fn caldav_disconnect(app: AppHandle) -> Result<calendar_sync::CalendarState, String> {
-    if let Some(username) = crate::utils::get_setting_str(&app, "nectar-caldav-username") {
-        if let Ok(e) = entry(&username) {
-            let _ = e.delete_credential();
+pub async fn caldav_disconnect(app: AppHandle) -> Result<calendar_sync::CalendarState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(username) = crate::utils::get_setting_str(&app, "nectar-caldav-username") {
+            if let Ok(e) = entry(&username) {
+                let _ = e.delete_credential();
+            }
         }
-    }
-    calendar_sync::drop_source(&app, ACCOUNT_KEY);
-    crate::commands::save_setting(
-        app.clone(),
-        "nectar-caldav-enabled".to_string(),
-        serde_json::Value::String("false".to_string()),
-    )?;
-    Ok(calendar_sync::emit_state(&app))
+        calendar_sync::drop_source(&app, ACCOUNT_KEY);
+        crate::commands::save_setting_sync(
+            &app,
+            "nectar-caldav-enabled",
+            serde_json::Value::String("false".to_string()),
+        )?;
+        Ok(calendar_sync::emit_state(&app))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]

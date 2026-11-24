@@ -177,8 +177,9 @@ pub fn read_pins() -> Option<Vec<AppInfo>> {
             Pin::Store(aumid) => {
                 let path = format!("shell:AppsFolder\\{aumid}");
                 if apps.iter().any(|a| a.path.eq_ignore_ascii_case(&path)) { continue; }
-                let name = unsafe { store_display_name(&aumid) }
-                    .unwrap_or_else(|| aumid.split_once('!').map(|(_, a)| a.to_string()).unwrap_or_else(|| aumid.clone()));
+                let Some(name) = (unsafe { store_display_name(&aumid) }) else {
+                    continue;
+                };
                 apps.push(AppInfo { name, path, icon: None, is_running: false, hwnd: None, executable: None, all_hwnds: None, args: None });
                 continue;
             }

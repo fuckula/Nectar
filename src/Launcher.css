@@ -1,0 +1,905 @@
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  overflow: hidden;
+  font-family: var(--nectar-font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
+  color: var(--nectar-text, #f5f5f7);
+  user-select: none;
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+}
+
+.launcher-viewport {
+  width: 100%;
+  min-height: 100%;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 8px;
+  box-sizing: border-box;
+}
+
+.launcher-surface {
+  width: min(660px, 100%);
+  border-radius: var(--shell-radius, 20px);
+  display: flex;
+  flex-direction: column;
+}
+
+.launcher-header {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--shell-divider);
+  flex-shrink: 0;
+}
+
+.launcher-input-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--shell-accent-ink);
+  flex-shrink: 0;
+}
+
+.launcher-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--nectar-text, #ffffff);
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+  caret-color: var(--shell-accent-ink);
+}
+
+.launcher-input::placeholder {
+  color: var(--nectar-text-muted, rgba(255, 255, 255, 0.48));
+}
+
+.light-mode .launcher-input::placeholder {
+  color: rgba(15, 23, 42, 0.45);
+}
+
+.launcher-mode-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  background: color-mix(in srgb, var(--shell-accent) 14%, transparent);
+  color: var(--shell-accent-ink);
+  border: 1px solid color-mix(in srgb, var(--shell-accent) 26%, transparent);
+}
+
+.everything-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(255, 196, 60, 0.85);
+}
+
+.everything-dot.active {
+  background: #30d158;
+}
+
+.light-mode .everything-dot.active {
+  background: #16a34a;
+}
+
+.launcher-icon-pill {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--shell-chip-radius, 8px);
+  border: 1px solid var(--shell-card-border);
+  background: var(--shell-card-bg);
+  color: var(--nectar-text-muted, rgba(255, 255, 255, 0.72));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s var(--nectar-ease, ease), color 0.15s ease, border-color 0.15s var(--nectar-ease, ease), box-shadow 0.15s var(--nectar-ease, ease);
+}
+
+.light-mode .launcher-icon-pill {
+  color: rgba(15, 23, 42, 0.68);
+}
+
+.launcher-icon-pill:hover,
+.launcher-icon-pill.active {
+  background: var(--shell-popover-hover-bg, color-mix(in srgb, var(--shell-accent) 16%, var(--shell-card-bg-hover)));
+  border-color: var(--shell-popover-hover-border, color-mix(in srgb, var(--shell-accent) 32%, transparent));
+  box-shadow: var(--shell-popover-hover-shadow, none);
+  color: var(--shell-accent-ink);
+}
+
+.launcher-prefix-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 9px 14px 4px;
+  flex-shrink: 0;
+}
+
+.launcher-prefix-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px 3px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--shell-card-border);
+  background: var(--shell-card-bg);
+  color: var(--nectar-text-muted, rgba(255, 255, 255, 0.78));
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.light-mode .launcher-prefix-chip {
+  color: rgba(15, 23, 42, 0.76);
+}
+
+.launcher-prefix-chip:hover {
+  background: var(--shell-popover-hover-bg, color-mix(in srgb, var(--shell-accent) 14%, var(--shell-card-bg-hover)));
+  border-color: var(--shell-popover-hover-border, color-mix(in srgb, var(--shell-accent) 30%, transparent));
+  box-shadow: var(--shell-popover-hover-shadow, none);
+  color: var(--nectar-text, inherit);
+}
+
+.launcher-prefix-chip kbd {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 10.5px;
+  font-weight: 700;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--shell-accent) 14%, transparent);
+  color: var(--shell-accent-ink);
+}
+
+@keyframes launcherCalcEnter {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.launcher-calc-hero {
+  width: calc(100% - 16px);
+  margin: 8px 8px 0;
+  padding: 13px 15px;
+  flex-shrink: 0;
+  border-radius: var(--shell-inner-radius, 12px);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--shell-accent) 15%, transparent),
+    color-mix(in srgb, var(--shell-accent) 5%, var(--shell-card-bg))
+  );
+  border: 1px solid color-mix(in srgb, var(--shell-accent) 30%, var(--shell-card-border));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+  animation: launcherCalcEnter calc(140ms / max(0.35, var(--nectar-motion-scale, 1))) var(--nectar-ease, ease-out) both;
+  transition: border-color 0.15s var(--nectar-ease, ease), transform 0.12s var(--nectar-ease, ease), background 0.15s ease;
+}
+
+.light-mode .launcher-calc-hero {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--shell-accent) 12%, rgba(255, 255, 255, 0.72)),
+    color-mix(in srgb, var(--shell-accent) 4%, rgba(255, 255, 255, 0.56))
+  );
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 2px 8px rgba(15, 23, 42, 0.04);
+}
+
+.launcher-calc-hero:hover {
+  border-color: color-mix(in srgb, var(--shell-accent) 48%, transparent);
+}
+
+.launcher-calc-hero:active {
+  transform: scale(0.992);
+}
+
+.launcher-calc-left {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.launcher-calc-expr {
+  font-size: 12px;
+  color: var(--nectar-text-muted, rgba(255, 255, 255, 0.65));
+}
+
+.launcher-calc-value {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.025em;
+}
+
+.launcher-calc-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.launcher-calc-note {
+  font-size: 11px;
+  color: var(--nectar-text-muted, rgba(255, 255, 255, 0.62));
+}
+
+.light-mode .launcher-calc-expr,
+.light-mode .launcher-calc-note {
+  color: rgba(15, 23, 42, 0.6);
+}
+
+.launcher-copy-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--shell-well-bg);
+  border: 1px solid var(--shell-well-border);
+}
+
+.launcher-copy-pill.copied {
+  background: rgba(48, 209, 88, 0.2);
+  border-color: rgba(48, 209, 88, 0.34);
+  color: #6ee794;
+}
+
+.light-mode .launcher-copy-pill.copied {
+  background: rgba(21, 128, 61, 0.14);
+  border-color: rgba(21, 128, 61, 0.28);
+  color: #15803d;
+}
+
+.launcher-confirm-banner {
+  margin: 8px 8px 0;
+  padding: 10px 12px;
+  flex-shrink: 0;
+  border-radius: var(--shell-inner-radius, 12px);
+  background: linear-gradient(90deg, rgba(245, 158, 11, 0.16), rgba(245, 158, 11, 0.08));
+  border: 1px solid rgba(245, 158, 11, 0.34);
+  box-shadow: inset 3px 0 0 #f59e0b;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.launcher-confirm-banner > svg {
+  color: #fbbf24;
+  flex-shrink: 0;
+}
+
+.light-mode .launcher-confirm-banner {
+  background: linear-gradient(90deg, rgba(217, 119, 6, 0.13), rgba(217, 119, 6, 0.06));
+  border-color: rgba(217, 119, 6, 0.32);
+  box-shadow: inset 3px 0 0 #d97706;
+}
+
+.light-mode .launcher-confirm-banner > svg {
+  color: #b45309;
+}
+
+.launcher-confirm-banner span {
+  flex: 1;
+}
+
+.launcher-confirm-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.launcher-confirm-btn {
+  padding: 5px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--shell-card-border-hover);
+  background: var(--shell-card-bg-hover);
+  color: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.14s ease, transform 0.1s ease;
+}
+
+.launcher-confirm-btn:hover {
+  background: color-mix(in srgb, var(--shell-card-bg-hover) 70%, rgba(255, 255, 255, 0.14));
+}
+
+.launcher-confirm-btn.danger {
+  background: #e11d48;
+  border-color: rgba(255, 255, 255, 0.14);
+  color: #ffffff;
+  box-shadow: 0 1px 3px rgba(225, 29, 72, 0.35);
+}
+
+.launcher-confirm-btn.danger:hover {
+  background: #be123c;
+}
+
+.launcher-body {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 368px;
+  overflow-y: auto;
+  padding: 8px 8px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  -webkit-mask-image: linear-gradient(180deg, #000 0%, #000 calc(100% - 14px), transparent 100%);
+  mask-image: linear-gradient(180deg, #000 0%, #000 calc(100% - 14px), transparent 100%);
+}
+
+@supports not selector(::-webkit-scrollbar) {
+  .launcher-body {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(150, 150, 165, 0.28) transparent;
+  }
+}
+
+.launcher-body::-webkit-scrollbar {
+  width: 5px;
+}
+
+.launcher-body::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.launcher-body::-webkit-scrollbar-thumb {
+  border-radius: 99px;
+  background: rgba(150, 150, 160, 0.3);
+}
+
+.launcher-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 8px 10px 8px 11px;
+  border-radius: var(--shell-inner-radius, 12px);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition:
+    background 0.12s var(--nectar-ease, ease),
+    border-color 0.12s var(--nectar-ease, ease),
+    box-shadow 0.12s var(--nectar-ease, ease);
+}
+
+.launcher-row:not(.selected):hover {
+  background: var(--shell-popover-hover-bg, var(--shell-card-bg-hover));
+  border-color: var(--shell-popover-hover-border, var(--shell-card-border-hover));
+  box-shadow: var(--shell-popover-hover-shadow, none);
+}
+
+.launcher-row.selected {
+  background: color-mix(in srgb, var(--shell-accent) 18%, var(--shell-card-bg-hover));
+  border-color: color-mix(in srgb, var(--shell-accent) 34%, var(--shell-card-border));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.launcher-row.selected::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 9px;
+  bottom: 9px;
+  width: 3px;
+  border-radius: 99px;
+  background: var(--shell-accent-ink);
+}
+
+.light-mode .launcher-row.selected {
+  background: color-mix(in srgb, var(--shell-accent) 11%, rgba(255, 255, 255, 0.65));
+  border-color: color-mix(in srgb, var(--shell-accent) 26%, rgba(15, 23, 42, 0.08));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85), 0 1px 3px rgba(15, 23, 42, 0.05);
+}
+
+.launcher-row-icon {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: var(--shell-well-bg);
+  border: 1px solid var(--shell-well-border);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.launcher-row-icon.kind-calc { color: var(--shell-accent-ink); }
+.launcher-row-icon.kind-file,
+.launcher-row-icon.kind-folder { color: #7dd3fc; }
+.launcher-row-icon.kind-shell { color: #fcd34d; }
+.launcher-row-icon.kind-system { color: #fca5a5; }
+.launcher-row-icon.kind-settings,
+.launcher-row-icon.kind-tool { color: #c7d2fe; }
+.launcher-row-icon.kind-web { color: #5eead4; }
+
+.light-mode .launcher-row-icon.kind-file,
+.light-mode .launcher-row-icon.kind-folder { color: #0369a1; }
+.light-mode .launcher-row-icon.kind-shell { color: #b45309; }
+.light-mode .launcher-row-icon.kind-system { color: #b91c1c; }
+.light-mode .launcher-row-icon.kind-settings,
+.light-mode .launcher-row-icon.kind-tool { color: #4338ca; }
+.light-mode .launcher-row-icon.kind-web { color: #0f766e; }
+
+.launcher-row-icon img {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  border-radius: 5px;
+}
+
+.launcher-running-dot {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #30d158;
+  border: 1.5px solid var(--nectar-bg-panel, rgba(15, 15, 18, 0.92));
+}
+
+.light-mode .launcher-running-dot {
+  background: #16a34a;
+  border-color: var(--nectar-bg-panel, #f5f5f8);
+}
+
+.launcher-row-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.launcher-row-title-line {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.launcher-row-title {
+  display: block;
+  min-width: 0;
+  width: 100%;
+  font-size: 13.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.launcher-match {
+  background: transparent;
+  color: var(--shell-accent-ink);
+  font-weight: 700;
+}
+
+.launcher-row-subtitle {
+  font-size: 11.5px;
+  color: var(--nectar-text-muted, rgba(255, 255, 255, 0.56));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.light-mode .launcher-row-subtitle {
+  color: rgba(15, 23, 42, 0.62);
+}
+
+.launcher-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.launcher-badge {
+  padding: 2px 7px;
+  border-radius: 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  background: var(--shell-card-bg);
+  border: 1px solid var(--shell-card-border);
+  color: var(--nectar-text-muted, rgba(255, 255, 255, 0.72));
+}
+
+.light-mode .launcher-badge {
+  color: rgba(15, 23, 42, 0.72);
+}
+
+.launcher-badge.badge-running,
+.launcher-badge.badge-window {
+  background: rgba(48, 209, 88, 0.13);
+  border-color: rgba(48, 209, 88, 0.25);
+  color: #6ee794;
+}
+
+.launcher-badge.badge-calc {
+  background: color-mix(in srgb, var(--shell-accent) 16%, transparent);
+  border-color: color-mix(in srgb, var(--shell-accent) 28%, transparent);
+  color: var(--shell-accent-ink);
+}
+
+.launcher-badge.badge-file,
+.launcher-badge.badge-folder {
+  background: rgba(56, 189, 248, 0.13);
+  border-color: rgba(56, 189, 248, 0.24);
+  color: #7dd3fc;
+}
+
+.launcher-badge.badge-shell {
+  background: rgba(251, 191, 36, 0.13);
+  border-color: rgba(251, 191, 36, 0.24);
+  color: #fcd34d;
+}
+
+.launcher-badge.badge-system {
+  background: rgba(248, 113, 113, 0.14);
+  border-color: rgba(248, 113, 113, 0.26);
+  color: #fca5a5;
+}
+
+.launcher-badge.badge-settings,
+.launcher-badge.badge-tool {
+  background: rgba(165, 180, 252, 0.13);
+  border-color: rgba(165, 180, 252, 0.24);
+  color: #c7d2fe;
+}
+
+.launcher-badge.badge-web {
+  background: rgba(45, 212, 191, 0.13);
+  border-color: rgba(45, 212, 191, 0.24);
+  color: #5eead4;
+}
+
+.light-mode .launcher-badge.badge-running,
+.light-mode .launcher-badge.badge-window {
+  background: rgba(22, 163, 74, 0.10);
+  border-color: rgba(22, 163, 74, 0.22);
+  color: #15803d;
+}
+
+.light-mode .launcher-badge.badge-file,
+.light-mode .launcher-badge.badge-folder {
+  background: rgba(2, 132, 199, 0.10);
+  border-color: rgba(2, 132, 199, 0.22);
+  color: #0369a1;
+}
+
+.light-mode .launcher-badge.badge-shell {
+  background: rgba(217, 119, 6, 0.10);
+  border-color: rgba(217, 119, 6, 0.24);
+  color: #b45309;
+}
+
+.light-mode .launcher-badge.badge-system {
+  background: rgba(220, 38, 38, 0.10);
+  border-color: rgba(220, 38, 38, 0.22);
+  color: #b91c1c;
+}
+
+.light-mode .launcher-badge.badge-settings,
+.light-mode .launcher-badge.badge-tool {
+  background: rgba(79, 70, 229, 0.09);
+  border-color: rgba(79, 70, 229, 0.20);
+  color: #4338ca;
+}
+
+.light-mode .launcher-badge.badge-web {
+  background: rgba(13, 148, 136, 0.10);
+  border-color: rgba(13, 148, 136, 0.22);
+  color: #0f766e;
+}
+
+.launcher-actions-btn {
+  position: relative;
+  z-index: 2;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  opacity: 0.58;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.13s ease, border-color 0.13s ease, opacity 0.13s ease;
+}
+
+.launcher-row.selected .launcher-actions-btn,
+.launcher-actions-btn:hover {
+  opacity: 1;
+  background: var(--shell-well-bg);
+  border-color: var(--shell-well-border);
+}
+
+.launcher-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 10px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--nectar-text-muted, rgba(255, 255, 255, 0.62));
+}
+
+.launcher-clear-hist-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0.8;
+}
+
+.launcher-clear-hist-btn:hover {
+  opacity: 1;
+  color: #ff453a;
+  background: rgba(255, 69, 58, 0.1);
+}
+
+.light-mode .launcher-clear-hist-btn:hover {
+  color: #dc2626;
+  background: rgba(220, 38, 38, 0.1);
+}
+
+.launcher-actions-drawer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px;
+}
+
+.launcher-actions-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 4px 8px;
+  border-bottom: 1px solid var(--shell-divider);
+}
+
+.launcher-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--shell-card-border);
+  background: var(--shell-card-bg);
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.launcher-back-btn:hover {
+  background: var(--shell-card-bg-hover);
+  border-color: var(--shell-card-border-hover);
+}
+
+.launcher-actions-target {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.launcher-actions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.launcher-action-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px;
+  border-radius: var(--shell-chip-radius, 10px);
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s var(--nectar-ease, ease), border-color 0.12s var(--nectar-ease, ease), box-shadow 0.12s var(--nectar-ease, ease);
+}
+
+.launcher-action-row-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.launcher-action-row-left > svg {
+  opacity: 0.78;
+  flex-shrink: 0;
+}
+
+.launcher-action-row:not(.selected):hover {
+  background: var(--shell-popover-hover-bg, var(--shell-card-bg-hover));
+  border-color: var(--shell-popover-hover-border, var(--shell-card-border-hover));
+  box-shadow: var(--shell-popover-hover-shadow, none);
+}
+
+.launcher-action-row.selected {
+  background: color-mix(in srgb, var(--shell-accent) 18%, var(--shell-card-bg-hover));
+  border-color: color-mix(in srgb, var(--shell-accent) 34%, transparent);
+}
+
+.launcher-action-row.destructive {
+  color: #fb7185;
+}
+
+.light-mode .launcher-action-row.destructive {
+  color: #be123c;
+}
+
+.launcher-action-row.destructive .launcher-action-row-left > svg {
+  opacity: 1;
+}
+
+.launcher-empty {
+  padding: 26px 16px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--nectar-text-muted, rgba(255, 255, 255, 0.55));
+}
+
+.light-mode .launcher-empty,
+.light-mode .launcher-section-header {
+  color: rgba(15, 23, 42, 0.58);
+}
+
+.launcher-footer {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 14px;
+  flex-shrink: 0;
+  background: var(--shell-footer-bg);
+  border-top: 1px solid var(--shell-divider);
+  font-size: 11px;
+  color: var(--nectar-text-muted, rgba(255, 255, 255, 0.58));
+}
+
+.light-mode .launcher-footer {
+  color: rgba(15, 23, 42, 0.6);
+}
+
+.launcher-hints {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-width: 0;
+}
+
+.launcher-hints span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.launcher-hints kbd,
+.launcher-action-row kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 18px;
+  padding: 0 5px;
+  border-radius: 5px;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  background: var(--shell-kbd-bg);
+  border: 1px solid var(--shell-kbd-border);
+  box-shadow: var(--shell-kbd-shadow);
+  color: var(--nectar-text, inherit);
+  opacity: 0.9;
+}
+
+.launcher-toast {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 4;
+  max-width: 55%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-weight: 600;
+  color: #6ee794;
+  background: rgba(20, 44, 28, 0.88);
+  border: 1px solid rgba(48, 209, 88, 0.34);
+  backdrop-filter: blur(var(--nectar-popover-blur, 12px));
+  -webkit-backdrop-filter: blur(var(--nectar-popover-blur, 12px));
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
+  pointer-events: none;
+}
+
+.light-mode .launcher-toast {
+  color: #15803d;
+  background: rgba(240, 253, 244, 0.94);
+  border-color: rgba(21, 128, 61, 0.28);
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.12);
+}
+
+.launcher-icon-pill:focus-visible,
+.launcher-prefix-chip:focus-visible,
+.launcher-calc-hero:focus-visible,
+.launcher-confirm-btn:focus-visible,
+.launcher-actions-btn:focus-visible,
+.launcher-back-btn:focus-visible,
+.launcher-clear-hist-btn:focus-visible,
+.launcher-action-row:focus-visible {
+  outline: none;
+  box-shadow: var(--shell-focus-ring);
+}
+
+:root.reduced-motion .launcher-calc-hero {
+  animation: none !important;
+}
+
+:root.reduced-motion .launcher-icon-pill,
+:root.reduced-motion .launcher-prefix-chip,
+:root.reduced-motion .launcher-calc-hero,
+:root.reduced-motion .launcher-row,
+:root.reduced-motion .launcher-actions-btn,
+:root.reduced-motion .launcher-back-btn,
+:root.reduced-motion .launcher-action-row {
+  transition-duration: 0.01ms !important;
+}

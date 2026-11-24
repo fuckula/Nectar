@@ -1,8 +1,9 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { CaldavState, CalEvent } from "../hooks/useCaldav";
 import { dateLocale, useT, weekdayNames } from "../i18n";
 import { daysSinceWeekStart, useWeekStart } from "../weekStart";
+import { setVisibleInterval } from "../hooks/visibleInterval";
 
 type View = "day" | "week" | "month" | "agenda";
 
@@ -112,15 +113,13 @@ export function NotchCalendar({ caldav, hour12 }: Props) {
       <div className="calendar-header">
         <span className="month-year">{title}</span>
         <span className="cal-nav-group">
-          {connected && (
-            <button className="cal-open" onClick={() => invoke("open_calendar_window").catch(() => {})} title={t("calendar.openFull")} aria-label={t("calendar.openFull")}>
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M15 3h6v6" />
-                <path d="M10 14L21 3" />
-                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-              </svg>
-            </button>
-          )}
+          <button className="cal-open" onClick={() => invoke("open_calendar_window").catch(() => {})} title={t("calendar.openFull")} aria-label={t("calendar.openFull")}>
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M15 3h6v6" />
+              <path d="M10 14L21 3" />
+              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+            </svg>
+          </button>
           {showToday && (
             <button className="cal-today" onClick={() => setAnchor(today)}>
               {t("calendar.today")}
@@ -307,7 +306,21 @@ function WeekList({ anchor, today, events, time, onOpen }: TimeProps & { anchor:
 function DayList({ day, events, time }: TimeProps & { day: Date; events: CalEvent[] }) {
   const t = useT();
   const list = eventsOn(events, day);
-  const [nowMs] = useState(() => Date.now());
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    const sync = () => setNowMs(Date.now());
+    const interval = setVisibleInterval(sync, 30_000);
+    const onVisibility = () => {
+      if (!document.hidden) sync();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, []);
+
   if (list.length === 0) {
     return <div className="cal-empty">{t("calendar.nothingPlanned")}</div>;
   }

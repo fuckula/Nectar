@@ -283,26 +283,13 @@ pub async fn get_lan_status() -> LanStatus {
 
 #[tauri::command]
 pub fn open_ethernet_settings() {
-    use windows::Win32::UI::Shell::ShellExecuteA;
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    unsafe {
-        let _ = ShellExecuteA(
-            None,
-            windows::core::PCSTR(c"open".as_ptr() as *const u8),
-            windows::core::PCSTR(c"ms-settings:network-ethernet".as_ptr() as *const u8),
-            windows::core::PCSTR::null(),
-            windows::core::PCSTR::null(),
-            SW_SHOWNORMAL,
-        );
-    }
+    crate::utils::spawn_shell_open("ms-settings:network-ethernet\0");
 }
 
 fn paired_bluetooth_devices() -> Result<Vec<BluetoothDeviceInfo>, String> {
     use windows::Devices::Bluetooth::{BluetoothConnectionStatus, BluetoothDevice};
     use windows::Devices::Enumeration::DeviceInformation;
-    unsafe {
-        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
-    }
+    let _com = crate::utils::ComApartmentGuard::init_mta();
     let selector = BluetoothDevice::GetDeviceSelectorFromPairingState(true).map_err(|e| e.to_string())?;
     let infos = DeviceInformation::FindAllAsyncAqsFilter(&selector)
         .and_then(|op| op.get())
@@ -331,9 +318,7 @@ pub async fn bluetooth_devices() -> Result<Vec<BluetoothDeviceInfo>, String> {
 pub async fn bluetooth_unpair(id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         use windows::Devices::Enumeration::{DeviceInformation, DeviceUnpairingResultStatus};
-        unsafe {
-            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
-        }
+        let _com = crate::utils::ComApartmentGuard::init_mta();
         let info = DeviceInformation::CreateFromIdAsync(&HSTRING::from(id))
             .and_then(|op| op.get())
             .map_err(|e| e.to_string())?;

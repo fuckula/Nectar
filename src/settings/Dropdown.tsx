@@ -19,6 +19,12 @@ const GAP = 6;
 const EDGE = 8;
 const MAX_HEIGHT = 240;
 
+function getActiveZoom(el: HTMLElement | null): number {
+  const raw = (el?.closest(".settings-container") as HTMLElement | null)?.style.zoom;
+  const parsed = parseFloat(raw || "1");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+
 // The menu is drawn in <body> so no section, card or scroll area can clip it or paint over it, and
 // it opens upward when there is more room above the button.
 export function Dropdown({ value, options, onChange, placeholder, align = "right" }: DropdownProps) {
@@ -30,18 +36,26 @@ export function Dropdown({ value, options, onChange, placeholder, align = "right
   const place = useCallback(() => {
     const rect = triggerRef.current?.getBoundingClientRect();
     if (!rect) return;
-    const below = window.innerHeight - rect.bottom - GAP - EDGE;
-    const above = rect.top - GAP - EDGE;
-    const wanted = Math.min(MAX_HEIGHT, menuRef.current?.scrollHeight ?? options.length * 30 + 8);
+    const zoom = getActiveZoom(triggerRef.current);
+    const gapPx = GAP * zoom;
+    const edgePx = EDGE * zoom;
+    const below = window.innerHeight - rect.bottom - gapPx - edgePx;
+    const above = rect.top - gapPx - edgePx;
+    const wantedLocal = Math.min(
+      MAX_HEIGHT,
+      menuRef.current?.scrollHeight ?? options.length * 30 + 8
+    );
+    const wanted = wantedLocal * zoom;
     const up = below < wanted && above > below;
     const room = up ? above : below;
     setStyle({
-      top: up ? "auto" : rect.bottom + GAP,
-      bottom: up ? window.innerHeight - rect.top + GAP : "auto",
-      left: align === "left" ? rect.left : "auto",
-      right: align === "right" ? window.innerWidth - rect.right : "auto",
-      minWidth: rect.width,
-      maxHeight: Math.max(96, Math.min(MAX_HEIGHT, room)),
+      zoom,
+      top: up ? "auto" : rect.bottom / zoom + GAP,
+      bottom: up ? (window.innerHeight - rect.top) / zoom + GAP : "auto",
+      left: align === "left" ? rect.left / zoom : "auto",
+      right: align === "right" ? (window.innerWidth - rect.right) / zoom : "auto",
+      minWidth: rect.width / zoom,
+      maxHeight: Math.max(96, Math.min(MAX_HEIGHT, room / zoom)),
     });
   }, [align, options.length]);
 
@@ -91,7 +105,11 @@ export function Dropdown({ value, options, onChange, placeholder, align = "right
       </button>
       {open &&
         createPortal(
-          <div ref={menuRef} className="dropdown-menu dropdown-menu--portal" style={style ?? { visibility: "hidden" }}>
+          <div
+            ref={menuRef}
+            className="dropdown-menu dropdown-menu--portal"
+            style={style ?? { visibility: "hidden", zoom: getActiveZoom(triggerRef.current) }}
+          >
             {options.map((opt) => (
               <button
                 type="button"

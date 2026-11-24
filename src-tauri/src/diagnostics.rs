@@ -19,6 +19,8 @@ static LAST_HITBOX_MS: [AtomicI64; 2] = [AtomicI64::new(0), AtomicI64::new(0)];
 
 pub static HOOK_EVENTS: AtomicI64 = AtomicI64::new(0);
 pub static HOOK_LAST_EVENT_MS: AtomicI64 = AtomicI64::new(0);
+pub static KEYBOARD_HOOK_EVENTS: AtomicI64 = AtomicI64::new(0);
+pub static KEYBOARD_HOOK_LAST_EVENT_MS: AtomicI64 = AtomicI64::new(0);
 
 pub fn init() {
     let Ok(appdata) = std::env::var("APPDATA") else { return };
@@ -28,6 +30,7 @@ pub fn init() {
     }
     let _ = LOG_DIR.set(dir);
     install_panic_hook();
+    install_unhandled_exception_filter();
     log(&format!(
         "---- Nectar {} starting (pid {}) ----",
         env!("CARGO_PKG_VERSION"),
@@ -50,6 +53,13 @@ pub fn log(msg: &str) {
         let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
         let _ = writeln!(f, "[{stamp}] {msg}");
     }
+}
+
+/// Queue a log write off low-latency threads (e.g. WH_KEYBOARD_LL) so file I/O never stalls the hook.
+pub fn log_async(msg: String) {
+    tauri::async_runtime::spawn(async move {
+        log(&msg);
+    });
 }
 
 fn install_panic_hook() {
@@ -207,6 +217,8 @@ pub fn build_report(app: &AppHandle) -> String {
     let now = crate::services::now_ms();
     let last = HOOK_LAST_EVENT_MS.load(Ordering::Relaxed);
     let hook_age = if last == 0 { "never".to_string() } else { format!("{}ms ago", now - last) };
+    let kb_last = KEYBOARD_HOOK_LAST_EVENT_MS.load(Ordering::Relaxed);
+    let kb_age = if kb_last == 0 { "never".to_string() } else { format!("{}ms ago", now - kb_last) };
 
     let report = format!(
         "Nectar diagnostics\n\
@@ -219,7 +231,8 @@ pub fn build_report(app: &AppHandle) -> String {
          Elevated: {elevated}\n\
          Possibly conflicting apps running: {conflicts}\n\n\
          Monitors:\n{monitors}\n\
-         Mouse hook: {events} events, last {hook_age}\n\n\
+         Mouse hook: {events} events, last {hook_age}\n\
+         Keyboard hook: {kb_events} events, last {kb_age}\n\n\
          Windows:\n{windows_info}\n\
          Settings:\n{settings}\n\n\
          Recent log:\n{log}\n",
@@ -233,6 +246,8 @@ pub fn build_report(app: &AppHandle) -> String {
         monitors = monitor_report(app),
         events = HOOK_EVENTS.load(Ordering::Relaxed),
         hook_age = hook_age,
+        kb_events = KEYBOARD_HOOK_EVENTS.load(Ordering::Relaxed),
+        kb_age = kb_age,
         windows_info = window_report(app),
         settings = settings_snapshot(),
         log = tail(24_000),
@@ -242,4 +257,88 @@ pub fn build_report(app: &AppHandle) -> String {
         let _ = fs::write(dir.join(REPORT_FILE), &report);
     }
     report
+}
+
+unsafe extern "system" fn unhandled_exception_handler(
+    info: *const windows::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    if !info.is_null() {
+        let record_ptr = (*info).ExceptionRecord;
+        if !record_ptr.is_null() {
+            let rec = &*record_ptr;
+            if let Some(dir) = LOG_DIR.get() {
+                if let Ok(mut file) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join(LOG_FILE))
+                {
+                    let _ = writeln!(
+                        file,
+                        "CRASH: unhandled SEH exception code=0x{:08X} flags=0x{:08X} addr=0x{:X}",
+                        rec.ExceptionCode.0 as u32,
+                        rec.ExceptionFlags,
+                        rec.ExceptionAddress as usize
+                    );
+                }
+            }
+        }
+    }
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+pub fn install_unhandled_exception_filter() {
+    static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        use windows::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter;
+        let _ = SetUnhandledExceptionFilter(Some(unhandled_exception_handler));
+    }
+}
+
+pub fn start_main_thread_watchdog(app: &AppHandle) {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app_h = app.clone();
+    let _ = std::thread::Builder::new()
+        .name("nectar-main-watchdog".into())
+        .spawn(move || {
+            let mut last_warn = Option::<std::time::Instant>::None;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                if crate::state::SHUTTING_DOWN.load(Ordering::Relaxed) {
+                    break;
+                }
+                let pinged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let ping_cb = pinged.clone();
+                if app_h
+                    .run_on_main_thread(move || {
+                        ping_cb.store(true, Ordering::Release);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                let start = std::time::Instant::now();
+                while !pinged.load(Ordering::Acquire)
+                    && start.elapsed() < std::time::Duration::from_millis(2500)
+                {
+                    if crate::state::SHUTTING_DOWN.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if !pinged.load(Ordering::Acquire)
+                    && !crate::state::SHUTTING_DOWN.load(Ordering::Relaxed)
+                    && last_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(30))
+                {
+                    last_warn = Some(std::time::Instant::now());
+                    log("WARN: main thread heartbeat missed for >2500ms");
+                }
+            }
+        });
 }

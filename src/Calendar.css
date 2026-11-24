@@ -7,20 +7,32 @@
   --cw-muted: var(--nectar-text-muted, #999999);
   --cw-line: rgba(255, 255, 255, 0.08);
   --cw-inverse: var(--nectar-bg-expanded, #000);
+  --cw-body-tint: rgba(0, 0, 0, 0.1);
+  --cw-sidebar-bg: rgba(255, 255, 255, 0.015);
+  --cw-surface: rgba(255, 255, 255, 0.08);
+  --cw-surface-hover: rgba(255, 255, 255, 0.14);
+  --cw-surface-soft: rgba(255, 255, 255, 0.06);
+  --cw-shadow: 0 18px 40px -8px rgba(0, 0, 0, 0.7);
 }
 
 .light-mode {
-  --cw-bg: rgba(246, 246, 248, 0.72);
-  --cw-line: rgba(0, 0, 0, 0.1);
-  --cw-bar: rgba(0, 0, 0, 0.02);
-  --cw-bar-line: rgba(0, 0, 0, 0.06);
-  --cw-title: rgba(0, 0, 0, 0.65);
+  --cw-bg: rgba(246, 246, 248, 0.78);
+  --cw-line: rgba(15, 23, 42, 0.11);
+  --cw-bar: rgba(15, 23, 42, 0.025);
+  --cw-bar-line: rgba(15, 23, 42, 0.07);
+  --cw-title: rgba(15, 23, 42, 0.7);
+  --cw-body-tint: rgba(15, 23, 42, 0.02);
+  --cw-sidebar-bg: rgba(255, 255, 255, 0.42);
+  --cw-surface: rgba(15, 23, 42, 0.065);
+  --cw-surface-hover: rgba(15, 23, 42, 0.12);
+  --cw-surface-soft: rgba(15, 23, 42, 0.045);
+  --cw-shadow: 0 16px 36px -8px rgba(15, 23, 42, 0.18);
 }
 
 body {
   margin: 0;
   padding: 0;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: var(--nectar-font-sans, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif);
   background-color: transparent;
   color: var(--cw-text);
   user-select: none;
@@ -77,7 +89,7 @@ button {
   flex: 1;
   min-height: 0;
   display: flex;
-  background: rgba(0, 0, 0, 0.1);
+  background: var(--cw-body-tint);
 }
 
 .cw-sidebar {
@@ -88,7 +100,7 @@ button {
   box-sizing: border-box;
   padding: 8px 8px 12px 8px;
   border-right: 1px solid var(--cw-line);
-  background: rgba(255, 255, 255, 0.015);
+  background: var(--cw-sidebar-bg);
 }
 
 .cw-label {
@@ -124,7 +136,7 @@ button {
 }
 
 .cw-sources button:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--cw-surface-soft);
 }
 
 .cw-sources button.off .cw-source-name {
@@ -186,7 +198,7 @@ button {
   padding: 4px 8px;
   border: none;
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--cw-surface);
   color: var(--cw-text);
   font-size: 11px;
   cursor: pointer;
@@ -194,7 +206,7 @@ button {
 
 .cw-sync-row button:hover:not(:disabled),
 .cw-manage:hover {
-  background: rgba(255, 255, 255, 0.16);
+  background: var(--cw-surface-hover);
 }
 
 .cw-sync-row button:disabled {
@@ -259,7 +271,7 @@ button {
   gap: 2px;
   padding: 2px;
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--cw-surface);
 }
 
 .cw-segment button {
@@ -306,7 +318,7 @@ button {
 
 .cw-nav button:hover {
   opacity: 1;
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--cw-surface);
 }
 
 .cw-nav .cw-today {
@@ -315,7 +327,7 @@ button {
   font-size: 11.5px;
   font-weight: 600;
   opacity: 1;
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--cw-surface-hover);
 }
 
 .cw-selected-strip {
@@ -437,7 +449,7 @@ button {
 }
 
 .cw-cell:hover::before {
-  background: rgba(255, 255, 255, 0.09);
+  background: var(--cw-surface);
 }
 
 .cw-cell.outside .cw-cell-events {
@@ -591,7 +603,7 @@ button {
 }
 
 .cw-week-head:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--cw-surface-soft);
 }
 
 .cw-week-head em {
@@ -771,7 +783,7 @@ button {
   border: 1px solid color-mix(in srgb, var(--cw-text) 18%, transparent);
   background: color-mix(in srgb, var(--cw-inverse) 92%, transparent);
   backdrop-filter: blur(20px);
-  box-shadow: 0 18px 40px -8px rgba(0, 0, 0, 0.7);
+  box-shadow: var(--cw-shadow);
   pointer-events: none;
 }
 

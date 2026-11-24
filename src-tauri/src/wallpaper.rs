@@ -7,7 +7,7 @@ use tauri::Window;
 
 // The copy is blurred and only ever seen behind the notch and dock, so it can be small.
 const BACKDROP_SIZE: u32 = 640;
-const CACHE_LIMIT: usize = 4;
+const CACHE_LIMIT: usize = 8;
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -322,7 +322,14 @@ pub async fn is_backdrop_covered(window: Window, rect: SurfaceRect) -> bool {
         right: origin.x + px(rect.x + rect.width) - 2,
         bottom: origin.y + px(rect.y + rect.height) - 2,
     };
-    area.right > area.left && area.bottom > area.top && window_behind(hwnd.0 as isize, area)
+    let allow_area = area.right > area.left && area.bottom > area.top;
+    if !allow_area {
+        return false;
+    }
+    let hwnd_raw = hwnd.0 as isize;
+    tauri::async_runtime::spawn_blocking(move || window_behind(hwnd_raw, area))
+        .await
+        .unwrap_or(false)
 }
 
 // Walks down the z-order from `hwnd` until it reaches the desktop.
@@ -392,4 +399,327 @@ fn window_behind(hwnd: isize, area: windows::Win32::Foundation::RECT) -> bool {
         }
     }
     false
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WallpaperPalette {
+    pub dominant: String,
+    pub accent: String,
+    pub surface_dark: String,
+    pub surface_light: String,
+    pub secondary: String,
+    pub swatches: Vec<String>,
+    pub is_dark: bool,
+    pub source: String,
+}
+
+fn rgb_to_hsl(rgb: [u8; 3]) -> (f32, f32, f32) {
+    let r = rgb[0] as f32 / 255.0;
+    let g = rgb[1] as f32 / 255.0;
+    let b = rgb[2] as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) * 0.5;
+    if (max - min).abs() < 1e-6 {
+        return (0.0, 0.0, l * 100.0);
+    }
+    let d = max - min;
+    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let mut h = if (max - r).abs() < 1e-6 {
+        (g - b) / d + if g < b { 6.0 } else { 0.0 }
+    } else if (max - g).abs() < 1e-6 {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    h /= 6.0;
+    (h * 360.0, s * 100.0, l * 100.0)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [u8; 3] {
+    let h = ((h % 360.0) + 360.0) % 360.0;
+    let s = s.clamp(0.0, 100.0) / 100.0;
+    let l = l.clamp(0.0, 100.0) / 100.0;
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c * 0.5;
+    let (r, g, b) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    [
+        ((r + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
+}
+
+fn rgb_hex(rgb: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
+}
+
+fn rgb_dist_sq(a: [u8; 3], b: [u8; 3]) -> i32 {
+    let dr = a[0] as i32 - b[0] as i32;
+    let dg = a[1] as i32 - b[1] as i32;
+    let db = a[2] as i32 - b[2] as i32;
+    dr * dr + dg * dg + db * db
+}
+
+pub fn palette_from_solid_rgb(rgb: [u8; 3], source: &str) -> WallpaperPalette {
+    let (h, s, l) = rgb_to_hsl(rgb);
+    let accent_rgb = if s < 10.0 {
+        [10, 132, 255]
+    } else {
+        hsl_to_rgb(h, s.clamp(55.0, 88.0), l.clamp(52.0, 64.0))
+    };
+    let surface_dark = rgb_hex(hsl_to_rgb(h, s.min(40.0), 10.0));
+    let surface_light = rgb_hex(hsl_to_rgb(h, s.min(24.0), 94.0));
+    let sec_rgb = hsl_to_rgb((h + 34.0) % 360.0, s.clamp(45.0, 80.0), l.clamp(48.0, 66.0));
+    let dom = rgb_hex(rgb);
+    let acc = rgb_hex(accent_rgb);
+    let sec = rgb_hex(sec_rgb);
+    let mut swatches = vec![acc.clone(), sec.clone(), dom.clone()];
+    swatches.push(surface_dark.clone());
+    swatches.push(surface_light.clone());
+    WallpaperPalette {
+        dominant: dom,
+        accent: acc,
+        surface_dark,
+        surface_light,
+        secondary: sec,
+        swatches,
+        is_dark: l < 46.0,
+        source: source.to_string(),
+    }
+}
+
+pub fn extract_palette_from_rgba(rgba: &[u8], width: u32, height: u32, source: &str) -> WallpaperPalette {
+    if width == 0 || height == 0 || rgba.len() < (width as usize * height as usize * 4) {
+        return palette_from_solid_rgb([10, 132, 255], source);
+    }
+
+    #[derive(Default, Clone, Copy)]
+    struct Bucket {
+        r_sum: u64,
+        g_sum: u64,
+        b_sum: u64,
+        count: u64,
+    }
+
+    let mut buckets = vec![Bucket::default(); 4096];
+    let step_x = (width / 64).max(1) as usize;
+    let step_y = (height / 64).max(1) as usize;
+    let mut luma_sum = 0.0f64;
+    let mut sample_count = 0u64;
+
+    for y in (0..height as usize).step_by(step_y) {
+        let row_off = y * width as usize * 4;
+        for x in (0..width as usize).step_by(step_x) {
+            let idx = row_off + x * 4;
+            let a = rgba[idx + 3];
+            if a < 32 {
+                continue;
+            }
+            let r = rgba[idx];
+            let g = rgba[idx + 1];
+            let b = rgba[idx + 2];
+            let luma = (0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64) / 255.0;
+            luma_sum += luma;
+            sample_count += 1;
+
+            let key = (((r as usize) >> 4) << 8) | (((g as usize) >> 4) << 4) | ((b as usize) >> 4);
+            buckets[key].r_sum += r as u64;
+            buckets[key].g_sum += g as u64;
+            buckets[key].b_sum += b as u64;
+            buckets[key].count += 1;
+        }
+    }
+
+    if sample_count == 0 {
+        return palette_from_solid_rgb([10, 132, 255], source);
+    }
+
+    let is_dark = (luma_sum / sample_count as f64) < 0.46;
+
+    struct Centroid {
+        rgb: [u8; 3],
+        sat: f32,
+        luma: f32,
+        vivid_score: f64,
+        dom_score: f64,
+    }
+
+    let mut centroids: Vec<Centroid> = buckets
+        .into_iter()
+        .filter(|b| b.count > 0)
+        .map(|b| {
+            let rgb = [
+                (b.r_sum / b.count) as u8,
+                (b.g_sum / b.count) as u8,
+                (b.b_sum / b.count) as u8,
+            ];
+            let (_h, s, l) = rgb_to_hsl(rgb);
+            let sat_norm = (s / 100.0) as f64;
+            let mid_bonus = 1.0 - ((l - 52.0).abs() / 55.0).clamp(0.0, 0.85) as f64;
+            let vivid_score = (b.count as f64).powf(0.55) * (0.15 + sat_norm * 3.0) * mid_bonus;
+            let dom_score = (b.count as f64) * (0.65 + sat_norm * 0.9);
+            Centroid {
+                rgb,
+                sat: s,
+                luma: l,
+                vivid_score,
+                dom_score,
+            }
+        })
+        .collect();
+
+    if centroids.is_empty() {
+        return palette_from_solid_rgb([10, 132, 255], source);
+    }
+
+    centroids.sort_by(|a, b| b.dom_score.partial_cmp(&a.dom_score).unwrap_or(std::cmp::Ordering::Equal));
+    let dominant_raw = centroids[0].rgb;
+    let (dom_h, dom_s, _dom_l) = rgb_to_hsl(dominant_raw);
+
+    let mut by_vivid: Vec<&Centroid> = centroids.iter().collect();
+    by_vivid.sort_by(|a, b| b.vivid_score.partial_cmp(&a.vivid_score).unwrap_or(std::cmp::Ordering::Equal));
+
+    let best_vivid = by_vivid
+        .iter()
+        .find(|c| c.sat >= 16.0 && c.luma >= 14.0 && c.luma <= 86.0)
+        .copied()
+        .unwrap_or(by_vivid[0]);
+
+    let (acc_h, acc_s, acc_l) = rgb_to_hsl(best_vivid.rgb);
+    let accent_rgb = if best_vivid.sat < 10.0 {
+        [138, 180, 248]
+    } else {
+        hsl_to_rgb(acc_h, acc_s.clamp(58.0, 88.0), acc_l.clamp(52.0, 66.0))
+    };
+
+    let mut picked: Vec<[u8; 3]> = vec![accent_rgb];
+    for threshold in [42 * 42, 24 * 24, 10 * 10] {
+        for c in &by_vivid {
+            if picked.len() >= 5 {
+                break;
+            }
+            let refined = if c.sat >= 18.0 {
+                let (h, s, l) = rgb_to_hsl(c.rgb);
+                hsl_to_rgb(h, s.clamp(45.0, 88.0), l.clamp(38.0, 74.0))
+            } else {
+                c.rgb
+            };
+            if picked.iter().all(|&p| rgb_dist_sq(p, refined) >= threshold) {
+                picked.push(refined);
+            }
+        }
+        if picked.len() >= 5 {
+            break;
+        }
+    }
+    if picked.iter().all(|&p| rgb_dist_sq(p, dominant_raw) >= 24 * 24) && picked.len() < 5 {
+        picked.push(dominant_raw);
+    }
+    while picked.len() < 5 {
+        let shift = (picked.len() as f32) * 35.0;
+        picked.push(hsl_to_rgb((acc_h + shift) % 360.0, acc_s.max(35.0).min(78.0), 54.0));
+    }
+
+    let secondary_rgb = picked
+        .iter()
+        .skip(1)
+        .max_by_key(|&&rgb| rgb_dist_sq(rgb, accent_rgb))
+        .copied()
+        .unwrap_or(picked[1]);
+
+    let surface_dark = rgb_hex(hsl_to_rgb(dom_h, dom_s.min(40.0), 10.0));
+    let surface_light = rgb_hex(hsl_to_rgb(dom_h, dom_s.min(24.0), 94.0));
+
+    WallpaperPalette {
+        dominant: rgb_hex(dominant_raw),
+        accent: rgb_hex(accent_rgb),
+        surface_dark,
+        surface_light,
+        secondary: rgb_hex(secondary_rgb),
+        swatches: picked.into_iter().take(5).map(rgb_hex).collect(),
+        is_dark,
+        source: source.to_string(),
+    }
+}
+
+#[tauri::command]
+pub async fn extract_wallpaper_palette() -> Result<WallpaperPalette, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let wallpaper = monitor_wallpaper(0, 0).unwrap_or_else(desktop_wallpaper);
+        for path in candidates(&wallpaper) {
+            if let Some(img) = decode(&path) {
+                let thumb = img.thumbnail(128, 128).to_rgba8();
+                let (w, h) = thumb.dimensions();
+                let source = path.file_name().and_then(|s| s.to_str()).unwrap_or("wallpaper");
+                return Ok(extract_palette_from_rgba(thumb.as_raw(), w, h, source));
+            }
+        }
+        Ok(palette_from_solid_rgb(wallpaper.color, "solid"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_palette_from_rgba, palette_from_solid_rgb};
+
+    #[test]
+    fn extract_palette_finds_vivid_accent_and_distinct_swatches() {
+        let w = 128u32;
+        let h = 128u32;
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                if y < 90 {
+                    // Deep plum background band
+                    rgba[i] = 35;
+                    rgba[i + 1] = 16;
+                    rgba[i + 2] = 42;
+                } else if x < 64 {
+                    // Vivid rose accent region
+                    rgba[i] = 245;
+                    rgba[i + 1] = 92;
+                    rgba[i + 2] = 148;
+                } else {
+                    // Cool cyan secondary region
+                    rgba[i] = 68;
+                    rgba[i + 1] = 198;
+                    rgba[i + 2] = 230;
+                }
+                rgba[i + 3] = 255;
+            }
+        }
+        let palette = extract_palette_from_rgba(&rgba, w, h, "test.png");
+        assert!(palette.is_dark);
+        assert_eq!(palette.swatches.len(), 5);
+        assert_ne!(palette.accent, palette.surface_dark);
+        assert_ne!(palette.accent, palette.secondary);
+        assert!(palette.accent.starts_with('#') && palette.accent.len() == 7);
+    }
+
+    #[test]
+    fn extract_palette_handles_empty_input_and_solid_color() {
+        let fallback = extract_palette_from_rgba(&[], 0, 0, "none");
+        assert_eq!(fallback.swatches.len(), 5);
+        let solid = palette_from_solid_rgb([230, 224, 210], "solid");
+        assert!(!solid.is_dark);
+        assert_eq!(solid.swatches.len(), 5);
+    }
 }

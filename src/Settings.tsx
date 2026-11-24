@@ -1,11 +1,9 @@
-import { StrictMode, useState, useEffect } from "react";
+import { StrictMode, useState, useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { Effect, EffectState } from "@tauri-apps/api/window";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { Settings, Palette, PanelTop, Monitor, Layers, Info, Bug } from "lucide-react";
+import { Settings, Palette, PanelTop, Monitor, Layers, Info, Bug, Search, LayoutGrid } from "lucide-react";
 import { WindowControls } from "./components/WindowControls";
+import { NectarMotionProvider } from "./components/NectarMotionProvider";
 import {
   useSettings,
   GeneralTab,
@@ -13,6 +11,8 @@ import {
   NotchTab,
   CalendarSyncPage,
   DockTab,
+  LauncherTab,
+  StartTab,
   OverlaysTab,
   AboutTab,
   DiagnosticsTab,
@@ -22,15 +22,19 @@ import { initTheme } from "./theme";
 import { useT } from "./i18n";
 import { SettingsSearchBox, SearchResults, useSearchHits } from "./settings/SettingsSearch";
 import type { SearchEntry } from "./settings/searchIndex";
+import { applyPreviewThemeParams, bridgeInvoke, bridgeListen, isTauriRuntime } from "./utils/tauriBridge";
+import "./surfaces.css";
 import "./Settings.css";
 
-const appWindow = getCurrentWebviewWindow();
+const appWindow = isTauriRuntime() ? getCurrentWebviewWindow() : null;
 
 const TABS: { id: SettingsTab; labelKey: string; icon: typeof Settings }[] = [
   { id: "general", labelKey: "tabs.general", icon: Settings },
   { id: "appearance", labelKey: "tabs.appearance", icon: Palette },
   { id: "notch", labelKey: "tabs.notch", icon: PanelTop },
   { id: "dock", labelKey: "tabs.dock", icon: Monitor },
+  { id: "launcher", labelKey: "tabs.launcher", icon: Search },
+  { id: "start", labelKey: "tabs.start", icon: LayoutGrid },
   { id: "overlays", labelKey: "tabs.overlays", icon: Layers },
   { id: "about", labelKey: "tabs.about", icon: Info },
   { id: "diagnostics", labelKey: "tabs.diagnostics", icon: Bug },
@@ -41,8 +45,18 @@ function SettingsApp() {
   const [activeTab, setActiveTab] = useState<SettingsTab>("general");
   const [query, setQuery] = useState("");
   const [pending, setPending] = useState<string | null>(null);
+  const flashTimerRef = useRef<number | null>(null);
   const settings = useSettings();
   const hits = useSearchHits(query);
+
+  useEffect(() => {
+    return () => {
+      if (flashTimerRef.current !== null) {
+        window.clearTimeout(flashTimerRef.current);
+        flashTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const pick = (entry: SearchEntry) => {
     setQuery("");
@@ -57,14 +71,36 @@ function SettingsApp() {
     const timer = setInterval(() => {
       tries++;
       window.dispatchEvent(new Event("nectar-settings-reveal"));
-      const row = Array.from(document.querySelectorAll<HTMLElement>(".setting-item, .setting-section-header")).find(
-        (el) => (el.querySelector(".setting-label") ?? el.querySelector("span"))?.textContent?.trim() === label
+      const exact = document.querySelector<HTMLElement>(
+        `[data-setting-key="${CSS.escape(pending)}"]`
       );
+      const exactTarget = exact
+        ? exact.classList.contains("setting-item") ||
+          exact.classList.contains("setting-section-header") ||
+          exact.classList.contains("widget-config-zone")
+          ? exact
+          : exact.querySelector<HTMLElement>(".setting-item") ?? exact
+        : null;
+      const row =
+        exactTarget ??
+        Array.from(
+          document.querySelectorAll<HTMLElement>(
+            ".setting-item, .setting-section-header, .widget-config-zone"
+          )
+        ).find(
+          (el) => (el.querySelector(".setting-label") ?? el.querySelector("span"))?.textContent?.trim() === label
+        );
       if (row) {
         clearInterval(timer);
         row.scrollIntoView({ block: "center", behavior: "smooth" });
         row.classList.add("setting-flash");
-        setTimeout(() => row.classList.remove("setting-flash"), 1800);
+        if (flashTimerRef.current !== null) {
+          window.clearTimeout(flashTimerRef.current);
+        }
+        flashTimerRef.current = window.setTimeout(() => {
+          row.classList.remove("setting-flash");
+          flashTimerRef.current = null;
+        }, 1800);
         setPending(null);
       } else if (tries > 20) {
         clearInterval(timer);
@@ -75,15 +111,22 @@ function SettingsApp() {
   }, [pending, activeTab]);
 
   useEffect(() => {
+    applyPreviewThemeParams();
     return initTheme();
   }, []);
 
   useEffect(() => {
-    const unlisten = listen<string>("settings-navigate", (e) => {
-      if (e.payload === "calendar-sync") setActiveTab("calendar-sync");
+    let cancelled = false;
+    let stop: (() => void) | undefined;
+    bridgeListen<string>("settings-navigate", (target) => {
+      if (target === "calendar-sync") setActiveTab("calendar-sync");
+    }).then((fn) => {
+      if (cancelled) fn();
+      else stop = fn;
     });
     return () => {
-      unlisten.then((fn) => fn());
+      cancelled = true;
+      stop?.();
     };
   }, []);
 
@@ -91,10 +134,12 @@ function SettingsApp() {
     const preventContext = (e: MouseEvent) => e.preventDefault();
     document.addEventListener("contextmenu", preventContext as any);
 
-    appWindow.setEffects({ effects: [Effect.Acrylic], state: EffectState.Active, color: [10, 10, 15, 20] }).catch(() => {})
-      .finally(() => {
-      requestAnimationFrame(() => requestAnimationFrame(() => invoke("on_demand_window_ready").catch(() => {})));
-    });
+    if (appWindow) {
+      appWindow.clearEffects().catch(() => {})
+        .finally(() => {
+          requestAnimationFrame(() => requestAnimationFrame(() => bridgeInvoke("on_demand_window_ready").catch(() => {})));
+        });
+    }
 
     return () => {
       document.removeEventListener("contextmenu", preventContext as any);
@@ -102,14 +147,18 @@ function SettingsApp() {
   }, []);
 
   useEffect(() => {
-    invoke("resize_settings_window", {
-      width: 620 * settings.scale,
-      height: 480 * settings.scale,
+    if (!isTauriRuntime()) return;
+    const scale = Number.isFinite(settings.scale) && settings.scale > 0 ? settings.scale : 1;
+    bridgeInvoke("resize_settings_window", {
+      width: Math.max(620, Math.round(760 * scale)),
+      height: Math.max(480, Math.round(620 * scale)),
     }).catch(console.error);
   }, [settings.scale]);
 
+  const activeScale = Number.isFinite(settings.scale) && settings.scale > 0 ? settings.scale : 1;
+
   return (
-    <div className="settings-container" style={{ zoom: settings.scale }}>
+    <div className="settings-container" style={{ zoom: activeScale }}>
       <div className="title-bar" data-tauri-drag-region>
         <span className="title-text" data-tauri-drag-region>
           {t("settings.title")}
@@ -124,7 +173,11 @@ function SettingsApp() {
             <button
               key={id}
               className={`sidebar-tab ${activeTab === id || (id === "notch" && activeTab === "calendar-sync") ? "active" : ""}`}
-              onClick={() => setActiveTab(id)}
+              onClick={() => {
+                setQuery("");
+                setPending(null);
+                setActiveTab(id);
+              }}
             >
               <div className="sidebar-tab-icon">
                 <Icon size={14} strokeWidth={1.5} />
@@ -178,6 +231,17 @@ function SettingsApp() {
               themeAccentColor={settings.themeAccentColor}
               handleAccentColorChange={settings.handleAccentColorChange}
               applyThemePreset={settings.applyThemePreset}
+              applyThemeSettingsMap={settings.applyThemeSettingsMap}
+              selectionColor={settings.selectionColor}
+              handleSelectionColorChange={settings.handleSelectionColorChange}
+              resetSelectionColor={settings.resetSelectionColor}
+              syncWindowsSelection={settings.syncWindowsSelection}
+              toggleSyncWindowsSelection={settings.toggleSyncWindowsSelection}
+              selectionSyncError={settings.selectionSyncError}
+              selectionNeedsExplorerRefresh={settings.selectionNeedsExplorerRefresh}
+              explorerRefreshState={settings.explorerRefreshState}
+              explorerRefreshDone={settings.explorerRefreshDone}
+              refreshDesktopSelection={settings.refreshDesktopSelection}
               legacyMode={settings.legacyMode}
               cornersEnabled={settings.cornersEnabled}
               toggleCorners={settings.toggleCorners}
@@ -272,6 +336,8 @@ function SettingsApp() {
               toggleDock={settings.toggleDock}
               dockMode={settings.dockMode}
               setDockModeValue={settings.setDockModeValue}
+              dockReserveSpace={settings.dockReserveSpace}
+              toggleDockReserveSpace={settings.toggleDockReserveSpace}
               dockPreviewEnabled={settings.dockPreviewEnabled}
               toggleDockPreview={settings.toggleDockPreview}
               dockAttentionEnabled={settings.dockAttentionEnabled}
@@ -323,6 +389,8 @@ function SettingsApp() {
               replaceDockModes={settings.replaceDockModesByMonitor}
             />
           )}
+          {!query.trim() && activeTab === "launcher" && <LauncherTab legacyMode={settings.legacyMode} />}
+          {!query.trim() && activeTab === "start" && <StartTab legacyMode={settings.legacyMode} />}
           {!query.trim() && activeTab === "overlays" && (
             <OverlaysTab
               volumeOverlayEnabled={settings.volumeOverlayEnabled}
@@ -338,6 +406,7 @@ function SettingsApp() {
           {!query.trim() && activeTab === "about" && (
             <AboutTab
               appVersion={settings.appVersion}
+              updaterDisabled={settings.updaterDisabled}
               autoUpdate={settings.autoUpdate}
               toggleAutoUpdate={settings.toggleAutoUpdate}
               prereleaseChannel={settings.prereleaseChannel}
@@ -366,6 +435,8 @@ function SettingsApp() {
 
 createRoot(document.getElementById("root") as HTMLElement).render(
   <StrictMode>
-    <SettingsApp />
+    <NectarMotionProvider>
+      <SettingsApp />
+    </NectarMotionProvider>
   </StrictMode>
 );

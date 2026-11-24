@@ -3,13 +3,16 @@ import { createRoot } from "react-dom/client";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Effect, EffectState } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
-import { emit } from "@tauri-apps/api/event";
 import { Check, ChevronLeft, ChevronRight, RefreshCw, Settings as SettingsIcon } from "lucide-react";
 import { WindowControls } from "./components/WindowControls";
+import { NectarMotionProvider } from "./components/NectarMotionProvider";
 import { initTheme } from "./theme";
 import { useCaldav, type CalEvent } from "./hooks/useCaldav";
+import { useSettingsSync } from "./hooks/useSettingsSync";
+import { hydrateSettingsFromBackend } from "./utils/settingsHydration";
 import { dateLocale, timeAgo, useT, weekdayNames } from "./i18n";
 import { daysSinceWeekStart, useWeekStart } from "./weekStart";
+import "./surfaces.css";
 import "./Calendar.css";
 
 type View = "day" | "week" | "month" | "agenda";
@@ -79,9 +82,22 @@ function CalendarWindow() {
   const [hidden, setHidden] = useState<Set<string>>(readHidden);
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
-  const hour12 = localStorage.getItem("nectar-time-format-24h") !== "true";
+  const [hour12, setHour12] = useState(() => localStorage.getItem("nectar-time-format-24h") !== "true");
 
   useEffect(() => initTheme(), []);
+
+  useEffect(() => {
+    hydrateSettingsFromBackend().then((settings) => {
+      if (Object.prototype.hasOwnProperty.call(settings, "nectar-time-format-24h")) {
+        const val = settings["nectar-time-format-24h"];
+        setHour12(val !== true && String(val) !== "true");
+      }
+    });
+  }, []);
+
+  useSettingsSync({
+    "nectar-time-format-24h": (v) => setHour12(v !== true && v !== "true"),
+  });
 
   useEffect(() => {
     appWindow.setEffects({ effects: [Effect.Acrylic], state: EffectState.Active, color: [10, 10, 15, 20] }).catch(() => {})
@@ -125,8 +141,7 @@ function CalendarWindow() {
   };
 
   const manageSources = async () => {
-    await invoke("open_settings_window");
-    await emit("settings-navigate", "calendar-sync");
+    await invoke("open_settings_window_with_tab", { tab: "calendar-sync" }).catch(() => {});
   };
 
   const shift = (dir: number) => {
@@ -395,7 +410,7 @@ function MonthView({ anchor, today, events, time, onSelect, onOpen }: MonthProps
                 {shown.map((e, i) => (
                   <Chip key={`${e.uid}-${e.start}-${i}`} event={e} />
                 ))}
-                {extra > 0 && <span className="cw-more">+{extra} more</span>}
+                {extra > 0 && <span className="cw-more">{t("calendar.more", { count: extra })}</span>}
                 {compact && (
                   <span className="cw-compact">
                     {colors.map((color) => (
@@ -527,6 +542,8 @@ function AgendaView({ today, events, time, onOpen }: { today: Date; events: CalE
 
 createRoot(document.getElementById("root") as HTMLElement).render(
   <StrictMode>
-    <CalendarWindow />
+    <NectarMotionProvider>
+      <CalendarWindow />
+    </NectarMotionProvider>
   </StrictMode>,
 );

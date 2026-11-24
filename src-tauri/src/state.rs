@@ -1,6 +1,6 @@
-use std::sync::{atomic::{AtomicBool, AtomicU32, AtomicI64}, Mutex, OnceLock};
+use std::sync::{atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8}, Mutex, OnceLock};
 use std::sync::mpsc::Sender;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::types::{SystemCommand, IntRect, AppInfo};
 use tauri::{AppHandle, PhysicalPosition, PhysicalSize};
 
@@ -12,6 +12,74 @@ pub static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 /// This launch follows a restart or a crash, so calendars should sync right away.
 pub static RELAUNCHED: AtomicBool = AtomicBool::new(false);
 pub static KEYBOARD_FOCUS_LABEL: Mutex<Option<String>> = Mutex::new(None);
+pub static KEYBOARD_FOCUS_HWND: AtomicIsize = AtomicIsize::new(0);
+pub static START_MENU_VISIBLE: AtomicBool = AtomicBool::new(false);
+pub static HOTKEYS_PAUSED: AtomicBool = AtomicBool::new(false);
+/// True while AltKeyGuard holds synthetic VK_LMENU for focus unlock (never treated as physical Alt).
+pub static SYNTHETIC_ALT_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Wall-clock timestamp (ms) when AltKeyGuard finished releasing synthetic VK_LMENU.
+pub static SYNTHETIC_ALT_RELEASED_MS: AtomicI64 = AtomicI64::new(0);
+
+pub static HOOK_CUSTOM_START_ENABLED: AtomicBool = AtomicBool::new(true);
+pub static HOOK_WINKEY_ENABLED: AtomicBool = AtomicBool::new(true);
+pub static HOOK_LEGACY_MODE: AtomicBool = AtomicBool::new(false);
+pub static HOOK_DOCK_WIN_NUMBER_ENABLED: AtomicBool = AtomicBool::new(true);
+pub static HOOK_VOLUME_OVERLAY_ENABLED: AtomicBool = AtomicBool::new(true);
+pub static HOOK_BRIGHTNESS_OVERLAY_ENABLED: AtomicBool = AtomicBool::new(true);
+pub static HOOK_DOCK_ENABLED: AtomicBool = AtomicBool::new(true);
+pub static HOOK_DOCK_SHOW_DESKTOP_CORNER: AtomicBool = AtomicBool::new(false);
+
+/// Performance profile: 0 = balanced, 1 = eco, 2 = max visuals.
+pub static PERF_PROFILE: AtomicU8 = AtomicU8::new(0);
+pub static RAM_SAVER_ENABLED: AtomicBool = AtomicBool::new(false);
+pub static GAME_MODE_ENABLED: AtomicBool = AtomicBool::new(true);
+pub static GAME_MODE_PAUSE_POLLS: AtomicBool = AtomicBool::new(true);
+pub static GAME_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub static HOOK_PREVIEW_PRECAPTURE: AtomicBool = AtomicBool::new(false);
+pub static HOOK_DOCK_PREVIEW_ENABLED: AtomicBool = AtomicBool::new(true);
+pub static DOCK_ICON_SIZE: AtomicI32 = AtomicI32::new(36);
+/// Overlay vertical position: 0 = center, 1 = top, 2 = bottom.
+pub static OVERLAY_VPOS: AtomicU8 = AtomicU8::new(0);
+/// Overlay thickness style: 0 = default (42), 1 = slim (34), 2 = wide (52).
+pub static OVERLAY_WIDTH_STYLE: AtomicU8 = AtomicU8::new(0);
+pub static NECTAR_SCALE_BITS: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
+pub static LAST_SELF_WRITE_MS: AtomicI64 = AtomicI64::new(0);
+pub static MOUSE_SETTINGS_EPOCH: AtomicU64 = AtomicU64::new(1);
+pub static MEDIA_ACCENT_RUNTIME: Mutex<Option<String>> = Mutex::new(None);
+
+pub static SHELL_CHROME_HWNDS: OnceLock<Mutex<HashSet<isize>>> = OnceLock::new();
+
+fn shell_chrome_hwnds() -> &'static Mutex<HashSet<isize>> {
+    SHELL_CHROME_HWNDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub fn register_shell_chrome_hwnd(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    if let Ok(mut set) = shell_chrome_hwnds().lock() {
+        set.insert(hwnd);
+    }
+}
+
+pub fn unregister_shell_chrome_hwnd(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    if let Ok(mut set) = shell_chrome_hwnds().lock() {
+        set.remove(&hwnd);
+    }
+}
+
+pub fn is_shell_chrome_hwnd(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    shell_chrome_hwnds()
+        .lock()
+        .map(|set| set.contains(&hwnd))
+        .unwrap_or(false)
+}
 
 macro_rules! label_map {
     ($fn_name:ident, $val_ty:ty) => {
@@ -23,16 +91,22 @@ macro_rules! label_map {
 }
 
 label_map!(dock_rects, IntRect);
+label_map!(dock_pill_rects, IntRect);
 label_map!(notch_rects, IntRect);
 label_map!(dock_hovered, bool);
+label_map!(dock_hidden, bool);
 label_map!(notch_hovered, bool);
 // Frontend says the notch is off screen (smart/peek), keep it click-through then.
 label_map!(notch_hidden, bool);
+label_map!(notch_min_heights, i32);
 // A fullscreen window covers this notch's monitor.
 label_map!(notch_fullscreen, bool);
 // Top edge hover intent: when the cursor entered the band, and whether it rested long enough.
 label_map!(notch_edge_enter_ms, i64);
 label_map!(notch_edge_armed, bool);
+// Bottom edge hover intent for hidden smart/peek docks: prevents pass-through clicks from stealing input.
+label_map!(dock_edge_enter_ms, i64);
+label_map!(dock_edge_armed, bool);
 label_map!(dock_overlap, i32);
 label_map!(notch_overlap, i32);
 label_map!(dock_window_rects, (PhysicalPosition<i32>, PhysicalSize<u32>));
@@ -89,13 +163,18 @@ pub fn set_i64(map: &'static Mutex<HashMap<String, i64>>, label: &str, value: i6
 
 pub fn clear_window_state(label: &str) {
     if let Ok(mut m) = dock_rects().lock() { m.remove(label); }
+    if let Ok(mut m) = dock_pill_rects().lock() { m.remove(label); }
     if let Ok(mut m) = notch_rects().lock() { m.remove(label); }
     if let Ok(mut m) = dock_hovered().lock() { m.remove(label); }
+    if let Ok(mut m) = dock_hidden().lock() { m.remove(label); }
     if let Ok(mut m) = notch_hovered().lock() { m.remove(label); }
     if let Ok(mut m) = notch_hidden().lock() { m.remove(label); }
+    if let Ok(mut m) = notch_min_heights().lock() { m.remove(label); }
     if let Ok(mut m) = notch_fullscreen().lock() { m.remove(label); }
     if let Ok(mut m) = notch_edge_enter_ms().lock() { m.remove(label); }
     if let Ok(mut m) = notch_edge_armed().lock() { m.remove(label); }
+    if let Ok(mut m) = dock_edge_enter_ms().lock() { m.remove(label); }
+    if let Ok(mut m) = dock_edge_armed().lock() { m.remove(label); }
     if let Ok(mut m) = dock_overlap().lock() { m.remove(label); }
     if let Ok(mut m) = notch_overlap().lock() { m.remove(label); }
     if let Ok(mut m) = dock_window_rects().lock() { m.remove(label); }
@@ -155,10 +234,25 @@ pub static CURRENT_FOREGROUND_MAXIMIZED: AtomicBool = AtomicBool::new(false);
 
 pub static SINGLE_INSTANCE_MUTEX_HANDLE: OnceLock<isize> = OnceLock::new();
 pub static SINGLE_INSTANCE_EVENT_HANDLE: OnceLock<isize> = OnceLock::new();
+pub static SINGLE_INSTANCE_WAITER: OnceLock<Mutex<Option<std::thread::JoinHandle<()>>>> = OnceLock::new();
 
 pub fn close_single_instance_handles() {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::Foundation::HANDLE;
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Threading::SetEvent;
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    if let Some(&h) = SINGLE_INSTANCE_EVENT_HANDLE.get() {
+        if h != 0 {
+            unsafe {
+                let _ = SetEvent(HANDLE(h as *mut _));
+            }
+        }
+    }
+    if let Some(mtx) = SINGLE_INSTANCE_WAITER.get() {
+        if let Some(handle) = mtx.lock().ok().and_then(|mut g| g.take()) {
+            let _ = handle.join();
+        }
+    }
     if let Some(&h) = SINGLE_INSTANCE_MUTEX_HANDLE.get() {
         if h != 0 {
             unsafe { let _ = CloseHandle(HANDLE(h as *mut _)); }

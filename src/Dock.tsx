@@ -1,17 +1,25 @@
-import { useState, useEffect, useLayoutEffect, useMemo, useRef, memo } from 'react';
+import { Fragment, useState, useEffect, useLayoutEffect, useMemo, useRef, memo } from 'react';
 import { motion, AnimatePresence, Reorder, useIsPresent } from 'framer-motion';
 import { invoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+import { Activity, AppWindow, Bell, Check, Copy, Cpu, Download, ExternalLink, EyeOff, FileText, Film, Folder, FolderOpen, HardDrive, House, Image as ImageIcon, Info, Lock, LogOut, Maximize2, Minimize2, Monitor, Moon, MoreHorizontal, Music, Palette, Pencil, Pin, PinOff, Play, Plus, PlusSquare, Power, RotateCcw, Search as SearchLucide, Settings, Shield, Sliders, Terminal, Trash2, Wifi, X, XCircle } from 'lucide-react';
 import './Dock.css';
 import './surfaces.css';
 import { SurfaceShape } from "./components/SurfaceShape";
 import { initTheme } from './theme';
 import { useSettingsSync } from './hooks/useSettingsSync';
+import { clearSettingsPreservingOnboarding, hydrateSettingsFromBackend, notifyLocalSettingChanges } from './utils/settingsHydration';
+import { computeUpdatedTintExclusions, isAppTintExcluded, parseExcludedTintApps } from './utils/iconTint';
+import { bridgeInvoke, bridgeListen } from './utils/tauriBridge';
 import { useT } from './i18n';
 import { PlayIcon, PauseIcon, SkipBackIcon, SkipForwardIcon } from './icons';
 import { setVisibleInterval } from "./hooks/visibleInterval";
+import { useSurfaceMetrics } from "./hooks/useSurfaceMetrics";
+import { isGameModeSuppressToastsActive, useGameMode } from "./hooks/useGameMode";
 import { appAttention } from "./attention";
+import type { TrayIconDto } from "./traybar/types";
+import { parsePinnedTrayKeys, parseStringList, parseStringMap, syncPinnedOrder, trayCustomIconKey, trayInteractionCoords } from "./traybar/utils";
 
 interface AppInfo {
   name: string;
@@ -123,7 +131,95 @@ function parseDrives(val: string | null): string[] {
   }
 }
 
+const MAX_SOLID_ICON_CACHE = 200;
 const solidIconCache = new Map<string, boolean>();
+
+function setBoundedSolidIconCache(key: string, value: boolean) {
+  if (solidIconCache.has(key)) {
+    solidIconCache.delete(key);
+  } else if (solidIconCache.size >= MAX_SOLID_ICON_CACHE) {
+    const oldest = solidIconCache.keys().next().value;
+    if (oldest !== undefined) solidIconCache.delete(oldest);
+  }
+  solidIconCache.set(key, value);
+}
+
+type DockIndicatorMode = "dots" | "pill" | "bar" | "glow" | "fixed" | "none";
+const VALID_DOCK_INDICATORS = new Set<DockIndicatorMode>(["dots", "pill", "bar", "glow", "fixed", "none"]);
+function sanitizeDockIndicator(val?: unknown): DockIndicatorMode {
+  const s = typeof val === "string" ? val.trim() : "";
+  return VALID_DOCK_INDICATORS.has(s as DockIndicatorMode) ? (s as DockIndicatorMode) : "dots";
+}
+
+interface ExplorerJumpListItem {
+  id: string;
+  path: string;
+  kind: string;
+}
+
+function isExplorerApp(app: AppInfo | null | undefined): boolean {
+  if (!app) return false;
+  const pathLower = app.path.toLowerCase().replace(/\//g, "\\");
+  const exeLower = (app.executable ?? "").toLowerCase();
+  const nameLower = app.name.toLowerCase();
+  return (
+    exeLower === "explorer.exe" ||
+    pathLower === "explorer.exe" ||
+    pathLower === "explorer" ||
+    pathLower.endsWith("\\explorer.exe") ||
+    nameLower === "file explorer"
+  );
+}
+
+function supportsWinFileActions(app: AppInfo | null | undefined): boolean {
+  if (!app || !app.path) return false;
+  const norm = app.path.trim().replace(/\\/g, "/").toLowerCase();
+  if (!norm || norm === "start" || norm === "nectar-settings") return false;
+  if (norm.startsWith("ms-") || norm.startsWith("http://") || norm.startsWith("https://")) {
+    return false;
+  }
+  const isFrameHost = (app.executable ?? "").toLowerCase() === "applicationframehost.exe";
+  const hasLiveWin32Hwnd = Boolean(app.is_running && app.hwnd && !isFrameHost);
+  if (norm.startsWith("shell:")) {
+    return norm.startsWith("shell:appsfolder") && hasLiveWin32Hwnd;
+  }
+  const isAumid =
+    norm.includes("!") ||
+    (!norm.includes("/") &&
+      ![".exe", ".lnk", ".msc", ".bat", ".cmd", ".cpl", ".ps1", ".vbs", ".msi"].some((ext) =>
+        norm.endsWith(ext)
+      ));
+  if (isAumid) return hasLiveWin32Hwnd;
+  return true;
+}
+
+type DockSubmenuId = "places" | "more" | "window" | "appearance" | "system" | "power" | "nectar";
+
+type DockShortcutMenu =
+  | { kind: "recycle" }
+  | { kind: "drive"; letter: string }
+  | { kind: "tray" }
+  | { kind: "search" }
+  | { kind: "calendar" };
+
+interface ContextWindowState {
+  minimized: boolean;
+  maximized: boolean;
+  topmost: boolean;
+}
+
+function translateWithFallback(
+  tFn: (key: string, params?: Record<string, string | number>) => string,
+  key: string,
+  fallback: string,
+  params?: Record<string, string | number>
+): string {
+  const resolved = tFn(key, params);
+  if (resolved !== key) return resolved;
+  return params
+    ? fallback.replace(/\{(\w+)\}/g, (m, name) => (name in params ? String(params[name]) : m))
+    : fallback;
+}
 
 function hasOpaqueCorners(img: HTMLImageElement): boolean {
   try {
@@ -139,17 +235,39 @@ function hasOpaqueCorners(img: HTMLImageElement): boolean {
   }
 }
 
-function DockAppIcon({ src, alt, nectar }: { src: string | undefined; alt: string; nectar: boolean }) {
+function DockAppIcon({
+  src,
+  alt,
+  nectar,
+  tintExcluded = false,
+}: {
+  src: string | undefined;
+  alt: string;
+  nectar: boolean;
+  tintExcluded?: boolean;
+}) {
   const [solid, setSolid] = useState(() => (src ? solidIconCache.get(src) ?? false : false));
+  useEffect(() => {
+    setSolid(src ? solidIconCache.get(src) ?? false : false);
+  }, [src]);
+  const className = [
+    nectar ? 'nectar-icon-img' : solid ? 'solid-icon' : '',
+    !tintExcluded ? 'nectar-tintable-icon' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
   return (
     <img
       src={src}
       alt={alt}
-      className={nectar ? 'nectar-icon-img' : solid ? 'solid-icon' : ''}
+      className={className || undefined}
+      data-tint-excluded={tintExcluded ? 'true' : undefined}
       draggable={false}
       onLoad={(e) => {
         if (nectar || !src) return;
-        if (!solidIconCache.has(src)) solidIconCache.set(src, hasOpaqueCorners(e.currentTarget));
+        if (!solidIconCache.has(src)) {
+          setBoundedSolidIconCache(src, hasOpaqueCorners(e.currentTarget));
+        }
         setSolid(solidIconCache.get(src) ?? false);
       }}
     />
@@ -170,17 +288,18 @@ const ITEM_ENTRY_TRANSITION = {
   scale: { type: 'spring' as const, stiffness: 400, damping: 25, delay: 0.15 }
 };
 const DOCK_SPRING = { type: "spring", stiffness: 250, damping: 28, mass: 0.8 } as const;
+const DOCK_SLIDE_SPRING = { type: "spring", stiffness: 420, damping: 38, mass: 0.8 } as const;
+const CLASSIC_DOCK_SPRING = { type: "spring", stiffness: 250, damping: 22, mass: 0.8 } as const;
+const CLASSIC_DOCK_SLIDE_SPRING = { type: "spring", stiffness: 400, damping: 35, mass: 0.8 } as const;
+const CLASSIC_CORNER_SPRING = { type: "spring", stiffness: 500, damping: 30 } as const;
+const MODERN_LAYOUT_SPRING = { type: "spring", stiffness: 300, damping: 35 } as const;
+const CLASSIC_LAYOUT_SPRING = { type: "spring", stiffness: 300, damping: 25 } as const;
 const ITEM_INITIAL = { opacity: 0, scale: 0 };
 const ITEM_ANIMATE = { opacity: 1, scale: 1 };
 const ITEM_EXIT = { opacity: 0, scale: 0 };
 // Without an explicit transition framer-motion's default spring makes the hover lift bounce.
 const ICON_SPRING = { type: "spring", stiffness: 500, damping: 38 } as const;
-const ICON_VARIANTS = {
-  idle: { y: 0, scale: 1, transition: ICON_SPRING },
-  hover: { y: -5, scale: 1.1, transition: ICON_SPRING },
-  drag: { y: -10, scale: 1.1, opacity: 0.8, transition: ICON_SPRING },
-  tap: { scale: 0.95, transition: ICON_SPRING }
-};
+const CLASSIC_ICON_SPRING = { type: "spring", stiffness: 400, damping: 20 } as const;
 
 function SearchIcon() {
   return (
@@ -266,8 +385,10 @@ function AttentionBadge({ count }: { count: number }) {
   );
 }
 
-function WindowDots({ count, mode }: { count: number; mode: string }) {
-  if (mode === "dots") {
+function WindowDots({ count, mode }: { count: number; mode: DockIndicatorMode | string }) {
+  const safeMode = sanitizeDockIndicator(mode);
+  if (safeMode === "none") return null;
+  if (safeMode === "dots") {
     return (
       <div className="window-dots dots">
         {Array.from({ length: Math.min(Math.max(count, 1), 4) }, (_, i) => (
@@ -276,8 +397,15 @@ function WindowDots({ count, mode }: { count: number; mode: string }) {
       </div>
     );
   }
+  if (safeMode === "pill" || safeMode === "glow") {
+    return (
+      <div className={`window-dots ${safeMode}${count > 1 ? " multi" : ""}`}>
+        <div className="active-indicator" />
+      </div>
+    );
+  }
   return (
-    <div className={`window-dots${mode === "bar" && count > 1 ? " multi" : ""}`}>
+    <div className={`window-dots ${safeMode}${safeMode === "bar" && count > 1 ? " multi" : ""}`}>
       <div className="active-indicator" />
     </div>
   );
@@ -285,6 +413,7 @@ function WindowDots({ count, mode }: { count: number; mode: string }) {
 
 let liveThumbnailGeneration = 0;
 
+const MAX_PREVIEW_WINDOWS = 4;
 const PREVIEW_MAX_WIDTH = 260;
 const PREVIEW_MAX_HEIGHT = 170;
 const PREVIEW_DEFAULT_RATIO = 16 / 10;
@@ -302,15 +431,25 @@ function imageRatio(src: string): Promise<number> {
   });
 }
 
-function previewBox(ratio: number) {
-  const width = Math.round(Math.min(PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT * ratio));
+function previewBox(ratio: number, cardCount = 1, zoom = 1) {
+  let maxSurfaceW = PREVIEW_MAX_WIDTH;
+  if (cardCount > 1 && typeof window !== "undefined") {
+    const availUnzoomed = (window.innerWidth * 0.82) / Math.max(0.75, zoom) - 20;
+    const perCardMax = Math.floor((availUnzoomed - (cardCount - 1) * 6) / cardCount) - 16;
+    if (perCardMax > 96) {
+      maxSurfaceW = Math.min(PREVIEW_MAX_WIDTH, perCardMax);
+    }
+  }
+  const width = Math.round(Math.min(maxSurfaceW, PREVIEW_MAX_HEIGHT * ratio));
   return { width, height: Math.round(width / ratio) };
 }
 
 interface DockPreviewTooltipProps {
   app: AppInfo;
   previews: { hwnd: number; title: string; image: string; ratio: number }[];
+  extraCount: number;
   onClosePreview: (e: React.MouseEvent, hwnd: number) => void;
+  onPinError: (message: string) => void;
   renderMedia: (app: AppInfo) => React.ReactNode;
   onMouseEnter: () => void;
   onMouseLeave: () => void;
@@ -320,16 +459,82 @@ interface DockPreviewTooltipProps {
 function DockPreviewTooltip({
   app,
   previews,
+  extraCount,
   onClosePreview,
+  onPinError,
   renderMedia,
   onMouseEnter,
   onMouseLeave,
   zoom,
 }: DockPreviewTooltipProps) {
   const t = useT();
+  const tr = (key: string, fallback: string, params?: Record<string, string | number>) =>
+    translateWithFallback(t, key, fallback, params);
   const rootRef = useRef<HTMLDivElement>(null);
   const [shift, setShift] = useState(0);
   const isPresent = useIsPresent();
+  const [pinnedMap, setPinnedMap] = useState<Record<number, boolean>>({});
+  const pendingPinRef = useRef<Set<number>>(new Set());
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const previewHwndSig = useMemo(() => previews.map((p) => p.hwnd).join(","), [previews]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const hwnds = previews.map((p) => p.hwnd);
+    if (hwnds.length === 0) {
+      setPinnedMap({});
+      return;
+    }
+    Promise.all(
+      hwnds.map(async (hwnd) => {
+        try {
+          const topmost = await bridgeInvoke<boolean>("get_window_topmost", { hwnd });
+          return [hwnd, Boolean(topmost)] as const;
+        } catch {
+          return [hwnd, false] as const;
+        }
+      })
+    ).then((entries) => {
+      if (cancelled) return;
+      const next: Record<number, boolean> = {};
+      for (const [hwnd, topmost] of entries) {
+        next[hwnd] = topmost;
+      }
+      setPinnedMap(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [previewHwndSig]);
+
+  const handleTogglePin = async (e: React.MouseEvent, hwnd: number) => {
+    e.stopPropagation();
+    if (pendingPinRef.current.has(hwnd)) return;
+    pendingPinRef.current.add(hwnd);
+    try {
+      const nextPinned = await bridgeInvoke<boolean>("toggle_window_topmost", { hwnd });
+      if (mountedRef.current) {
+        setPinnedMap((prev) => ({ ...prev, [hwnd]: Boolean(nextPinned) }));
+      }
+    } catch (err) {
+      const errText = typeof err === "string" ? err : String(err ?? "");
+      if (errText.includes("elevated_window") || errText.includes("shell_window") || errText.includes("invalid_window")) {
+        onPinError(tr("dock.preview.pinElevatedError", "Cannot pin an administrator window"));
+      } else {
+        onPinError(tr("dock.preview.pinElevatedError", "Cannot pin an administrator window"));
+      }
+    } finally {
+      pendingPinRef.current.delete(hwnd);
+    }
+  };
 
   useLayoutEffect(() => {
     const el = rootRef.current;
@@ -340,7 +545,7 @@ function DockPreviewTooltip({
     if (rect.left < margin) delta = margin - rect.left;
     else if (rect.right > window.innerWidth - margin) delta = window.innerWidth - margin - rect.right;
     if (Math.abs(delta) > 0.5) setShift((s) => s + delta / (zoom || 1));
-  }, [previews, zoom]);
+  }, [previews, extraCount, zoom]);
   const [liveHwnds, setLiveHwnds] = useState<Set<number>>(() => new Set());
   const surfaceRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
@@ -348,8 +553,8 @@ function DockPreviewTooltip({
     const generation = ++liveThumbnailGeneration;
     let cancelled = false;
     let rafId: number | null = null;
-    let t1: any = null;
-    let t2: any = null;
+    let t1: ReturnType<typeof setTimeout> | null = null;
+    let t2: ReturnType<typeof setTimeout> | null = null;
 
     const syncThumbnails = async () => {
       if (cancelled) return;
@@ -398,10 +603,12 @@ function DockPreviewTooltip({
   }, [previews]);
 
   useEffect(() => {
+    let cancelled = false;
     let raf = 0;
     const ramp = (from: number, to: number, done?: () => void) => {
       const start = performance.now();
       const step = (now: number) => {
+        if (cancelled) return;
         const p = Math.min(1, (now - start) / 150);
         invoke('set_live_thumbnails_opacity', { opacity: Math.round(from + (to - from) * p) }).catch(() => {});
         if (p < 1) raf = requestAnimationFrame(step);
@@ -411,20 +618,26 @@ function DockPreviewTooltip({
     };
     if (isPresent) {
       ramp(0, 255);
-      return () => cancelAnimationFrame(raf);
+      return () => {
+        cancelled = true;
+        cancelAnimationFrame(raf);
+      };
     }
     ramp(255, 0, () => {
-      setLiveHwnds(new Set());
+      if (!cancelled && mountedRef.current) setLiveHwnds(new Set());
       invoke('clear_live_thumbnails').then(() => invoke('set_live_thumbnails_opacity', { opacity: 255 })).catch(() => {});
     });
-    return () => cancelAnimationFrame(raf);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+    };
   }, [isPresent]);
 
   return (
     <motion.div
       ref={rootRef}
       style={{ ['--pv-shift' as string]: `${shift}px` }}
-      className={`preview-tooltip ${previews.length > 1 ? 'multi' : ''}`}
+      className={`preview-tooltip ${previews.length > 1 || extraCount > 0 ? 'multi' : ''}`}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
@@ -436,14 +649,19 @@ function DockPreviewTooltip({
         <AnimatePresence initial={false}>
         {previews.map((prev, idx) => {
           const isLive = liveHwnds.has(prev.hwnd);
-          const box = previewBox(prev.ratio);
+          const box = previewBox(prev.ratio, previews.length, zoom);
+          const resolvedTitle = prev.title || app.name;
+          const isTopmost = Boolean(pinnedMap[prev.hwnd]);
+          const pinLabel = isTopmost
+            ? tr("dock.preview.unpinWindow", "Unpin window from top")
+            : tr("dock.preview.pinWindow", "Pin window on top");
           return (
             <motion.div
               key={prev.hwnd}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.15 }}
               className="preview-item"
-              style={{ width: Math.max(150, box.width + 16) }}
+              style={{ width: Math.max(120, box.width + 16) }}
               onClick={() => invoke('focus_window', { hwnd: prev.hwnd })}
             >
               <div
@@ -487,32 +705,60 @@ function DockPreviewTooltip({
                 )}
               </div>
               <div className="preview-label">
-                {app.icon && <img src={app.icon} alt="" />}
-                <span>{prev.title || app.name}</span>
+                {app.icon && <img src={app.icon} alt="" className="preview-app-icon" />}
+                <span className="preview-title" title={resolvedTitle}>{resolvedTitle}</span>
+                <div className="preview-label-actions">
+                  <button
+                    type="button"
+                    className={`preview-pin-btn${isTopmost ? " is-pinned" : ""}`}
+                    onClick={(e) => handleTogglePin(e, prev.hwnd)}
+                    aria-label={pinLabel}
+                    aria-pressed={isTopmost}
+                    title={pinLabel}
+                  >
+                    {isTopmost ? (
+                      <>
+                        <Pin size={11} className="pin-active-icon" />
+                        <PinOff size={11} className="pin-hover-off-icon" />
+                      </>
+                    ) : (
+                      <Pin size={11} />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="preview-close-btn"
+                    onClick={(e) => onClosePreview(e, prev.hwnd)}
+                    aria-label={t("dockmenu.closeWindow")}
+                    title={t("dockmenu.closeWindow")}
+                  >
+                    <svg
+                      width="10"
+                      height="10"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="3"
+                      strokeLinecap="round"
+                    >
+                      <line x1="18" y1="6" x2="6" y2="18"></line>
+                      <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                  </button>
+                </div>
               </div>
-              <button
-                className="preview-close-btn"
-                onClick={(e) => onClosePreview(e, prev.hwnd)}
-                aria-label={t("dockmenu.closeWindow")}
-              >
-                <svg
-                  width="10"
-                  height="10"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="3"
-                  strokeLinecap="round"
-                >
-                  <line x1="18" y1="6" x2="6" y2="18"></line>
-                  <line x1="6" y1="6" x2="18" y2="18"></line>
-                </svg>
-              </button>
             </motion.div>
           );
         })}
         </AnimatePresence>
       </div>
+      {extraCount > 0 && (
+        <div className="preview-more-row">
+          <span className="preview-more-badge">
+            {tr("dock.preview.moreWindows", "+{count} more", { count: extraCount })}
+          </span>
+        </div>
+      )}
       {renderMedia(app)}
     </motion.div>
   );
@@ -522,6 +768,24 @@ const tourDockAction = () => { emit('tour-dock-action').catch(() => {}); };
 
 const Dock = memo(function Dock() {
   const t = useT();
+  const tr = (key: string, fallback: string, params?: Record<string, string | number>) =>
+    translateWithFallback(t, key, fallback, params);
+  const { scaleSpring, scaledRadius, motionSpeed } = useSurfaceMetrics();
+  const { shouldPausePolls, shouldSuppressToasts } = useGameMode();
+  const shouldPausePollsRef = useRef(shouldPausePolls);
+  shouldPausePollsRef.current = shouldPausePolls;
+  const shouldSuppressToastsRef = useRef(shouldSuppressToasts);
+  shouldSuppressToastsRef.current = shouldSuppressToasts;
+  const motionSpeedRef = useRef(motionSpeed);
+  motionSpeedRef.current = motionSpeed;
+  const unmountedRef = useRef(false);
+  useEffect(() => {
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
+    };
+  }, []);
+
   useEffect(() => {
     return initTheme({ backdrop: true });
   }, []);
@@ -529,6 +793,11 @@ const Dock = memo(function Dock() {
   const [pinnedApps, setPinnedApps] = useState<AppInfo[]>([]);
   const [activeApps, setActiveApps] = useState<AppInfo[]>([]);
   const iconsRef = useRef<Record<string, string>>({});
+  const iconInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
+  const iconNegativeCacheRef = useRef<Set<string>>(new Set());
+  const pendingRetryKeysRef = useRef<Set<string>>(new Set());
+  const iconRetryTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  const iconCacheEpochRef = useRef(0);
   const [, setIconsTick] = useState(0); 
   const [dockMode, setDockMode] = useState(() => {
     const raw = localStorage.getItem("nectar-dock-mode") || "smart";
@@ -544,6 +813,17 @@ const Dock = memo(function Dock() {
   const [dockCalendarEnabled, setDockCalendarEnabled] = useState(() => localStorage.getItem("nectar-dock-calendar-enabled") !== "false");
   const [legacyMode, setLegacyMode] = useState(() => localStorage.getItem("nectar-legacy-mode") === "true");
   const [dockTray, setDockTray] = useState(() => localStorage.getItem("nectar-dock-tray-enabled") !== "false");
+  const [trayBarEnabled, setTrayBarEnabled] = useState(() => localStorage.getItem("nectar-tray-bar-enabled") !== "false");
+  const [pinnedTrayKeys, setPinnedTrayKeys] = useState<string[]>(() =>
+    parsePinnedTrayKeys(localStorage.getItem("nectar-tray-pinned-keys"))
+  );
+  const [trayOrder, setTrayOrder] = useState<string[]>(() =>
+    parseStringList(localStorage.getItem("nectar-tray-order"))
+  );
+  const [trayLabels, setTrayLabels] = useState<Record<string, string>>(() =>
+    parseStringMap(localStorage.getItem("nectar-tray-labels"))
+  );
+  const [trayIcons, setTrayIcons] = useState<TrayIconDto[]>([]);
   const [dockTaskView, setDockTaskView] = useState(() => localStorage.getItem("nectar-dock-taskview-enabled") === "true");
   const [dockShowDesktop, setDockShowDesktop] = useState(() => localStorage.getItem("nectar-dock-show-desktop-corner") === "true");
   const [dockRecycle, setDockRecycle] = useState(() => localStorage.getItem("nectar-dock-recycle-enabled") === "true");
@@ -551,14 +831,46 @@ const Dock = memo(function Dock() {
   const [hiddenApps, setHiddenApps] = useState<HiddenApp[]>(() => parseHiddenApps(localStorage.getItem("nectar-dock-hidden-apps")));
   const [menuItems, setMenuItems] = useState<string[]>(() => parseMenuItems(localStorage.getItem("nectar-dock-menu-items")));
   const [dockIconOnly, setDockIconOnly] = useState(() => localStorage.getItem("nectar-dock-icon-only") === "true");
-  const [windowIndicator, setWindowIndicator] = useState(() => localStorage.getItem("nectar-dock-indicator") ?? "bar");
+  const [windowIndicator, setWindowIndicator] = useState<DockIndicatorMode>(() =>
+    sanitizeDockIndicator(localStorage.getItem("nectar-dock-indicator"))
+  );
+  const [waveEnabled, setWaveEnabled] = useState(() => localStorage.getItem("nectar-dock-wave-enabled") !== "false");
+  const [launchBounce, setLaunchBounce] = useState(() => localStorage.getItem("nectar-dock-launch-bounce") !== "false");
+  const launchBounceRef = useRef(launchBounce);
+  launchBounceRef.current = launchBounce;
+  const [classicDockAnimations, setClassicDockAnimations] = useState(() => localStorage.getItem("nectar-dock-classic-animations") === "true");
+  const classicDockAnimationsRef = useRef(classicDockAnimations);
+  classicDockAnimationsRef.current = classicDockAnimations;
+  const [excludedTintApps, setExcludedTintApps] = useState<Set<string>>(() =>
+    new Set(parseExcludedTintApps(localStorage.getItem("nectar-icon-tint-excluded")))
+  );
+  const [dockIconSize, setDockIconSize] = useState(() => {
+    const n = Number(localStorage.getItem("nectar-dock-icon-size"));
+    return Number.isFinite(n) && n >= 28 && n <= 48 ? n : 36;
+  });
+  const [dockIconGap, setDockIconGap] = useState(() => {
+    const n = Number(localStorage.getItem("nectar-dock-icon-gap"));
+    return Number.isFinite(n) && n >= 6 && n <= 18 ? n : 12;
+  });
+  const [dockHoverScale, setDockHoverScale] = useState(() => {
+    const n = Number(localStorage.getItem("nectar-dock-hover-scale"));
+    return Number.isFinite(n) && n >= 1 && n <= 1.35 ? n : 1.1;
+  });
   const [dockAdaptive, setDockAdaptive] = useState(() => localStorage.getItem("nectar-dock-adaptive") === "true");
   const [startIcon, setStartIcon] = useState(() => localStorage.getItem("nectar-start-icon") || "default");
   const [isMaximized, setIsMaximized] = useState(false);
   const [dockMixedReorder, setDockMixedReorder] = useState(() => localStorage.getItem("nectar-dock-mixed-reorder") === "true");
   const [mixedOrder, setMixedOrder] = useState<string[]>([]);
-  const [previewData, setPreviewData] = useState<{ id: string, previews: { hwnd: number, title: string, image: string, ratio: number }[] } | null>(null);
+  const [previewData, setPreviewData] = useState<{
+    id: string;
+    previews: { hwnd: number; title: string; image: string; ratio: number }[];
+    extraCount: number;
+  } | null>(null);
+  const previewDataRef = useRef(previewData);
+  previewDataRef.current = previewData;
   const [isDockHovered, setIsDockHovered] = useState(false);
+  const isDockHoveredRef = useRef(isDockHovered);
+  isDockHoveredRef.current = isDockHovered;
   const [isEdgeHovered, setIsEdgeHovered] = useState(false);
   const [isOverlapped, setIsOverlapped] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -588,10 +900,12 @@ const Dock = memo(function Dock() {
     setRenameApp(null);
     invoke('set_menu_open', { open: false, rect: null }).catch(() => {});
   };
-  const [contextMenu, setContextMenu] = useState<{ x: number, y: number, app: AppInfo | null } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number, y: number, app: AppInfo | null, shortcut?: DockShortcutMenu } | null>(null);
   const [contextMenuHeight, setContextMenuHeight] = useState(0);
   const [contextMenuWidth, setContextMenuWidth] = useState(0);
-  const [activeSubmenu, setActiveSubmenu] = useState<string | null>(null);
+  const [activeSubmenu, setActiveSubmenu] = useState<DockSubmenuId | null>(null);
+  const [contextWindowState, setContextWindowState] = useState<ContextWindowState | null>(null);
+  const [explorerJumpList, setExplorerJumpList] = useState<ExplorerJumpListItem[]>([]);
   const [activeOrder, setActiveOrder] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [hoveredApp, setHoveredApp] = useState<string | null>(null);
@@ -599,25 +913,56 @@ const Dock = memo(function Dock() {
   const [isReady, setIsReady] = useState(false);
   const [isImpacted, setIsImpacted] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
-  const [startupAnimating, setStartupAnimating] = useState(false);
+  const [startupAnimating, setStartupAnimating] = useState(true);
   const [customIcons, setCustomIcons] = useState<Record<string, string>>({});
   const [toast, setToast] = useState<string | null>(null);
   const iconPickerTargetRef = useRef<string | null>(null);
-  const toastTimerRef = useRef<any>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dockRef = useRef<HTMLDivElement>(null);
   const [popupBottom, setPopupBottom] = useState(56);
   const [scale, setScale] = useState(() => parseFloat(localStorage.getItem("nectar-scale") || "1.0"));
+  const scaleRef = useRef(scale);
+  scaleRef.current = scale;
+  const dockIconSizeRef = useRef(dockIconSize);
+  dockIconSizeRef.current = dockIconSize;
+  const dockIconGapRef = useRef(dockIconGap);
+  dockIconGapRef.current = dockIconGap;
+  const dockHoverScaleRef = useRef(dockHoverScale);
+  dockHoverScaleRef.current = dockHoverScale;
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const pinnedItemsRef = useRef<AppInfo[]>([]);
   const handleAppClickRef = useRef<(app: AppInfo) => void>(() => {});
+
+  const showDockToast = (message: string, durationMs = 4000) => {
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+    setToast(message);
+    toastTimerRef.current = setTimeout(() => {
+      toastTimerRef.current = null;
+      setToast(null);
+    }, durationMs);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) {
+        clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = null;
+      }
+      for (const timer of iconRetryTimersRef.current) {
+        clearTimeout(timer);
+      }
+      iconRetryTimersRef.current.clear();
+    };
+  }, []);
 
   useEffect(() => {
     const onResize = () => setViewportWidth(window.innerWidth);
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   }, []);
-
-
 
   // Measure the dock pill when the popup opens. The card tucks ~14px behind it,
   // so the seam stays fused even if the measurement is slightly off.
@@ -632,10 +977,18 @@ const Dock = memo(function Dock() {
   const [interactionState, setInteractionState] = useState<'active' | 'grace' | 'none'>('none');
   const isAnyInteraction = isCurrentlyHovered || !!contextMenu || popupOpen;
   
-  const previewTimerRef = useRef<any>(null);
+  const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const trayClickTimersRef = useRef<Record<string, number>>({});
   const isPreviewHoveredRef = useRef(false);
   const [mediaSessions, setMediaSessions] = useState<AppMediaSession[]>([]);
   const hoveredAppRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    return () => {
+      Object.values(trayClickTimersRef.current).forEach((id) => window.clearTimeout(id));
+      trayClickTimersRef.current = {};
+    };
+  }, []);
 
   useEffect(() => {
     if (isAnyInteraction) {
@@ -647,16 +1000,193 @@ const Dock = memo(function Dock() {
     }
   }, [isAnyInteraction, hideDelay]);
 
-  const isHidden = ((dockMode === 'smart' || dockMode === 'peek') && isFullscreen) || isShellSurfaceFocused ||
+  const isHidden = isFullscreen || isShellSurfaceFocused ||
     (!startupAnimating && (
       (dockMode === 'smart' && isOverlapped && interactionState === 'none') ||
       (dockMode === 'peek' && interactionState === 'none')
     ));
 
+  const [isDockRevealing, setIsDockRevealing] = useState(false);
+  const isDockRevealingRef = useRef(false);
+  const prevHiddenRef = useRef(isHidden);
+  const justStartedReveal = prevHiddenRef.current && !isHidden && isExpanded;
+  isDockRevealingRef.current = isDockRevealing || justStartedReveal;
+
+  useLayoutEffect(() => {
+    const wasHidden = prevHiddenRef.current;
+    prevHiddenRef.current = isHidden;
+    if (isHidden) {
+      isDockRevealingRef.current = false;
+      setIsDockRevealing(false);
+      return;
+    }
+    if (wasHidden && isExpanded) {
+      isDockRevealingRef.current = true;
+      setIsDockRevealing(true);
+      const fallbackMs = motionSpeed <= 0 ? 30 : Math.min(500, Math.round(380 / Math.max(0.5, motionSpeed)));
+      const timer = setTimeout(() => {
+        isDockRevealingRef.current = false;
+        setIsDockRevealing(false);
+      }, fallbackMs);
+      return () => clearTimeout(timer);
+    }
+  }, [isHidden, isExpanded, motionSpeed]);
+
+  const isWaveActive =
+    !classicDockAnimations &&
+    !isDockRevealing &&
+    !justStartedReveal &&
+    waveEnabled &&
+    dockHoverScale > 1.01 &&
+    motionSpeed > 0 &&
+    !isDragging &&
+    !isHidden;
+  const isWaveActiveRef = useRef(isWaveActive);
+  isWaveActiveRef.current = isWaveActive;
+  const waveRafRef = useRef<number | null>(null);
+  const wavePointerXRef = useRef<number | null>(null);
+
+  const resetWave = () => {
+    if (waveRafRef.current !== null) {
+      cancelAnimationFrame(waveRafRef.current);
+      waveRafRef.current = null;
+    }
+    wavePointerXRef.current = null;
+    const dockEl = dockRef.current;
+    if (!dockEl) return;
+    dockEl.classList.remove('wave-tracking');
+    const nodes = dockEl.querySelectorAll<HTMLElement>('.dock-wave-item');
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      if (node.dataset.waveSig) {
+        delete node.dataset.waveSig;
+        node.style.removeProperty('--dock-wave-scale');
+        node.style.removeProperty('--dock-wave-lift');
+      }
+    }
+  };
+
+  const applyWaveFrame = () => {
+    waveRafRef.current = null;
+    const dockEl = dockRef.current;
+    const pointerX = wavePointerXRef.current;
+    if (!dockEl || pointerX === null || !isWaveActiveRef.current) {
+      resetWave();
+      return;
+    }
+    const nodes = dockEl.querySelectorAll<HTMLElement>('.dock-wave-item');
+    if (nodes.length === 0) return;
+
+    const currentScale = scaleRef.current || 1;
+    const maxScale = dockHoverScaleRef.current;
+    const radius = Math.max(84, (dockIconSizeRef.current + dockIconGapRef.current) * 2.2) * currentScale;
+    const peakLift = 5 * Math.min(1, (maxScale - 1) / 0.1);
+
+    // Read phase first to avoid layout thrashing
+    const centers: number[] = new Array(nodes.length);
+    for (let i = 0; i < nodes.length; i++) {
+      const rect = nodes[i].getBoundingClientRect();
+      centers[i] = rect.left + rect.width * 0.5;
+    }
+
+    // Write phase directly via CSS custom properties (zero React re-renders)
+    for (let i = 0; i < nodes.length; i++) {
+      const dist = Math.abs(pointerX - centers[i]);
+      let itemScale = 1;
+      let itemLift = 0;
+      if (dist < radius) {
+        const tNorm = 1 - dist / radius;
+        const factor = 0.5 - 0.5 * Math.cos(Math.PI * tNorm);
+        itemScale = 1 + (maxScale - 1) * factor;
+        itemLift = peakLift * factor;
+      }
+      const sig = itemScale <= 1.0005 ? '' : `${itemScale.toFixed(4)}:${itemLift.toFixed(2)}`;
+      const node = nodes[i];
+      if ((node.dataset.waveSig || '') !== sig) {
+        if (!sig) {
+          delete node.dataset.waveSig;
+          node.style.removeProperty('--dock-wave-scale');
+          node.style.removeProperty('--dock-wave-lift');
+        } else {
+          node.dataset.waveSig = sig;
+          node.style.setProperty('--dock-wave-scale', itemScale.toFixed(4));
+          node.style.setProperty('--dock-wave-lift', itemLift.toFixed(2));
+        }
+      }
+    }
+  };
+
+  const handleDockMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!isWaveActiveRef.current) return;
+    if ((e.target as HTMLElement | null)?.closest('.preview-tooltip')) {
+      resetWave();
+      return;
+    }
+    wavePointerXRef.current = e.clientX;
+    dockRef.current?.classList.add('wave-tracking');
+    if (waveRafRef.current === null) {
+      waveRafRef.current = requestAnimationFrame(applyWaveFrame);
+    }
+  };
+
+  useEffect(() => {
+    if (!isWaveActive) {
+      resetWave();
+    }
+  }, [isWaveActive]);
+
+  useEffect(() => {
+    return () => {
+      if (waveRafRef.current !== null) {
+        cancelAnimationFrame(waveRafRef.current);
+        waveRafRef.current = null;
+      }
+    };
+  }, []);
+
+  const triggerLaunchBounce = (containerEl: Element | null) => {
+    if (classicDockAnimationsRef.current || !launchBounceRef.current || motionSpeedRef.current <= 0) return;
+    if (typeof document !== 'undefined' && document.documentElement.classList.contains('reduced-motion')) {
+      return;
+    }
+    const slot = containerEl?.classList.contains('dock-launch-slot')
+      ? (containerEl as HTMLElement)
+      : (containerEl?.querySelector('.dock-launch-slot') as HTMLElement | null);
+    if (!slot) return;
+    slot.classList.remove('is-launching');
+    void slot.offsetWidth;
+    slot.classList.add('is-launching');
+  };
+
   // Adaptive mode (fixed dock): stretch to a full-width taskbar while a window is maximized.
   const isAdaptive = dockAdaptive && dockMode === 'fixed' && isMaximized && isExpanded && !isHidden;
   // Nearly full width, 24px margin per side. Width is pre-scale, so (viewport - 48*scale) / scale.
   const adaptiveWidth = (viewportWidth - 48 * scale) / scale;
+
+  useEffect(() => {
+    invoke('set_dock_hidden', { hidden: !isReady || isHidden }).catch(() => {});
+  }, [isReady, isHidden]);
+
+  useEffect(() => {
+    if (!isHidden) return;
+    if (previewTimerRef.current) {
+      clearTimeout(previewTimerRef.current);
+      previewTimerRef.current = null;
+    }
+    resetWave();
+    isPreviewHoveredRef.current = false;
+    hoveredAppRef.current = null;
+    setPreviewData(null);
+    setHoveredApp(null);
+    setPressedApp(null);
+    setIsDockHovered(false);
+    setContextMenu(null);
+    setActiveSubmenu(null);
+    setShowAddPopup(false);
+    setRenameApp(null);
+    invoke('set_menu_open', { open: false, rect: null }).catch(() => {});
+    invoke('clear_live_thumbnails').catch(() => {});
+  }, [isHidden]);
 
   useEffect(() => {
     let cleared = false;
@@ -665,12 +1195,12 @@ const Dock = memo(function Dock() {
       try {
         const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
         const visible = await getCurrentWebviewWindow().isVisible();
-        if (visible) {
+        if (visible && !cleared) {
           setStartupAnimating(true);
           setIsReady(true);
-          setTimeout(() => setIsImpacted(true), 280);
-          setTimeout(() => setIsExpanded(true), 350);
-          setTimeout(() => setStartupAnimating(false), 1500);
+          setTimeout(() => !unmountedRef.current && setIsImpacted(true), 280);
+          setTimeout(() => !unmountedRef.current && setIsExpanded(true), 350);
+          setTimeout(() => !unmountedRef.current && setStartupAnimating(false), 1500);
           return true;
         }
       } catch (_) {}
@@ -695,46 +1225,138 @@ const Dock = memo(function Dock() {
     return () => { clearInterval(interval); cleared = true; };
   }, []);
 
+  const lastPillSentRef = useRef("");
+  const lastRectSentRef = useRef("");
+  const lastVisiblePillRef = useRef<{ x: number; y: number; width: number; height: number } | null>(null);
+  const updateDockRectRef = useRef<() => void>(() => {});
+
   useEffect(() => {
-    let lastSent = "";
     const updateRect = () => {
-      if (dockRef.current) {
-        const rect = dockRef.current.getBoundingClientRect();
-        const hasPreview = !!previewData;
-        const next = {
-          x: Math.round(rect.x) - (hasPreview ? 500 : 0),
-          y: Math.round(rect.y) - (hasPreview ? 320 : 0),
-          width: Math.round(rect.width) + (hasPreview ? 1000 : 0),
-          height: Math.round(rect.height) + (hasPreview ? 320 : 0)
+      if (!dockRef.current) return;
+      const rect = dockRef.current.getBoundingClientRect();
+
+      // C4: Freeze the resting visible pill rect while hidden/collapsed or mid-reveal so overlap detection
+      // never oscillates on the off-screen slide animation frame.
+      const settledAtBottom = Math.abs(rect.bottom - window.innerHeight) <= 6;
+      const isRestingVisible =
+        !isHidden &&
+        !isDockRevealingRef.current &&
+        isReady &&
+        isExpanded &&
+        settledAtBottom &&
+        rect.width >= 60 * scale &&
+        rect.height >= 20;
+      if (isRestingVisible) {
+        const rawPill = {
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
         };
-        const key = `${next.x},${next.y},${next.width},${next.height}`;
-        if (key === lastSent) return;
-        lastSent = key;
-        invoke('update_dock_rect', { rect: next }).catch(() => { lastSent = ""; });
+        lastVisiblePillRef.current = rawPill;
+        const pillKey = `${rawPill.x},${rawPill.y},${rawPill.width},${rawPill.height}`;
+        if (pillKey !== lastPillSentRef.current) {
+          lastPillSentRef.current = pillKey;
+          invoke('update_dock_pill_rect', { rect: rawPill }).catch(() => { lastPillSentRef.current = ""; });
+        }
       }
+
+      // C6: Use exact DOM union of .dock and .preview-tooltip instead of hardcoded +/-500x320 shield.
+      const tooltipEl = !isHidden && previewData ? document.querySelector('.preview-tooltip') : null;
+      const tipRect = tooltipEl ? tooltipEl.getBoundingClientRect() : null;
+      const hasValidTip = !!tipRect && tipRect.width > 0 && tipRect.height > 0;
+      const freezePillRect = (isHidden || isDockRevealingRef.current) && !!lastVisiblePillRef.current;
+      const pill = freezePillRect ? lastVisiblePillRef.current! : null;
+      const baseLeft = pill ? pill.x : rect.left;
+      const baseRight = pill ? pill.x + pill.width : rect.right;
+      const waveHeadroom =
+        isWaveActiveRef.current && isDockHoveredRef.current && !isHidden && !isDockRevealingRef.current
+          ? Math.ceil(((dockHoverScaleRef.current - 1) * dockIconSizeRef.current + 8) * scale)
+          : 0;
+      const dockTop = (pill ? pill.y : rect.top) - waveHeadroom;
+      const dockBottom = pill ? pill.y + pill.height : rect.bottom;
+      const left = hasValidTip ? Math.min(baseLeft, tipRect.left) : baseLeft;
+      const top = hasValidTip ? Math.min(dockTop, tipRect.top) : dockTop;
+      const right = hasValidTip ? Math.max(baseRight, tipRect.right) : baseRight;
+      const bottom = hasValidTip ? Math.max(dockBottom, tipRect.bottom) : dockBottom;
+      const next = {
+        x: Math.round(left),
+        y: Math.round(top),
+        width: Math.round(right - left),
+        height: Math.round(bottom - top),
+      };
+      const key = `${next.x},${next.y},${next.width},${next.height}`;
+      if (key === lastRectSentRef.current) return;
+      lastRectSentRef.current = key;
+      invoke('update_dock_rect', { rect: next }).catch(() => { lastRectSentRef.current = ""; });
     };
+    updateDockRectRef.current = updateRect;
 
     updateRect();
+    let rafId = 0;
+    let tipTimer: ReturnType<typeof setTimeout> | undefined;
+    if (previewData) {
+      rafId = requestAnimationFrame(updateRect);
+      tipTimer = setTimeout(updateRect, 60);
+    }
+
     window.addEventListener('resize', updateRect);
     const observer = new ResizeObserver(updateRect);
     if (dockRef.current) observer.observe(dockRef.current);
+    const tooltipEl = previewData ? document.querySelector('.preview-tooltip') : null;
+    if (tooltipEl) observer.observe(tooltipEl);
 
-    const poll = setVisibleInterval(updateRect, 500);
+    const poll = setVisibleInterval(() => {
+      if (!shouldPausePollsRef.current) updateRect();
+    }, 500);
 
     return () => {
+      if (rafId) cancelAnimationFrame(rafId);
+      if (tipTimer) clearTimeout(tipTimer);
       window.removeEventListener('resize', updateRect);
       observer.disconnect();
       clearInterval(poll);
     };
-  }, [isHidden, previewData, scale]);
+  }, [isReady, isExpanded, isHidden, isDockRevealing, isDockHovered, isWaveActive, dockHoverScale, previewData, scale, dockIconSize, dockIconGap]);
 
   const refreshDockMode = () => {
     invoke<string>('get_dock_mode_for_window').then(setDockMode).catch(() => {});
   };
 
+  const trayBarEnabledRef = useRef(trayBarEnabled);
+  trayBarEnabledRef.current = trayBarEnabled;
+  const isDraggingRef = useRef(isDragging);
+  isDraggingRef.current = isDragging;
+  const pendingPollDuringDragRef = useRef(false);
+  const pollWindowsRef = useRef<() => Promise<void>>(async () => {});
+  const loadDockTrayIconsRef = useRef<() => void>(() => {});
+  const closeMenuRef = useRef<() => void>(() => {});
+  const closePopupRef = useRef<() => void>(() => {});
+
+  const resetWaveLaunchIndicatorExclusions = () => {
+    setWindowIndicator("dots");
+    setWaveEnabled(true);
+    setLaunchBounce(true);
+    setClassicDockAnimations(false);
+    setExcludedTintApps(new Set());
+  };
+
   useEffect(() => {
+    let cancelled = false;
+    const unlisteners: Array<() => void> = [];
+
+    const registerListen = (promise: Promise<() => void>) => {
+      promise
+        .then((fn) => {
+          if (cancelled) fn();
+          else unlisteners.push(fn);
+        })
+        .catch(() => {});
+    };
+
     const init = async () => {
-      const settings: any = await invoke('load_settings').catch(() => ({}));
+      const settings = await hydrateSettingsFromBackend();
+      if (cancelled) return;
       const getVal = (key: string, fallback: string | null = null) => {
         const val = settings[key];
         if (val !== undefined && val !== null) return String(val);
@@ -748,18 +1370,20 @@ const Dock = memo(function Dock() {
       setHideDelay(Number(getVal("nectar-dock-hide-delay", "800")) || 800);
       setPreviewDelay(Number(getVal("nectar-dock-preview-delay", "300")) || 0);
 
-      const preview = getVal("nectar-dock-preview-enabled", "true");
-      setDockPreviewEnabled(preview === "true");
+      setDockPreviewEnabled(getVal("nectar-dock-preview-enabled", "true") !== "false");
       setDockAttentionEnabled(getVal("nectar-dock-attention-enabled", "true") !== "false");
-
-      const searchEnabled = getVal("nectar-dock-search-enabled", "true");
-      setDockSearchEnabled(searchEnabled === "true");
-
-      const calendarEnabled = getVal("nectar-dock-calendar-enabled", "true");
-      setDockCalendarEnabled(calendarEnabled === "true");
+      setDockSearchEnabled(getVal("nectar-dock-search-enabled", "true") !== "false");
+      setDockCalendarEnabled(getVal("nectar-dock-calendar-enabled", "true") !== "false");
 
       setLegacyMode(getVal("nectar-legacy-mode", "false") === "true");
       setDockTray(getVal("nectar-dock-tray-enabled", "true") !== "false");
+      const trayBarOn = getVal("nectar-tray-bar-enabled", "true") !== "false";
+      trayBarEnabledRef.current = trayBarOn;
+      setTrayBarEnabled(trayBarOn);
+      loadDockTrayIconsRef.current();
+      setPinnedTrayKeys(parsePinnedTrayKeys(getVal("nectar-tray-pinned-keys", "[]")));
+      setTrayOrder(parseStringList(getVal("nectar-tray-order", "[]")));
+      setTrayLabels(parseStringMap(getVal("nectar-tray-labels", "{}")));
       setDockTaskView(getVal("nectar-dock-taskview-enabled", "false") === "true");
       setDockShowDesktop(getVal("nectar-dock-show-desktop-corner", "false") === "true");
       setDockRecycle(getVal("nectar-dock-recycle-enabled", "false") === "true");
@@ -769,7 +1393,17 @@ const Dock = memo(function Dock() {
 
       const iconOnly = getVal("nectar-dock-icon-only", "false");
       setDockIconOnly(iconOnly === "true");
-      setWindowIndicator(getVal("nectar-dock-indicator", "bar") ?? "bar");
+      setWindowIndicator(sanitizeDockIndicator(getVal("nectar-dock-indicator", "dots")));
+      setWaveEnabled(getVal("nectar-dock-wave-enabled", "true") !== "false");
+      setLaunchBounce(getVal("nectar-dock-launch-bounce", "true") !== "false");
+      setClassicDockAnimations(getVal("nectar-dock-classic-animations", "false") === "true");
+      setExcludedTintApps(new Set(parseExcludedTintApps(getVal("nectar-icon-tint-excluded", "[]"))));
+      const rawIconSize = Number(getVal("nectar-dock-icon-size", "36"));
+      setDockIconSize(Number.isFinite(rawIconSize) ? Math.min(48, Math.max(28, rawIconSize)) : 36);
+      const rawIconGap = Number(getVal("nectar-dock-icon-gap", "12"));
+      setDockIconGap(Number.isFinite(rawIconGap) ? Math.min(18, Math.max(6, rawIconGap)) : 12);
+      const rawHoverScale = Number(getVal("nectar-dock-hover-scale", "1.1"));
+      setDockHoverScale(Number.isFinite(rawHoverScale) ? Math.min(1.35, Math.max(1.0, rawHoverScale)) : 1.1);
 
       const adaptive = getVal("nectar-dock-adaptive", "false");
       setDockAdaptive(adaptive === "true");
@@ -780,18 +1414,29 @@ const Dock = memo(function Dock() {
       const mixedReorder = getVal("nectar-dock-mixed-reorder", "false");
       setDockMixedReorder(mixedReorder === "true");
 
+      const namesRaw = getVal("nectar-dock-names", "{}");
+      try {
+        const parsedNames = JSON.parse(namesRaw || "{}");
+        if (parsedNames && typeof parsedNames === "object" && !Array.isArray(parsedNames)) {
+          setDockNames(parsedNames);
+        }
+      } catch {}
+
       const scaleVal = getVal("nectar-scale");
-      if (scaleVal !== null) setScale(parseFloat(scaleVal));
+      if (scaleVal !== null) {
+        const parsedScale = parseFloat(scaleVal);
+        if (!Number.isNaN(parsedScale)) setScale(parsedScale);
+      }
 
       const pinned = await invoke<AppInfo[]>('load_pinned_apps');
+      if (cancelled) return;
       setPinnedApps(pinned.map(a => ({ ...a, is_pinned: true })));
       pinned.forEach(app => fetchIcon(app.path));
-
 
       // Load custom icons
       try {
         const icons = await invoke<Record<string, string>>('get_custom_icons');
-        setCustomIcons(icons);
+        if (!cancelled) setCustomIcons(icons);
       } catch (_) {}
     };
     init();
@@ -799,84 +1444,206 @@ const Dock = memo(function Dock() {
     // Sent to one dock by label, a global listen() would get them for every dock.
     const thisWindow = getCurrentWebviewWindow();
 
-    const unlistenOverlap = thisWindow.listen<boolean>("dock-overlap", (event) => {
-      setIsOverlapped(event.payload);
-    });
+    registerListen(thisWindow.listen<boolean>("dock-overlap", (event) => {
+      if (!cancelled) setIsOverlapped(event.payload);
+    }));
 
-    const unlistenEdgeHover = thisWindow.listen<boolean>("dock-edge-hover", (event) => {
-      setIsEdgeHovered(event.payload);
-    });
+    registerListen(thisWindow.listen<boolean>("dock-edge-hover", (event) => {
+      if (!cancelled) setIsEdgeHovered(event.payload);
+    }));
 
-    const unlistenFullscreen = thisWindow.listen<boolean>("dock-fullscreen", (event) => {
+    registerListen(thisWindow.listen<boolean>("dock-fullscreen", (event) => {
+      if (cancelled) return;
       setIsFullscreen(event.payload);
       if (event.payload) {
         setIsEdgeHovered(false);
         setIsDockHovered(false);
       }
-    });
+    }));
 
-    const unlistenShellSurface = thisWindow.listen<boolean>("dock-shell-surface", (event) => {
+    registerListen(thisWindow.listen<boolean>("dock-shell-surface", (event) => {
+      if (cancelled) return;
       setIsShellSurfaceFocused(event.payload);
       if (event.payload) {
         setIsEdgeHovered(false);
         setIsDockHovered(false);
       }
-    });
+    }));
 
-    const unlistenMonitors = listen("monitors-changed", refreshDockMode);
+    registerListen(listen("shell-surface-opening", () => {
+      if (cancelled) return;
+      if (previewTimerRef.current) {
+        clearTimeout(previewTimerRef.current);
+        previewTimerRef.current = null;
+      }
+      isPreviewHoveredRef.current = false;
+      setHoveredApp(null);
+      setPressedApp(null);
+      setPreviewData(null);
+      closeMenuRef.current();
+      closePopupRef.current();
+    }));
 
-    const unlistenMaximized = thisWindow.listen<boolean>("dock-maximized", (event) => {
-      setIsMaximized(event.payload);
-    });
+    registerListen(listen("monitors-changed", () => {
+      if (!cancelled) refreshDockMode();
+    }));
+
+    registerListen(thisWindow.listen<boolean>("dock-maximized", (event) => {
+      if (!cancelled) setIsMaximized(event.payload);
+    }));
 
     return () => {
-      unlistenMaximized.then(f => f());
-      unlistenOverlap.then(f => f());
-      unlistenEdgeHover.then(f => f());
-      unlistenFullscreen.then(f => f());
-      unlistenShellSurface.then(f => f());
-      unlistenMonitors.then(f => f());
+      cancelled = true;
+      for (const fn of unlisteners) fn();
     };
   }, []);
 
+  const asBool = (v: any, def: boolean) => (v === null || v === undefined ? def : v !== false && v !== "false");
   useSettingsSync(
     {
       "nectar-dock-mode": refreshDockMode,
       "nectar-dock-mode-by-monitor": refreshDockMode,
       "nectar-dock-monitor-mode": refreshDockMode,
       "nectar-dock-monitor-id": refreshDockMode,
-      "nectar-dock-hide-delay": (v) => setHideDelay(Number(v) || 800),
-      "nectar-dock-preview-delay": (v) => setPreviewDelay(Number(v) || 0),
-      "nectar-dock-preview-enabled": setDockPreviewEnabled,
-      "nectar-dock-attention-enabled": (v) => setDockAttentionEnabled(v !== false && v !== "false"),
-      "nectar-dock-search-enabled": setDockSearchEnabled,
-      "nectar-dock-calendar-enabled": setDockCalendarEnabled,
-      "nectar-legacy-mode": setLegacyMode,
-      "nectar-dock-tray-enabled": (v) => setDockTray(v !== false && v !== "false"),
-      "nectar-dock-taskview-enabled": setDockTaskView,
-      "nectar-dock-show-desktop-corner": setDockShowDesktop,
-      "nectar-dock-recycle-enabled": setDockRecycle,
-      "nectar-dock-drives": (v) => setDockDrives(parseDrives(v)),
+      "nectar-dock-hide-delay": (v) => setHideDelay(v == null ? 800 : Number(v) || 800),
+      "nectar-dock-preview-delay": (v) => setPreviewDelay(v == null ? 300 : Number(v) || 0),
+      "nectar-dock-preview-enabled": (v) => setDockPreviewEnabled(asBool(v, true)),
+      "nectar-dock-attention-enabled": (v) => setDockAttentionEnabled(asBool(v, true)),
+      "nectar-dock-search-enabled": (v) => setDockSearchEnabled(asBool(v, true)),
+      "nectar-dock-calendar-enabled": (v) => setDockCalendarEnabled(asBool(v, true)),
+      "nectar-legacy-mode": (v) => setLegacyMode(v === true || v === "true"),
+      "nectar-dock-tray-enabled": (v) => setDockTray(asBool(v, true)),
+      "nectar-tray-bar-enabled": (v) => {
+        const on = asBool(v, true);
+        trayBarEnabledRef.current = on;
+        setTrayBarEnabled(on);
+        if (!on) {
+          setTrayIcons([]);
+        } else {
+          invoke<TrayIconDto[]>("get_tray_icons")
+            .then((res) => Array.isArray(res) && setTrayIcons(res))
+            .catch((err) => console.error("Failed to load tray icons:", err));
+        }
+      },
+      "nectar-tray-pinned-keys": (v) => setPinnedTrayKeys(parsePinnedTrayKeys(v)),
+      "nectar-tray-order": (v) => setTrayOrder(parseStringList(v)),
+      "nectar-tray-labels": (v) => setTrayLabels(parseStringMap(v)),
+      "nectar-dock-taskview-enabled": (v) => setDockTaskView(v === true || v === "true"),
+      "nectar-dock-show-desktop-corner": (v) => setDockShowDesktop(v === true || v === "true"),
+      "nectar-dock-recycle-enabled": (v) => setDockRecycle(v === true || v === "true"),
+      "nectar-dock-drives": (v) => setDockDrives(parseDrives(v == null ? null : typeof v === "string" ? v : JSON.stringify(v))),
       "nectar-dock-hidden-apps": (v) => setHiddenApps(parseHiddenApps(v)),
       "nectar-dock-menu-items": (v) => setMenuItems(parseMenuItems(v)),
-      "nectar-dock-icon-only": setDockIconOnly,
-      "nectar-dock-indicator": (v) => setWindowIndicator(String(v)),
-      "nectar-dock-adaptive": setDockAdaptive,
-      "nectar-start-icon": setStartIcon,
-      "nectar-dock-mixed-reorder": setDockMixedReorder,
-      "nectar-scale": setScale,
+      "nectar-dock-icon-only": (v) => setDockIconOnly(v === true || v === "true"),
+      "nectar-dock-indicator": (v) => setWindowIndicator(sanitizeDockIndicator(v)),
+      "nectar-dock-wave-enabled": (v) => setWaveEnabled(asBool(v, true)),
+      "nectar-dock-launch-bounce": (v) => setLaunchBounce(asBool(v, true)),
+      "nectar-dock-classic-animations": (v) => setClassicDockAnimations(v === true || v === "true"),
+      "nectar-icon-tint-excluded": (v) => {
+        const raw = v == null ? "[]" : typeof v === "string" ? v : JSON.stringify(v);
+        setExcludedTintApps(new Set(parseExcludedTintApps(raw)));
+      },
+      "nectar-dock-icon-size": (v) => {
+        const n = Number(v);
+        setDockIconSize(Number.isFinite(n) ? Math.min(48, Math.max(28, n)) : 36);
+      },
+      "nectar-dock-icon-gap": (v) => {
+        const n = Number(v);
+        setDockIconGap(Number.isFinite(n) ? Math.min(18, Math.max(6, n)) : 12);
+      },
+      "nectar-dock-hover-scale": (v) => {
+        const n = Number(v);
+        setDockHoverScale(Number.isFinite(n) ? Math.min(1.35, Math.max(1.0, n)) : 1.1);
+      },
+      "nectar-dock-adaptive": (v) => setDockAdaptive(v === true || v === "true"),
+      "nectar-start-icon": (v) => setStartIcon(v ? String(v) : "default"),
+      "nectar-dock-mixed-reorder": (v) => setDockMixedReorder(v === true || v === "true"),
+      "nectar-dock-names": (v) => {
+        if (v === null || v === undefined) {
+          setDockNames({});
+          return;
+        }
+        try {
+          const parsed = typeof v === "string" ? JSON.parse(v) : v;
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) setDockNames(parsed);
+        } catch {}
+      },
+      "nectar-scale": (v) => setScale(typeof v === "number" && !Number.isNaN(v) ? v : 1.0),
+    },
+    undefined,
+    {
+      onReset: () => {
+        clearSettingsPreservingOnboarding();
+        resetWaveLaunchIndicatorExclusions();
+      },
     }
   );
 
   useEffect(() => {
+    const syncLocalKey = (key?: string | null) => {
+      if (!key || key === "nectar-icon-tint-excluded") {
+        setExcludedTintApps(new Set(parseExcludedTintApps(localStorage.getItem("nectar-icon-tint-excluded"))));
+      }
+      if (!key || key === "nectar-dock-wave-enabled") {
+        setWaveEnabled(localStorage.getItem("nectar-dock-wave-enabled") !== "false");
+      }
+      if (!key || key === "nectar-dock-launch-bounce") {
+        setLaunchBounce(localStorage.getItem("nectar-dock-launch-bounce") !== "false");
+      }
+      if (!key || key === "nectar-dock-classic-animations") {
+        setClassicDockAnimations(localStorage.getItem("nectar-dock-classic-animations") === "true");
+      }
+      if (!key || key === "nectar-dock-indicator") {
+        setWindowIndicator(sanitizeDockIndicator(localStorage.getItem("nectar-dock-indicator")));
+      }
+    };
+    const onLocal = (e: Event) => {
+      const keys = (e as CustomEvent<{ keys?: string[] }>).detail?.keys;
+      if (!keys) syncLocalKey(null);
+      else keys.forEach((k) => syncLocalKey(k));
+    };
+    const onStorage = (e: StorageEvent) => syncLocalKey(e.key);
+    window.addEventListener("nectar-local-setting", onLocal);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener("nectar-local-setting", onLocal);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, []);
+
+  const prevPausedPollsRef = useRef(shouldPausePolls);
+  useEffect(() => {
+    const wasPaused = prevPausedPollsRef.current;
+    prevPausedPollsRef.current = shouldPausePolls;
+    if (wasPaused && !shouldPausePolls) {
+      void pollWindowsRef.current();
+    }
+  }, [shouldPausePolls]);
+
+  useEffect(() => {
+    let cancelled = false;
     let pollSeq = 0;
+    const unlisteners: Array<() => void> = [];
+
+    const registerListen = (promise: Promise<() => void>) => {
+      promise
+        .then((fn) => {
+          if (cancelled) fn();
+          else unlisteners.push(fn);
+        })
+        .catch(() => {});
+    };
 
     const poll = async () => {
-      if (isDragging) return;
+      if (cancelled) return;
+      if (isDraggingRef.current) {
+        pendingPollDuringDragRef.current = true;
+        return;
+      }
       const seq = ++pollSeq;
       const running = await invoke<AppInfo[]>('get_active_windows');
       // Drop out-of-order responses, an old poll must not bring back closed apps.
-      if (seq !== pollSeq) return;
+      if (cancelled || seq !== pollSeq) return;
       setActiveApps(prev => {
         const same = prev.length === running.length && prev.every((p, i) => {
           const r = running[i];
@@ -894,65 +1661,163 @@ const Dock = memo(function Dock() {
 
       running.forEach(app => fetchIcon(app.path, app.name, app.hwnd));
     };
+    pollWindowsRef.current = poll;
 
     poll();
 
-    const unlistenWindowChange = listen("windows-changed", () => {
-      poll();
-    });
+    registerListen(bridgeListen("windows-changed", () => {
+      if (!cancelled) void poll();
+    }));
 
-    const unlistenSettingsReset = listen("settings-reset", () => {
-      localStorage.clear();
+    registerListen(bridgeListen("settings-reset", () => {
+      if (cancelled) return;
+      clearSettingsPreservingOnboarding();
+      resetWaveLaunchIndicatorExclusions();
       window.location.reload();
-    });
+    }));
 
-    const unlistenIconCache = listen("icon-cache-cleared", () => {
+    registerListen(bridgeListen("icon-cache-cleared", () => {
+      if (cancelled) return;
+      solidIconCache.clear();
+      iconNegativeCacheRef.current.clear();
+      pendingRetryKeysRef.current.clear();
       window.location.reload();
-    });
+    }));
 
     // Safety net: even if a window event is missed, converge on the real state
-    const interval = setVisibleInterval(poll, 10000);
+    const interval = setVisibleInterval(() => {
+      if (!shouldPausePollsRef.current) void poll();
+    }, 10000);
 
     // Windows that flashed for attention; the backend drops them once they're activated or closed
-    invoke<number[]>('get_attention_windows').then(list => setAttentionWindows(new Set(list))).catch(() => {});
-    const unlistenAttention = listen<number[]>("app-attention", (event) => {
-      setAttentionWindows(new Set(event.payload));
-    });
+    invoke<number[]>('get_attention_windows')
+      .then(list => { if (!cancelled) setAttentionWindows(new Set(list)); })
+      .catch(() => {});
+    registerListen(bridgeListen<number[]>("app-attention", (payload) => {
+      if (!cancelled) setAttentionWindows(new Set(payload));
+    }));
+
+    const loadDockTrayIcons = () => {
+      if (cancelled) return;
+      if (!trayBarEnabledRef.current) {
+        setTrayIcons([]);
+        return;
+      }
+      invoke<TrayIconDto[]>('get_tray_icons')
+        .then((res) => {
+          if (!cancelled && Array.isArray(res)) setTrayIcons(res);
+        })
+        .catch((err) => console.error("Failed to fetch dock tray icons:", err));
+    };
+    loadDockTrayIconsRef.current = loadDockTrayIcons;
+    loadDockTrayIcons();
+    registerListen(bridgeListen("tray-icons-updated", loadDockTrayIcons));
+    registerListen(bridgeListen("custom-icons-updated", async () => {
+      if (cancelled) return;
+      try {
+        const icons = await invoke<Record<string, string>>('get_custom_icons');
+        if (!cancelled && icons) setCustomIcons(icons);
+      } catch {}
+    }));
+    registerListen(bridgeListen("pinned-apps-updated", async () => {
+      if (cancelled) return;
+      try {
+        const pinned = await invoke<AppInfo[]>('load_pinned_apps');
+        if (cancelled) return;
+        setPinnedApps(pinned.map(a => ({ ...a, is_pinned: true })));
+        pinned.forEach(app => fetchIcon(app.path));
+      } catch {}
+    }));
 
     return () => {
+      cancelled = true;
       clearInterval(interval);
-      unlistenAttention.then(f => f());
-      unlistenWindowChange.then(f => f());
-      unlistenSettingsReset.then(f => f());
-      unlistenIconCache.then(f => f());
+      for (const fn of unlisteners) fn();
     };
+  }, []);
+
+  useEffect(() => {
+    if (!isDragging && pendingPollDuringDragRef.current) {
+      pendingPollDuringDragRef.current = false;
+      void pollWindowsRef.current();
+    }
   }, [isDragging]);
 
-  const fetchIcon = async (path: string, name?: string, hwnd?: number, retryCount = 0) => {
+  const fetchIcon = (path: string, name?: string, hwnd?: number, retryCount = 0): Promise<void> => {
+    if (!path) return Promise.resolve();
     const isHost = isBrowserHost(path);
     const cacheKey = isHost && name ? `${path}:${name.toLowerCase()}` : (hwnd ? `${path}-${hwnd}` : path);
-    
-    if (iconsRef.current[cacheKey]) return;
-    try {
-      const icon = await invoke<string | null>('get_app_icon', { path, name: name || null, hwnd: hwnd || null });
-      if (icon) {
-        iconsRef.current[cacheKey] = icon;
-        if (!isHost) iconsRef.current[path] = icon;
-        setIconsTick(t => t + 1);
-      } else if (retryCount < 3 && !hwnd) {
-        setTimeout(() => fetchIcon(path, name, undefined, retryCount + 1), 3000 * (retryCount + 1));
+
+    if (iconsRef.current[cacheKey]) return Promise.resolve();
+    if (iconNegativeCacheRef.current.has(cacheKey)) return Promise.resolve();
+    if (retryCount === 0 && pendingRetryKeysRef.current.has(cacheKey)) return Promise.resolve();
+    const existingPromise = iconInFlightRef.current.get(cacheKey);
+    if (existingPromise) return existingPromise;
+
+    const epoch = iconCacheEpochRef.current;
+    let promise!: Promise<void>;
+    promise = (async () => {
+      try {
+        const icon = await invoke<string | null>('get_app_icon', { path, name: name || null, hwnd: hwnd || null });
+        if (unmountedRef.current || epoch !== iconCacheEpochRef.current) return;
+        if (icon) {
+          iconsRef.current[cacheKey] = icon;
+          if (!isHost) iconsRef.current[path] = icon;
+          iconNegativeCacheRef.current.delete(cacheKey);
+          pendingRetryKeysRef.current.delete(cacheKey);
+          setIconsTick(t => t + 1);
+        } else if (retryCount < 3 && !hwnd) {
+          pendingRetryKeysRef.current.add(cacheKey);
+          const timer = setTimeout(() => {
+            iconRetryTimersRef.current.delete(timer);
+            pendingRetryKeysRef.current.delete(cacheKey);
+            if (!unmountedRef.current && epoch === iconCacheEpochRef.current) {
+              void fetchIcon(path, name, undefined, retryCount + 1);
+            }
+          }, 3000 * (retryCount + 1));
+          iconRetryTimersRef.current.add(timer);
+        } else {
+          iconNegativeCacheRef.current.add(cacheKey);
+        }
+      } catch (e) {
+        console.error(`Failed to fetch icon for ${path}:`, e);
+        if (unmountedRef.current || epoch !== iconCacheEpochRef.current) return;
+        if (retryCount < 3 && !hwnd) {
+          pendingRetryKeysRef.current.add(cacheKey);
+          const timer = setTimeout(() => {
+            iconRetryTimersRef.current.delete(timer);
+            pendingRetryKeysRef.current.delete(cacheKey);
+            if (!unmountedRef.current && epoch === iconCacheEpochRef.current) {
+              void fetchIcon(path, name, undefined, retryCount + 1);
+            }
+          }, 3000 * (retryCount + 1));
+          iconRetryTimersRef.current.add(timer);
+        } else {
+          iconNegativeCacheRef.current.add(cacheKey);
+        }
+      } finally {
+        if (iconInFlightRef.current.get(cacheKey) === promise) {
+          iconInFlightRef.current.delete(cacheKey);
+        }
       }
-    } catch (e) {
-      console.error(`Failed to fetch icon for ${path}:`, e);
-      if (retryCount < 3 && !hwnd) {
-        setTimeout(() => fetchIcon(path, name, undefined, retryCount + 1), 3000 * (retryCount + 1));
-      }
-    }
+    })();
+
+    iconInFlightRef.current.set(cacheKey, promise);
+    return promise;
   };
 
   const handleClearIconCache = async () => {
     try {
       await invoke('clear_icon_cache');
+      iconCacheEpochRef.current += 1;
+      for (const timer of iconRetryTimersRef.current) {
+        clearTimeout(timer);
+      }
+      iconRetryTimersRef.current.clear();
+      pendingRetryKeysRef.current.clear();
+      iconNegativeCacheRef.current.clear();
+      iconInFlightRef.current.clear();
+      solidIconCache.clear();
       iconsRef.current = {};
       setIconsTick(t => t + 1);
       pinnedApps.forEach(app => fetchIcon(app.path));
@@ -976,10 +1841,10 @@ const Dock = memo(function Dock() {
         });
         setCustomIcons(prev => ({ ...prev, [target]: newIcon }));
       } catch (err) {
-        const msg = typeof err === 'string' ? err : t('dockmenu.iconError');
-        if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-        setToast(msg);
-        toastTimerRef.current = setTimeout(() => setToast(null), 4000);
+        if (!isGameModeSuppressToastsActive() && !shouldSuppressToastsRef.current) {
+          const msg = typeof err === 'string' ? err : t('dockmenu.iconError');
+          showDockToast(msg, 4000);
+        }
       }
     };
     reader.readAsDataURL(file);
@@ -1001,6 +1866,9 @@ const Dock = memo(function Dock() {
       delete iconsRef.current[ck];
       delete iconsRef.current[app.path];
       if (app.hwnd) delete iconsRef.current[`${app.path}-${app.hwnd}`];
+      iconNegativeCacheRef.current.delete(ck);
+      iconNegativeCacheRef.current.delete(app.path);
+      if (app.hwnd) iconNegativeCacheRef.current.delete(`${app.path}-${app.hwnd}`);
       setIconsTick(t => t + 1);
       fetchIcon(app.path, app.name, app.hwnd);
     } catch (err) {
@@ -1010,15 +1878,18 @@ const Dock = memo(function Dock() {
 
   const handleClosePreview = async (e: React.MouseEvent, hwnd: number) => {
     e.stopPropagation();
-    setPreviewData(prev => {
-      if (!prev) return null;
-      const remaining = prev.previews.filter(p => p.hwnd !== hwnd);
+    const current = previewDataRef.current;
+    if (current) {
+      const remaining = current.previews.filter(p => p.hwnd !== hwnd);
       if (remaining.length === 0) {
+        isPreviewHoveredRef.current = false;
+        hoveredAppRef.current = null;
+        setPreviewData(null);
         setHoveredApp(null);
-        return null;
+      } else {
+        setPreviewData({ ...current, previews: remaining });
       }
-      return { ...prev, previews: remaining };
-    });
+    }
     try {
       await invoke('clear_live_thumbnails');
       await invoke('close_window', { hwnd });
@@ -1047,9 +1918,105 @@ const Dock = memo(function Dock() {
   const handleNewInstance = async (app: AppInfo) => {
     if (!app || app.path === 'start') return;
     try {
-      await invoke('launch_new_instance', { appPath: app.path, appName: app.name, args: app.args ?? null });
+      await bridgeInvoke('launch_new_instance', { appPath: app.path, appName: app.name, args: app.args ?? null });
     } catch (e) {
       console.error(`Failed to launch a new instance of ${app.name}:`, e);
+    }
+  };
+
+  const handleRunAsAdmin = async (app: AppInfo) => {
+    if (!supportsWinFileActions(app)) return;
+    try {
+      await bridgeInvoke('launch_app_as_admin', {
+        appPath: app.path,
+        appName: app.name,
+        args: app.args ?? null,
+        hwnd: app.hwnd ?? null,
+      });
+    } catch (err) {
+      const msg = String(err ?? '');
+      if (msg.includes('cancelled')) return;
+      showDockToast(
+        msg.includes('admin_unavailable')
+          ? t('start.action.adminUnavailable')
+          : t('dockmenu.adminFailed'),
+        3500
+      );
+    }
+  };
+
+  const handleOpenLocation = async (app: AppInfo) => {
+    if (!supportsWinFileActions(app)) return;
+    try {
+      await bridgeInvoke('open_app_location', {
+        appPath: app.path,
+        hwnd: app.hwnd ?? null,
+      });
+    } catch {
+      showDockToast(t('dockmenu.locationUnavailable'), 3500);
+    }
+  };
+
+  const handleOpenProperties = async (app: AppInfo) => {
+    if (!supportsWinFileActions(app)) return;
+    try {
+      await bridgeInvoke('open_app_properties', {
+        appPath: app.path,
+        hwnd: app.hwnd ?? null,
+      });
+    } catch {
+      showDockToast(t('dockmenu.propertiesUnavailable'), 3500);
+    }
+  };
+
+  const handleCopyPath = async (app: AppInfo) => {
+    if (!app.path || app.path === 'start') return;
+    try {
+      await bridgeInvoke('copy_text_to_clipboard', { text: app.path });
+      showDockToast(t('start.action.copiedPath'), 2200);
+    } catch (err) {
+      console.error('Failed to copy path:', err);
+    }
+  };
+
+  const handleWindowAction = async (app: AppInfo, action: 'minimize' | 'maximize' | 'restore' | 'close_all') => {
+    if (!app.hwnd) return;
+    try {
+      await bridgeInvoke('window_action', {
+        hwnd: app.hwnd,
+        allHwnds: app.all_hwnds?.map(([h]) => h) ?? null,
+        action,
+      });
+    } catch (err) {
+      console.error(`Failed window action ${action}:`, err);
+    }
+  };
+
+  const handleToggleTopmost = async (app: AppInfo) => {
+    if (!app.hwnd) return;
+    try {
+      await bridgeInvoke<boolean>('toggle_window_topmost', { hwnd: app.hwnd });
+    } catch (err) {
+      console.error('Failed to toggle topmost:', err);
+      showDockToast(tr('dock.preview.pinElevatedError', 'Cannot pin an administrator window'), 3500);
+    }
+  };
+
+  const handleOpenWindowsTool = async (tool: string) => {
+    try {
+      await bridgeInvoke('open_windows_tool', { tool });
+    } catch (err) {
+      const msg = String(err ?? '');
+      if (msg.includes('cancelled')) return;
+      console.error(`Failed to open Windows tool ${tool}:`, err);
+    }
+  };
+
+  const handlePowerAction = async (action: 'lock' | 'sign_out' | 'sleep' | 'hibernate' | 'restart' | 'shutdown') => {
+    try {
+      await bridgeInvoke('execute_power_action', { action });
+    } catch (err) {
+      console.error(`Failed power action ${action}:`, err);
     }
   };
 
@@ -1078,47 +2045,150 @@ const Dock = memo(function Dock() {
     closeMenu();
   };
 
+  const toggleAppTintExclusion = (app: AppInfo) => {
+    const targetId = app.path || app.name;
+    const currentRaw = JSON.stringify(Array.from(excludedTintApps));
+    const wasExcluded = isAppTintExcluded(targetId, excludedTintApps);
+    let result = computeUpdatedTintExclusions(targetId, currentRaw);
+    // Handle `.exe` stem alias if excluded under the alternate variant
+    if (wasExcluded && result.excluded && result.key) {
+      const altKey = result.key.endsWith(".exe") ? result.key.slice(0, -4) : `${result.key}.exe`;
+      if (altKey) {
+        result = computeUpdatedTintExclusions(altKey, currentRaw);
+      }
+    }
+    try {
+      localStorage.setItem("nectar-icon-tint-excluded", result.serialized);
+    } catch {}
+    setExcludedTintApps(new Set(result.list));
+    notifyLocalSettingChanges(["nectar-icon-tint-excluded"]);
+    bridgeInvoke("save_setting", { key: "nectar-icon-tint-excluded", value: result.serialized }).catch(console.error);
+    closeMenu();
+  };
+
   const menuRef = useRef<HTMLDivElement>(null);
+  const activeSubmenuRef = useRef<HTMLDivElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
+  const submenuCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const cancelSubmenuClose = () => {
+    if (submenuCloseTimerRef.current) {
+      clearTimeout(submenuCloseTimerRef.current);
+      submenuCloseTimerRef.current = null;
+    }
+  };
 
+  const openSubmenu = (id: DockSubmenuId) => {
+    cancelSubmenuClose();
+    setActiveSubmenu(id);
+  };
 
-  const handleContextMenu = (e: React.MouseEvent, app: AppInfo | null) => {
+  const scheduleSubmenuClose = (id: DockSubmenuId) => {
+    cancelSubmenuClose();
+    submenuCloseTimerRef.current = setTimeout(() => {
+      submenuCloseTimerRef.current = null;
+      setActiveSubmenu((cur) => (cur === id ? null : cur));
+    }, 170);
+  };
+
+  useEffect(() => cancelSubmenuClose, []);
+
+  const handleContextMenu = (e: React.MouseEvent, app: AppInfo | null, shortcut?: DockShortcutMenu) => {
     e.stopPropagation();
     e.preventDefault();
     tourDockAction();
+    cancelSubmenuClose();
     setHoveredApp(null);
     setPreviewData(null);
+    setActiveSubmenu(null);
+    setContextWindowState(null);
     setContextMenuHeight(0);
     setContextMenuWidth(0);
     const dockRect = dockRef.current?.getBoundingClientRect();
     const target = (e.currentTarget as HTMLElement).getBoundingClientRect();
     setContextMenu({
-      x: app ? target.left + target.width / 2 : (dockRect ? dockRect.left + dockRect.width / 2 : e.clientX),
+      x: (app || shortcut) ? target.left + target.width / 2 : (dockRect ? dockRect.left + dockRect.width / 2 : e.clientX),
       y: dockRect ? dockRect.top : e.clientY,
       app,
+      shortcut,
     });
   };
 
   const closeMenu = () => {
+    cancelSubmenuClose();
     setContextMenu(null);
     setActiveSubmenu(null);
     invoke('set_menu_open', { open: false, rect: null }).catch(() => {});
   };
+  closeMenuRef.current = closeMenu;
 
   const closePopup = () => {
     setShowAddPopup(false);
     setRenameApp(null);
     invoke('set_menu_open', { open: false, rect: null }).catch(() => {});
   };
+  closePopupRef.current = closePopup;
+
+  const contextMenuAppIsExplorer = isExplorerApp(contextMenu?.app);
+  useEffect(() => {
+    if (!contextMenu || !contextMenuAppIsExplorer) {
+      setExplorerJumpList([]);
+      return;
+    }
+    setExplorerJumpList([{ id: "thisPc", path: "shell:MyComputerFolder", kind: "thisPc" }]);
+    let cancelled = false;
+    bridgeInvoke<ExplorerJumpListItem[]>("get_explorer_jump_list")
+      .then((items) => {
+        if (cancelled) return;
+        const normalized = Array.isArray(items)
+          ? items.filter((it) => it && typeof it.path === "string" && it.path.trim() !== "")
+          : [];
+        const hasThisPc = normalized.some(
+          (it) => it.kind === "thisPc" || it.kind === "this_pc" || it.path.toLowerCase() === "shell:mycomputerfolder"
+        );
+        if (!hasThisPc) {
+          normalized.push({
+            id: "thisPc",
+            path: "shell:MyComputerFolder",
+            kind: "thisPc",
+          });
+        }
+        setExplorerJumpList(normalized);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setExplorerJumpList([{ id: "thisPc", path: "shell:MyComputerFolder", kind: "thisPc" }]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [contextMenu, contextMenuAppIsExplorer]);
+
+  const contextMenuHwnd = contextMenu?.app?.is_running ? (contextMenu.app.hwnd ?? null) : null;
+  useEffect(() => {
+    if (!contextMenuHwnd) {
+      setContextWindowState(null);
+      return;
+    }
+    let cancelled = false;
+    bridgeInvoke<ContextWindowState>("get_window_state", { hwnd: contextMenuHwnd })
+      .then((state) => {
+        if (!cancelled && state) setContextWindowState(state);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [contextMenuHwnd]);
 
   useLayoutEffect(() => {
     if (contextMenu && menuRef.current) {
-      const measured = menuRef.current.offsetHeight;
-      if (measured > 0 && measured !== contextMenuHeight) {
+      const measured = menuRef.current.offsetHeight * scale;
+      if (measured > 0 && Math.abs(measured - contextMenuHeight) > 0.5) {
         setContextMenuHeight(measured);
       }
-      const measuredWidth = menuRef.current.getBoundingClientRect().width;
+      const measuredWidth = menuRef.current.offsetWidth * scale;
       if (measuredWidth > 0 && Math.abs(measuredWidth - contextMenuWidth) > 0.5) {
         setContextMenuWidth(measuredWidth);
       }
@@ -1126,35 +2196,81 @@ const Dock = memo(function Dock() {
       setContextMenuHeight(0);
       setContextMenuWidth(0);
     }
-  }, [contextMenu, contextMenuHeight, contextMenuWidth]);
+  }, [contextMenu, contextMenuHeight, contextMenuWidth, explorerJumpList.length, scale]);
 
-  useEffect(() => {
+  const dockSpring = useMemo(
+    () => scaleSpring(classicDockAnimations ? CLASSIC_DOCK_SPRING : DOCK_SPRING),
+    [scaleSpring, classicDockAnimations],
+  );
+  const dockSlideSpring = useMemo(
+    () => scaleSpring(classicDockAnimations ? CLASSIC_DOCK_SLIDE_SPRING : DOCK_SLIDE_SPRING),
+    [scaleSpring, classicDockAnimations],
+  );
+  const dockCornerSpring = useMemo(
+    () => (classicDockAnimations ? scaleSpring(CLASSIC_CORNER_SPRING) : dockSpring),
+    [scaleSpring, classicDockAnimations, dockSpring],
+  );
+  const dockLayoutSpring = useMemo(
+    () => scaleSpring(classicDockAnimations ? CLASSIC_LAYOUT_SPRING : MODERN_LAYOUT_SPRING),
+    [scaleSpring, classicDockAnimations],
+  );
+  const iconVariants = useMemo(() => {
+    const iconSpring = scaleSpring(classicDockAnimations ? CLASSIC_ICON_SPRING : ICON_SPRING);
+    const hoverTarget = isWaveActive
+      ? { y: 0, scale: 1, transition: iconSpring }
+      : { y: dockHoverScale <= 1.01 ? 0 : -5, scale: dockHoverScale, transition: iconSpring };
+    return {
+      idle: { y: 0, scale: 1, transition: iconSpring },
+      hover: hoverTarget,
+      drag: { y: -10, scale: Math.max(1.05, dockHoverScale), opacity: 0.8, transition: iconSpring },
+      tap: { scale: 0.94, transition: iconSpring },
+    };
+  }, [scaleSpring, classicDockAnimations, dockHoverScale, isWaveActive]);
+  const contextMenuLeft = useMemo(() => {
+    if (!contextMenu) return 8;
+    const w = contextMenuWidth || 176 * scale;
+    return Math.min(Math.max(8, contextMenu.x - w / 2), Math.max(8, viewportWidth - w - 8));
+  }, [contextMenu, contextMenuWidth, viewportWidth, scale]);
+  const openSubmenuLeft = useMemo(() => {
+    const w = contextMenuWidth || 176 * scale;
+    return contextMenuLeft + w + 224 * scale > viewportWidth;
+  }, [contextMenuLeft, contextMenuWidth, viewportWidth, scale]);
+
+  useLayoutEffect(() => {
     let open = false;
     let rect = null;
 
     if (contextMenu && menuRef.current) {
       const r = menuRef.current.getBoundingClientRect();
-      rect = { 
-        x: Math.round(r.x), 
-        y: Math.round(r.y), 
-        width: Math.round(r.width + (activeSubmenu ? 160 : 0)), 
-        height: Math.round(r.height) 
+      const subW = activeSubmenu ? Math.round(215 * scale) : 0;
+      const subRect = activeSubmenu && activeSubmenuRef.current ? activeSubmenuRef.current.getBoundingClientRect() : null;
+      const hasSubRect = !!subRect && subRect.width > 0 && subRect.height > 0;
+      const pad = Math.round(14 * scale);
+      const minX = (hasSubRect ? Math.min(r.x, subRect.left) : r.x - (openSubmenuLeft ? subW : 0)) - pad;
+      const maxX = (hasSubRect ? Math.max(r.right, subRect.right) : r.right + (openSubmenuLeft ? 0 : subW)) + pad;
+      const minY = (hasSubRect ? Math.min(r.y, subRect.top) : r.y) - pad;
+      const maxY = (hasSubRect ? Math.max(r.bottom, subRect.bottom) : r.bottom) + pad;
+      rect = {
+        x: Math.round(minX),
+        y: Math.round(minY),
+        width: Math.round(Math.max(r.width + subW + pad * 2, maxX - minX)),
+        height: Math.round(maxY - minY),
       };
       open = true;
     } else if (popupOpen && popupRef.current) {
       const r = popupRef.current.getBoundingClientRect();
-      rect = { 
-        x: Math.round(r.x), 
-        y: Math.round(r.y), 
-        width: Math.round(r.width), 
-        height: Math.round(r.height) 
+      rect = {
+        x: Math.round(r.x),
+        y: Math.round(r.y),
+        width: Math.round(r.width),
+        height: Math.round(r.height),
       };
       open = true;
     }
 
     invoke('set_menu_open', { open, rect }).catch(() => {});
 
-  }, [contextMenu, popupOpen, pinnedApps, activeApps, activeSubmenu, scale]);
+  }, [contextMenu, contextMenuHeight, contextMenuWidth, popupOpen, pinnedApps, activeApps, activeSubmenu, explorerJumpList, scale, openSubmenuLeft]);
 
   const dockItems = useMemo(() => {
     const runningMap = new Map();
@@ -1224,26 +2340,147 @@ const Dock = memo(function Dock() {
     return [...pinned, ...unpinned];
   }, [pinnedApps, activeApps, activeOrder, hiddenApps]);
 
-  const nectarOptionsMenu = () => {
+  const resolveExplorerPlaceKey = (item: Pick<ExplorerJumpListItem, "id" | "kind">) => {
+    const kind = (item.kind || "").toLowerCase();
+    if (kind && kind !== "known" && kind !== "shell") return kind;
+    return (item.id || kind).toLowerCase();
+  };
+
+  const renderExplorerPlaceIcon = (item: ExplorerJumpListItem) => {
+    switch (resolveExplorerPlaceKey(item)) {
+      case "desktop":
+        return <Monitor size={14} />;
+      case "downloads":
+        return <Download size={14} />;
+      case "documents":
+        return <FileText size={14} />;
+      case "pictures":
+        return <ImageIcon size={14} />;
+      case "music":
+        return <Music size={14} />;
+      case "videos":
+        return <Film size={14} />;
+      case "thispc":
+      case "this_pc":
+        return <HardDrive size={14} />;
+      case "home":
+        return <House size={14} />;
+      default:
+        return <Folder size={14} />;
+    }
+  };
+
+  const formatExplorerPlaceLabel = (item: ExplorerJumpListItem) => {
+    switch (resolveExplorerPlaceKey(item)) {
+      case "desktop":
+        return tr("dock.explorer.desktop", "Desktop");
+      case "downloads":
+        return tr("dock.explorer.downloads", "Downloads");
+      case "documents":
+        return tr("dock.explorer.documents", "Documents");
+      case "pictures":
+        return tr("dock.explorer.pictures", "Pictures");
+      case "music":
+        return tr("dock.explorer.music", "Music");
+      case "videos":
+        return tr("dock.explorer.videos", "Videos");
+      case "thispc":
+      case "this_pc":
+        return tr("dock.explorer.thisPc", "This PC");
+      default: {
+        const clean = item.path.replace(/[\\/]+$/, "");
+        const last = clean.split(/[\\/]/).pop();
+        return last || item.path;
+      }
+    }
+  };
+
+  const renderExplorerJumpMenu = (openLeft = false) => {
+    if (explorerJumpList.length === 0) return null;
+    return (
+      <div
+        className={`menu-item has-submenu${activeSubmenu === "places" ? " submenu-open" : ""}`}
+        onMouseEnter={() => openSubmenu("places")}
+        onMouseLeave={() => scheduleSubmenuClose("places")}
+        onClick={(e) => {
+          e.stopPropagation();
+          cancelSubmenuClose();
+          setActiveSubmenu((prev) => (prev === "places" ? null : "places"));
+        }}
+      >
+        <span className="menu-item-icon"><FolderOpen size={14} /></span>
+        <span className="menu-item-label">{tr("dock.explorer.places", "Places")}</span>
+        <span className="submenu-arrow">▶</span>
+        <div
+          ref={activeSubmenu === "places" ? activeSubmenuRef : undefined}
+          className={`submenu explorer-places-submenu nectar-menu-pop${openLeft ? " submenu-left" : ""}`}
+          onMouseEnter={() => openSubmenu("places")}
+          onMouseLeave={() => scheduleSubmenuClose("places")}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="submenu-scroll nectar-scroll">
+            {explorerJumpList.map((folder, idx) => {
+              const isThisPc = folder.kind.toLowerCase() === "thispc" || folder.kind.toLowerCase() === "this_pc";
+              return (
+                <Fragment key={folder.id || folder.path}>
+                  {isThisPc && idx > 0 && <div className="menu-divider" />}
+                  <div
+                    className="menu-item explorer-place-item"
+                    title={folder.path}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      bridgeInvoke("open_start_folder", { path: folder.path }).catch((err) =>
+                        console.error("Failed to open Explorer place:", err)
+                      );
+                      closeMenu();
+                    }}
+                  >
+                    <span className="menu-item-icon">{renderExplorerPlaceIcon(folder)}</span>
+                    <span className="menu-item-label">{formatExplorerPlaceLabel(folder)}</span>
+                  </div>
+                </Fragment>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const nectarOptionsMenu = (openLeft = false) => {
     const on = (id: string) => menuItems.includes(id);
     const hasTop = ["calendar", "settings", "taskmgr", "restart", "clearicons"].some(on);
     if (!hasTop && !on("quit")) return null;
     return (
       <div
-        className="menu-item has-submenu"
-        onMouseEnter={() => setActiveSubmenu('nectar')}
-        onMouseLeave={() => setActiveSubmenu(null)}
+        className={`menu-item has-submenu${activeSubmenu === 'nectar' ? ' submenu-open' : ''}`}
+        onMouseEnter={() => openSubmenu('nectar')}
+        onMouseLeave={() => scheduleSubmenuClose('nectar')}
+        onClick={(e) => {
+          e.stopPropagation();
+          cancelSubmenuClose();
+          setActiveSubmenu((prev) => (prev === 'nectar' ? null : 'nectar'));
+        }}
       >
-        {t("dockmenu.options")}
+        <span className="menu-item-icon"><Sliders size={14} /></span>
+        <span className="menu-item-label">{t("dockmenu.options")}</span>
         <span className="submenu-arrow">▶</span>
-        <div className="submenu">
-          {on("calendar") && <div className="menu-item" onClick={() => { invoke('open_calendar_window'); closeMenu(); }}>{t("dockmenu.openCalendar")}</div>}
-          {on("settings") && <div className="menu-item" onClick={() => { invoke('open_settings_window'); closeMenu(); }}>{t("dockmenu.openSettings")}</div>}
-          {on("taskmgr") && <div className="menu-item" onClick={() => { invoke('open_app', { appName: 'taskmgr' }); closeMenu(); }}>{t("dockmenu.taskManager")}</div>}
-          {on("restart") && <div className="menu-item" onClick={() => invoke('restart_nectar')}>{t("general.restart")}</div>}
-          {on("clearicons") && <div className="menu-item" onClick={() => { handleClearIconCache(); closeMenu(); }}>{t("dockmenu.clearIconCache")}</div>}
-          {hasTop && on("quit") && <div className="menu-divider" />}
-          {on("quit") && <div className="menu-item quit" onClick={() => invoke('quit_nectar')}>{t("general.quit")}</div>}
+        <div
+          ref={activeSubmenu === 'nectar' ? activeSubmenuRef : undefined}
+          className={`submenu nectar-menu-pop${openLeft ? ' submenu-left' : ''}`}
+          onMouseEnter={() => openSubmenu('nectar')}
+          onMouseLeave={() => scheduleSubmenuClose('nectar')}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="submenu-scroll nectar-scroll">
+            {on("calendar") && <div className="menu-item" onClick={() => { bridgeInvoke('open_calendar_window'); closeMenu(); }}><span className="menu-item-label">{t("dockmenu.openCalendar")}</span></div>}
+            {on("settings") && <div className="menu-item" onClick={() => { bridgeInvoke('open_settings_window'); closeMenu(); }}><span className="menu-item-label">{t("dockmenu.openSettings")}</span></div>}
+            {on("taskmgr") && <div className="menu-item" onClick={() => { bridgeInvoke('open_app', { appName: 'taskmgr' }); closeMenu(); }}><span className="menu-item-label">{t("dockmenu.taskManager")}</span></div>}
+            {on("restart") && <div className="menu-item" onClick={() => bridgeInvoke('restart_nectar')}><span className="menu-item-label">{t("general.restart")}</span></div>}
+            {on("clearicons") && <div className="menu-item" onClick={() => { handleClearIconCache(); closeMenu(); }}><span className="menu-item-label">{t("dockmenu.clearIconCache")}</span></div>}
+            {hasTop && on("quit") && <div className="menu-divider" />}
+            {on("quit") && <div className="menu-item quit" onClick={() => bridgeInvoke('quit_nectar')}><span className="menu-item-label">{t("general.quit")}</span></div>}
+          </div>
         </div>
       </div>
     );
@@ -1279,25 +2516,48 @@ const Dock = memo(function Dock() {
   // Which launcher the search icon couldn't open (it fell back to Windows Search), shown for a few seconds
   const [searchNote, setSearchNote] = useState<string | null>(null);
   useEffect(() => {
+    let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const unlisten = getCurrentWebviewWindow().listen<string>("dock-search-note", (event) => {
+    let stop: (() => void) | undefined;
+    getCurrentWebviewWindow().listen<string>("dock-search-note", (event) => {
+      if (cancelled) return;
       setSearchNote(event.payload);
       clearTimeout(timer);
-      timer = setTimeout(() => setSearchNote(null), 4500);
-    });
+      timer = setTimeout(() => {
+        if (!cancelled) setSearchNote(null);
+      }, 4500);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else stop = fn;
+    }).catch(() => {});
     return () => {
+      cancelled = true;
       clearTimeout(timer);
-      unlisten.then(f => f());
+      stop?.();
     };
   }, []);
 
   useEffect(() => {
     // Backend claims Win+1-9 while the taskbar is hidden and tells us the slot, same as clicking that icon.
-    const unlisten = getCurrentWebviewWindow().listen<number>("dock-win-number", (event) => {
+    let cancelled = false;
+    let stop: (() => void) | undefined;
+    getCurrentWebviewWindow().listen<number>("dock-win-number", (event) => {
+      if (cancelled) return;
       const app = pinnedItemsRef.current[event.payload];
-      if (app) handleAppClickRef.current(app);
-    });
-    return () => { unlisten.then(f => f()); };
+      if (app) {
+        const key = itemKey(app);
+        const wrapper = dockRef.current?.querySelector(`[data-app-key="${CSS.escape(key)}"]`);
+        triggerLaunchBounce(wrapper ?? null);
+        handleAppClickRef.current(app);
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else stop = fn;
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
   }, []);
 
   const combinableItems = useMemo(() => dockItems.filter(i => i.path !== 'start'), [dockItems]);
@@ -1389,6 +2649,11 @@ const Dock = memo(function Dock() {
     isPreviewHoveredRef.current = false;
     hoveredAppRef.current = hoveredApp;
 
+    if (!dockPreviewEnabled) {
+      setPreviewData(null);
+      return;
+    }
+
     if (!hoveredApp) {
       const timer = setTimeout(() => setPreviewData(null), 100);
       return () => clearTimeout(timer);
@@ -1397,13 +2662,18 @@ const Dock = memo(function Dock() {
     if (hoveredApp && !isDragging && !contextMenu) {
       const app = dockItemsRef.current.find(a => itemKey(a) === hoveredApp);
       if (app && app.is_running) {
-        const hwndsToCapture = app.all_hwnds || (app.hwnd ? [[app.hwnd, app.name]] : []);
+        const rawHwnds: [number, string][] = app.all_hwnds && app.all_hwnds.length > 0
+          ? app.all_hwnds
+          : (app.hwnd ? [[app.hwnd, app.name]] : []);
+        const hwndsToCapture = rawHwnds.slice(0, MAX_PREVIEW_WINDOWS);
+        const extraCount = Math.max(0, rawHwnds.length - hwndsToCapture.length);
         const pixelScale = (window.devicePixelRatio || 1) * (scale || 1);
 
         previewTimerRef.current = setTimeout(async () => {
           try {
             const results = await Promise.all(
-              hwndsToCapture.map(async ([hwnd, title]) => {
+              hwndsToCapture.map(async ([hwnd, rawTitle]) => {
+                const title = rawTitle?.trim() || app.name;
                 for (let attempt = 0; attempt < 3; attempt++) {
                   if (attempt > 0) {
                     await new Promise((r) => setTimeout(r, 120));
@@ -1425,6 +2695,12 @@ const Dock = memo(function Dock() {
               .filter((r): r is { hwnd: number, title: string, image: string, lastFocused: number } => r !== null)
               .map(({ hwnd, title, image }) => ({ hwnd, title, image }));
             const order = previewOrderRef.current;
+            if (order.size > 200) {
+              const activeSet = new Set(captured.map(c => c.hwnd));
+              for (const k of order.keys()) {
+                if (!activeSet.has(k)) order.delete(k);
+              }
+            }
             for (const c of [...captured].sort((a, b) => a.hwnd - b.hwnd)) {
               if (!order.has(c.hwnd)) order.set(c.hwnd, order.size);
             }
@@ -1433,7 +2709,7 @@ const Dock = memo(function Dock() {
 
             const currentHovered = hoveredAppRef.current;
             if (sized.length > 0 && currentHovered === itemKey(app)) {
-              setPreviewData({ id: itemKey(app), previews: sized });
+              setPreviewData({ id: itemKey(app), previews: sized, extraCount });
               tourDockAction();
             } else if (currentHovered === itemKey(app)) {
               setPreviewData(null);
@@ -1451,20 +2727,55 @@ const Dock = memo(function Dock() {
     return () => {
       if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
     };
-  }, [hoveredApp, isDragging, hoveredPreviewSig, contextMenu, previewDelay]);
+  }, [hoveredApp, isDragging, hoveredPreviewSig, contextMenu, previewDelay, dockPreviewEnabled, scale]);
+
+  // Sync updated Explorer/window titles into open preview cards without tearing down DWM thumbnails.
+  useEffect(() => {
+    const current = previewDataRef.current;
+    if (!current) return;
+    const app = dockItems.find((a) => itemKey(a) === current.id);
+    if (!app?.all_hwnds?.length) return;
+    const titleMap = new Map<number, string>(app.all_hwnds);
+    let changed = false;
+    const nextPreviews = current.previews.map((p) => {
+      const nextTitle = titleMap.get(p.hwnd)?.trim() || app.name;
+      if (nextTitle !== p.title) {
+        changed = true;
+        return { ...p, title: nextTitle };
+      }
+      return p;
+    });
+    const nextExtra = current.previews.length >= MAX_PREVIEW_WINDOWS
+      ? Math.max(0, app.all_hwnds.length - MAX_PREVIEW_WINDOWS)
+      : current.extraCount;
+    if (changed || nextExtra !== current.extraCount) {
+      setPreviewData({ ...current, previews: nextPreviews, extraCount: nextExtra });
+    }
+  }, [dockItems]);
 
   const dockItemsRef = useRef(dockItems);
   dockItemsRef.current = dockItems;
 
   useEffect(() => {
+    let cancelled = false;
     let key: string | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const unlisteners: Array<() => void> = [];
+    const registerListen = (promise: Promise<() => void>) => {
+      promise
+        .then((fn) => {
+          if (cancelled) fn();
+          else unlisteners.push(fn);
+        })
+        .catch(() => {});
+    };
     const clear = () => {
       key = null;
       if (timer) clearTimeout(timer);
       timer = undefined;
     };
     const over = (x: number, y: number) => {
+      if (cancelled) return;
       const ratio = window.devicePixelRatio || 1;
       const el = document.elementFromPoint(x / ratio, y / ratio)?.closest('[data-app-key]');
       const next = el?.getAttribute('data-app-key') ?? null;
@@ -1474,24 +2785,24 @@ const Dock = memo(function Dock() {
       key = next;
       tourDockAction();
       timer = setTimeout(() => {
+        if (cancelled) return;
         const app = dockItemsRef.current.find((a) => itemKey(a) === next);
         const hwnd = app?.hwnd ?? app?.all_hwnds?.[0]?.[0];
         if (app?.is_running && hwnd) invoke('bring_window_forward', { hwnd }).catch(() => {});
       }, 650);
     };
-    const unlistenDrop = getCurrentWebviewWindow().onDragDropEvent((event) => {
+    registerListen(getCurrentWebviewWindow().onDragDropEvent((event) => {
       const payload = event.payload;
       if (payload.type === 'over') over(payload.position.x, payload.position.y);
       else clear();
-    });
-    const unlistenOver = listen<{ x: number; y: number }>('dock-file-drag', (event) => over(event.payload.x, event.payload.y));
-    const unlistenEnd = listen('dock-file-drag-end', clear);
+    }));
+    registerListen(listen<{ x: number; y: number }>('dock-file-drag', (event) => over(event.payload.x, event.payload.y)));
+    registerListen(listen('dock-file-drag-end', clear));
     invoke('setup_shelf_drop').catch(() => {});
     return () => {
+      cancelled = true;
       clear();
-      unlistenDrop.then((f) => f());
-      unlistenOver.then((f) => f());
-      unlistenEnd.then((f) => f());
+      for (const fn of unlisteners) fn();
     };
   }, []);
 
@@ -1501,10 +2812,19 @@ const Dock = memo(function Dock() {
       setMediaSessions([]);
       return;
     }
-    const refresh = () => invoke<AppMediaSession[]>('get_app_media_sessions').then(setMediaSessions).catch(() => {});
+    let cancelled = false;
+    const refresh = () =>
+      invoke<AppMediaSession[]>('get_app_media_sessions')
+        .then((sessions) => { if (!cancelled) setMediaSessions(sessions); })
+        .catch(() => {});
     refresh();
-    const timer = setVisibleInterval(refresh, 2000);
-    return () => clearInterval(timer);
+    const timer = setVisibleInterval(() => {
+      if (!shouldPausePollsRef.current) refresh();
+    }, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
   }, [previewAppId]);
 
   const controlMedia = (e: React.MouseEvent, session: AppMediaSession, action: 'previous' | 'play_pause' | 'next') => {
@@ -1537,74 +2857,255 @@ const Dock = memo(function Dock() {
     );
   };
 
-  const renderShortcut = (id: string, label: string, delay: number, onClick: (rect: DOMRect, e: React.MouseEvent) => void, icon: React.ReactNode) => (
-    <motion.div
-      key={id}
-      initial={{ opacity: 0, scale: 0 }}
-      animate={{ opacity: 1, scale: 1 }}
-      transition={{ opacity: { duration: 0.15, delay }, scale: { type: "spring", stiffness: 400, damping: 25, delay } }}
-      className="dock-icon-wrapper"
-      onMouseEnter={() => setHoveredApp(id)}
-      onMouseLeave={() => { setHoveredApp(null); setPressedApp(null); }}
-    >
-      {(!dockPreviewEnabled || hoveredApp === id) && <div className="tooltip">{label}</div>}
+  const renderShortcut = (
+    id: string,
+    label: string,
+    delay: number,
+    onClick: (rect: DOMRect, e: React.MouseEvent) => void,
+    icon: React.ReactNode,
+    shortcutMenu?: DockShortcutMenu
+  ) => {
+    const tintExcluded = isAppTintExcluded(id, excludedTintApps);
+    return (
       <motion.div
-        className="dock-icon"
-        variants={ICON_VARIANTS}
-        animate={pressedApp === id ? "tap" : (hoveredApp === id ? "hover" : "idle")}
-        onPointerDown={() => setPressedApp(id)}
-        onPointerUp={() => setPressedApp(null)}
-        onPointerCancel={() => setPressedApp(null)}
-        onClick={(e) => { e.stopPropagation(); onClick(e.currentTarget.getBoundingClientRect(), e); }}
+        key={id}
+        initial={{ opacity: 0, scale: 0 }}
+        animate={{ opacity: 1, scale: 1 }}
+        transition={{ opacity: { duration: 0.15, delay }, scale: { type: "spring", stiffness: 400, damping: 25, delay } }}
+        className="dock-icon-wrapper dock-wave-item"
+        onContextMenu={shortcutMenu ? (e) => handleContextMenu(e, null, shortcutMenu) : undefined}
+        onMouseEnter={() => setHoveredApp(id)}
+        onMouseLeave={() => { setHoveredApp(null); setPressedApp(null); }}
       >
-        {icon}
+        {(!dockPreviewEnabled || hoveredApp === id) && <div className="tooltip">{label}</div>}
+        <div className="dock-wave-target">
+          <div
+            className="dock-launch-slot"
+            onAnimationEnd={(e) => e.currentTarget.classList.remove('is-launching')}
+          >
+            <motion.div
+              className={`dock-icon${!dockIconOnly ? " nectar-tint-tile" : ""}`}
+              data-tint-excluded={tintExcluded ? "true" : undefined}
+              variants={iconVariants}
+              animate={pressedApp === id ? "tap" : (hoveredApp === id ? "hover" : "idle")}
+              onPointerDown={() => setPressedApp(id)}
+              onPointerUp={() => setPressedApp(null)}
+              onPointerCancel={() => setPressedApp(null)}
+              onClick={(e) => {
+                e.stopPropagation();
+                triggerLaunchBounce(e.currentTarget.closest('.dock-launch-slot'));
+                onClick(e.currentTarget.getBoundingClientRect(), e);
+              }}
+            >
+              {icon}
+            </motion.div>
+          </div>
+        </div>
       </motion.div>
-    </motion.div>
-  );
+    );
+  };
+
+  const renderDockAppItem = (app: AppInfo, listKind: "pinned" | "unpinned" | "mixed") => {
+    const key = itemKey(app);
+    const tintExcluded = isAppTintExcluded(app.path || app.name, excludedTintApps);
+    const isHost = isBrowserHost(app.path);
+    const cacheKey = isHost ? `${app.path}:${app.name.toLowerCase()}` : (app.hwnd ? `${app.path}-${app.hwnd}` : app.path);
+    // Running host items skip the shared path fallback, or the browser's icon leaks onto its PWAs.
+    const allowPathFallback = !isHost || !app.is_running;
+    const icon =
+      customIcons[cacheKey] ||
+      (allowPathFallback && customIcons[app.path]) ||
+      iconsRef.current[cacheKey] ||
+      (allowPathFallback && iconsRef.current[app.path]) ||
+      app.icon;
+    const isNectarOrSettings = isNectarWindow(app);
+
+    const animateState =
+      pressedApp === key
+        ? "tap"
+        : listKind === "pinned" && isDragging && !app.is_pinned
+          ? "idle"
+          : listKind === "unpinned" && isDragging && app.is_pinned
+            ? "idle"
+            : hoveredApp === key && !isDragging
+              ? "hover"
+              : "idle";
+
+    return (
+      <Reorder.Item
+        as="div"
+        key={key}
+        value={key}
+        style={{ position: 'relative' }}
+        onDragStart={() => {
+          resetWave();
+          setIsDragging(true);
+          setHoveredApp(null);
+          setPressedApp(null);
+        }}
+        onDragEnd={() => {
+          if (listKind === "pinned") handleDragEnd();
+          else if (listKind === "unpinned") handleUnpinnedDragEnd();
+          else handleMixedDragEnd(app);
+        }}
+        onContextMenu={(e) => handleContextMenu(e, app)}
+        onMouseDown={(e) => { if (e.button === 1) e.preventDefault(); }}
+        onAuxClick={(e) => handleMiddleClick(e, app)}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (!isDragging) {
+            triggerLaunchBounce(e.currentTarget);
+            if (e.ctrlKey && e.shiftKey && app.path !== 'start') {
+              handleRunAsAdmin(app);
+            } else if (e.shiftKey && app.path !== 'start') {
+              handleNewInstance(app);
+            } else {
+              handleAppClick(app);
+            }
+          }
+        }}
+      >
+        <motion.div
+          className="dock-icon-wrapper dock-wave-item"
+          data-app-key={key}
+          initial={ITEM_INITIAL}
+          animate={ITEM_ANIMATE}
+          exit={listKind === "unpinned" ? { opacity: 0, scale: 0, transition: { duration: 0.12 } } : ITEM_EXIT}
+          transition={ITEM_ENTRY_TRANSITION}
+          onMouseEnter={() => setHoveredApp(key)}
+          onMouseLeave={() => { if (!isPreviewHoveredRef.current) { setHoveredApp(null); setPressedApp(null); } }}
+        >
+          <AnimatePresence>
+            {dockPreviewEnabled && previewData && previewData.id === key && hoveredApp === key && (
+              <DockPreviewTooltip
+                app={app}
+                previews={previewData.previews}
+                extraCount={previewData.extraCount}
+                onClosePreview={handleClosePreview}
+                onPinError={(msg) => showDockToast(msg, 4000)}
+                renderMedia={renderPreviewMedia}
+                zoom={scale}
+                onMouseEnter={() => { isPreviewHoveredRef.current = true; }}
+                onMouseLeave={() => { isPreviewHoveredRef.current = false; setHoveredApp(null); setPressedApp(null); }}
+              />
+            )}
+          </AnimatePresence>
+
+          {/* Fallback to text tooltip if previews are disabled, app isn't running, or preview failed to load */}
+          {(!dockPreviewEnabled || (dockPreviewEnabled && hoveredApp === key && !previewData)) && (
+            <div className="tooltip">{displayName(app)}</div>
+          )}
+
+          <div className="dock-wave-target">
+            <div
+              className="dock-launch-slot"
+              onAnimationEnd={(e) => e.currentTarget.classList.remove('is-launching')}
+            >
+              <motion.div
+                className={`dock-icon${!dockIconOnly ? " nectar-tint-tile" : ""}`}
+                data-tint-excluded={tintExcluded ? "true" : undefined}
+                variants={iconVariants}
+                animate={animateState}
+                whileDrag="drag"
+                onPointerDown={() => setPressedApp(key)}
+                onPointerUp={() => setPressedApp(null)}
+                onPointerCancel={() => setPressedApp(null)}
+              >
+                {(icon || isNectarOrSettings) ? (
+                  <DockAppIcon
+                    src={isNectarOrSettings ? "/nectar.png" : (icon ?? undefined)}
+                    alt={app.name}
+                    nectar={isNectarOrSettings}
+                    tintExcluded={tintExcluded}
+                  />
+                ) : (
+                  <div className="fallback-icon">{app.name[0]}</div>
+                )}
+                {attentionBadge(app)}
+              </motion.div>
+            </div>
+          </div>
+          {app.is_running && <WindowDots count={app.all_hwnds?.length ?? 1} mode={windowIndicator} />}
+        </motion.div>
+      </Reorder.Item>
+    );
+  };
+
+  const dockHideOffsetY = Math.max(120, Math.ceil((dockIconSize + 56) * scale));
+  const dockTopRadius = scaledRadius(isImpacted || isExpanded ? 18 : 17, 6, 36);
+  const dockBottomRadius = isImpacted || isExpanded ? 0 : scaledRadius(17, 6, 36);
 
   return (
-    <div className={`dock-container ${isDragging ? 'dragging' : ''}`} onClick={closeMenu}>
+    <div
+      className={`dock-container ${isDragging ? 'dragging' : ''}`}
+      style={{
+        '--dock-icon-size': `${dockIconSize}px`,
+        '--dock-icon-gap': `${dockIconGap}px`,
+      } as React.CSSProperties}
+      onClick={closeMenu}
+    >
       <div style={{ width: '100%', height: '100%', display: 'flex', justifyContent: 'center', alignItems: 'flex-end' }}>
         <motion.div
+          className="dock-motion-shell"
+          initial={{ y: -800, scale }}
+          animate={{
+            y: !isReady ? -800 : (isHidden ? dockHideOffsetY : 0),
+            scale,
+          }}
+          transition={{
+            y: dockSlideSpring,
+            scale: { duration: 0 },
+          }}
+          style={{ originX: 0.5, originY: 1, display: 'flex', justifyContent: 'center', alignItems: 'flex-end' }}
+          onAnimationComplete={() => {
+            if (isDockRevealingRef.current) {
+              isDockRevealingRef.current = false;
+              setIsDockRevealing(false);
+            }
+            updateDockRectRef.current();
+          }}
+        >
+        <motion.div
           ref={dockRef}
-          layout={!startupAnimating}
-          className={`dock ${isExpanded && !isHidden ? 'dock-expanded' : ''} ${isImpacted && !isExpanded && !isHidden ? 'dock-impacted' : ''} ${dockIconOnly ? 'dock-icon-only' : ''} ${isAdaptive ? 'dock-adaptive' : ''}`}
+          layout={!startupAnimating && isExpanded}
+          className={`dock ${isExpanded ? 'dock-expanded' : ''} ${isImpacted && !isExpanded ? 'dock-impacted' : ''} ${isHidden ? 'dock-hidden' : ''} ${dockIconOnly ? 'dock-icon-only' : ''} ${isAdaptive ? 'dock-adaptive' : ''}`}
           onMouseEnter={() => setIsDockHovered(true)}
-          onMouseLeave={() => { setIsDockHovered(false); setHoveredApp(null); setPressedApp(null); }}
-        initial={{ y: -800, opacity: 1, width: 34, height: 34, borderTopLeftRadius: 17, borderTopRightRadius: 17, borderBottomLeftRadius: 17, borderBottomRightRadius: 17 }}
+          onMouseMove={handleDockMouseMove}
+          onMouseLeave={() => { resetWave(); setIsDockHovered(false); setHoveredApp(null); setPressedApp(null); }}
+        initial={{ opacity: 1, width: 34, height: 34, borderTopLeftRadius: 17, borderTopRightRadius: 17, borderBottomLeftRadius: 17, borderBottomRightRadius: 17 }}
         animate={{
-          y: !isReady ? -800 : (isHidden ? 100 : 0),
-          width: isExpanded && !isHidden ? (isAdaptive ? adaptiveWidth : 'auto') : 34,
-          height: isExpanded && !isHidden ? 'auto' : 34,
-          borderTopLeftRadius: (isImpacted || isExpanded) && !isHidden ? 18 : 17,
-          borderTopRightRadius: (isImpacted || isExpanded) && !isHidden ? 18 : 17,
-          borderBottomLeftRadius: (isImpacted || isExpanded) && !isHidden ? 0 : 17,
-          borderBottomRightRadius: (isImpacted || isExpanded) && !isHidden ? 0 : 17,
+          width: isExpanded ? (isAdaptive ? adaptiveWidth : 'auto') : 34,
+          height: isExpanded ? 'auto' : 34,
+          borderTopLeftRadius: dockTopRadius,
+          borderTopRightRadius: dockTopRadius,
+          borderBottomLeftRadius: dockBottomRadius,
+          borderBottomRightRadius: dockBottomRadius,
           opacity: 1,
-          scale: scale,
         }}
         transition={{
-          y: { type: "spring", stiffness: 400, damping: 35, mass: 0.8 },
-          // Critically damped so the dock grows and settles without wobbling
-          width: DOCK_SPRING,
-          height: DOCK_SPRING,
-          layout: isDragging ? { duration: 0 } : { type: "spring", stiffness: 300, damping: 35 },
-          borderTopLeftRadius: DOCK_SPRING,
-          borderTopRightRadius: DOCK_SPRING,
-          borderBottomLeftRadius: DOCK_SPRING,
-          borderBottomRightRadius: DOCK_SPRING,
+          width: dockSpring,
+          height: dockSpring,
+          layout: isDragging ? { duration: 0 } : dockLayoutSpring,
+          borderTopLeftRadius: dockCornerSpring,
+          borderTopRightRadius: dockCornerSpring,
+          borderBottomLeftRadius: dockCornerSpring,
+          borderBottomRightRadius: dockCornerSpring,
           opacity: { type: "tween", duration: 0.2 },
-          scale: { duration: 0 },
         }}
         style={{ originX: 0.5, originY: 1, minWidth: 34 }}
         onContextMenu={(e) => handleContextMenu(e, null)}
+        onAnimationComplete={() => {
+          updateDockRectRef.current();
+        }}
       >
         <SurfaceShape
           edge="bottom"
-          flare={isExpanded && !isHidden ? 13 : 0}
+          flare={isExpanded ? 13 : 0}
+          radius={isImpacted || isExpanded ? 18 : 17}
+          edgeRadius={isImpacted || isExpanded ? 0 : 17}
+          minRadius={6}
+          maxRadius={36}
           settling={startupAnimating}
-          radius={(isImpacted || isExpanded) && !isHidden ? 18 : 17}
-          edgeRadius={(isImpacted || isExpanded) && !isHidden ? 0 : 17}
         />
         <AnimatePresence>
           {isExpanded && (
@@ -1616,42 +3117,68 @@ const Dock = memo(function Dock() {
               transition={{ duration: 0.15, delay: startupAnimating ? 0.3 : 0 }}
               className="dock-reorder-container"
             >
-              {startItem && (
-                <motion.div
-                  initial={{ opacity: 0, scale: 0 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  transition={{ opacity: { duration: 0.15, delay: 0.15 }, scale: { type: "spring", stiffness: 400, damping: 25, delay: 0.15 } }}
-                  className="dock-icon-wrapper"
-                  onContextMenu={(e) => handleContextMenu(e, startItem)}
-                  onMouseEnter={() => setHoveredApp(itemKey(startItem))}
-                  onMouseLeave={() => { setHoveredApp(null); setPressedApp(null); }}
-                >
-                  {(!dockPreviewEnabled || (dockPreviewEnabled && hoveredApp === itemKey(startItem))) && (
-                    <div className="tooltip">{t("dockmenu.start")}</div>
-                  )}
-                  <motion.div 
-                    className="dock-icon"
-                    variants={ICON_VARIANTS}
-                    animate={pressedApp === itemKey(startItem) ? "tap" : (hoveredApp === itemKey(startItem) ? "hover" : "idle")}
-                    onPointerDown={() => setPressedApp(itemKey(startItem))}
-                    onPointerUp={() => setPressedApp(null)}
-                    onPointerCancel={() => setPressedApp(null)}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleAppClick(startItem);
-                    }}
+              {startItem && (() => {
+                const startKey = itemKey(startItem);
+                const startTintExcluded = isAppTintExcluded(startItem.path || startItem.name, excludedTintApps);
+                return (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    transition={{ opacity: { duration: 0.15, delay: 0.15 }, scale: { type: "spring", stiffness: 400, damping: 25, delay: 0.15 } }}
+                    className="dock-icon-wrapper dock-wave-item"
+                    onContextMenu={(e) => handleContextMenu(e, startItem)}
+                    onMouseEnter={() => setHoveredApp(startKey)}
+                    onMouseLeave={() => { setHoveredApp(null); setPressedApp(null); }}
                   >
-                    <img src={resolveStartIcon(startIcon)} alt="Start" className={startIcon === "default" ? "nectar-icon-img" : "nectar-icon-img start-img"} style={startIcon.startsWith("custom:") ? { borderRadius: "8px" } : undefined} draggable={false} />
+                    {(!dockPreviewEnabled || (dockPreviewEnabled && hoveredApp === startKey)) && (
+                      <div className="tooltip">{t("dockmenu.start")}</div>
+                    )}
+                    <div className="dock-wave-target">
+                      <div
+                        className="dock-launch-slot"
+                        onAnimationEnd={(e) => e.currentTarget.classList.remove('is-launching')}
+                      >
+                        <motion.div
+                          className={`dock-icon${!dockIconOnly ? " nectar-tint-tile" : ""}`}
+                          data-tint-excluded={startTintExcluded ? "true" : undefined}
+                          variants={iconVariants}
+                          animate={pressedApp === startKey ? "tap" : (hoveredApp === startKey ? "hover" : "idle")}
+                          onPointerDown={() => setPressedApp(startKey)}
+                          onPointerUp={() => setPressedApp(null)}
+                          onPointerCancel={() => setPressedApp(null)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            triggerLaunchBounce(e.currentTarget.closest('.dock-launch-slot'));
+                            handleAppClick(startItem);
+                          }}
+                        >
+                          <img
+                            src={resolveStartIcon(startIcon)}
+                            alt="Start"
+                            className={[
+                              startIcon === "default" ? "nectar-icon-img" : "nectar-icon-img start-img",
+                              !startTintExcluded ? "nectar-tintable-icon" : "",
+                            ].filter(Boolean).join(" ")}
+                            data-tint-excluded={startTintExcluded ? "true" : undefined}
+                            style={startIcon.startsWith("custom:") ? { borderRadius: "8px" } : undefined}
+                            draggable={false}
+                          />
+                        </motion.div>
+                      </div>
+                    </div>
                   </motion.div>
-                </motion.div>
-              )}
+                );
+              })()}
               
-              {dockSearchEnabled && (
+              {dockSearchEnabled && (() => {
+                const searchTintExcluded = isAppTintExcluded('search', excludedTintApps);
+                return (
                 <motion.div
                   initial={{ opacity: 0, scale: 0 }}
                   animate={{ opacity: 1, scale: 1 }}
                   transition={{ opacity: { duration: 0.15, delay: 0.18 }, scale: { type: "spring", stiffness: 400, damping: 25, delay: 0.18 } }}
-                  className="dock-icon-wrapper"
+                  className="dock-icon-wrapper dock-wave-item"
+                  onContextMenu={(e) => handleContextMenu(e, null, { kind: 'search' })}
                   onMouseEnter={() => setHoveredApp('search')}
                   onMouseLeave={() => { setHoveredApp(null); setPressedApp(null); }}
                 >
@@ -1660,51 +3187,74 @@ const Dock = memo(function Dock() {
                   ) : (!dockPreviewEnabled || (dockPreviewEnabled && hoveredApp === 'search')) && (
                     <div className="tooltip">{t("dockmenu.search")}</div>
                   )}
-                  <motion.div
-                    className="dock-icon"
-                    variants={ICON_VARIANTS}
-                    animate={pressedApp === 'search' ? "tap" : (hoveredApp === 'search' ? "hover" : "idle")}
-                    onPointerDown={() => setPressedApp('search')}
-                    onPointerUp={() => setPressedApp(null)}
-                    onPointerCancel={() => setPressedApp(null)}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      invoke('open_app', { appName: 'search' }).catch((err) => console.error('Failed to open search:', err));
-                    }}
-                  >
-                    <SearchIcon />
-                  </motion.div>
+                  <div className="dock-wave-target">
+                    <div
+                      className="dock-launch-slot"
+                      onAnimationEnd={(e) => e.currentTarget.classList.remove('is-launching')}
+                    >
+                      <motion.div
+                        className={`dock-icon${!dockIconOnly ? " nectar-tint-tile" : ""}`}
+                        data-tint-excluded={searchTintExcluded ? "true" : undefined}
+                        variants={iconVariants}
+                        animate={pressedApp === 'search' ? "tap" : (hoveredApp === 'search' ? "hover" : "idle")}
+                        onPointerDown={() => setPressedApp('search')}
+                        onPointerUp={() => setPressedApp(null)}
+                        onPointerCancel={() => setPressedApp(null)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          triggerLaunchBounce(e.currentTarget.closest('.dock-launch-slot'));
+                          invoke('open_app', { appName: 'search' }).catch((err) => console.error('Failed to open search:', err));
+                        }}
+                      >
+                        <SearchIcon />
+                      </motion.div>
+                    </div>
+                  </div>
                 </motion.div>
-              )}
+                );
+              })()}
 
-              {dockCalendarEnabled && (
+              {dockCalendarEnabled && (() => {
+                const calTintExcluded = isAppTintExcluded('calendar', excludedTintApps);
+                return (
                 <motion.div
                   initial={{ opacity: 0, scale: 0 }}
                   animate={{ opacity: 1, scale: 1 }}
                   transition={{ opacity: { duration: 0.15, delay: 0.2 }, scale: { type: "spring", stiffness: 400, damping: 25, delay: 0.2 } }}
-                  className="dock-icon-wrapper"
+                  className="dock-icon-wrapper dock-wave-item"
+                  onContextMenu={(e) => handleContextMenu(e, null, { kind: 'calendar' })}
                   onMouseEnter={() => setHoveredApp('calendar')}
                   onMouseLeave={() => { setHoveredApp(null); setPressedApp(null); }}
                 >
                   {(!dockPreviewEnabled || (dockPreviewEnabled && hoveredApp === 'calendar')) && (
                     <div className="tooltip">{t("dockmenu.calendar")}</div>
                   )}
-                  <motion.div
-                    className="dock-icon"
-                    variants={ICON_VARIANTS}
-                    animate={pressedApp === 'calendar' ? "tap" : (hoveredApp === 'calendar' ? "hover" : "idle")}
-                    onPointerDown={() => setPressedApp('calendar')}
-                    onPointerUp={() => setPressedApp(null)}
-                    onPointerCancel={() => setPressedApp(null)}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      invoke('open_calendar_window').catch((err) => console.error('Failed to open calendar:', err));
-                    }}
-                  >
-                    <CalendarIcon />
-                  </motion.div>
+                  <div className="dock-wave-target">
+                    <div
+                      className="dock-launch-slot"
+                      onAnimationEnd={(e) => e.currentTarget.classList.remove('is-launching')}
+                    >
+                      <motion.div
+                        className={`dock-icon${!dockIconOnly ? " nectar-tint-tile" : ""}`}
+                        data-tint-excluded={calTintExcluded ? "true" : undefined}
+                        variants={iconVariants}
+                        animate={pressedApp === 'calendar' ? "tap" : (hoveredApp === 'calendar' ? "hover" : "idle")}
+                        onPointerDown={() => setPressedApp('calendar')}
+                        onPointerUp={() => setPressedApp(null)}
+                        onPointerCancel={() => setPressedApp(null)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          triggerLaunchBounce(e.currentTarget.closest('.dock-launch-slot'));
+                          invoke('open_calendar_window').catch((err) => console.error('Failed to open calendar:', err));
+                        }}
+                      >
+                        <CalendarIcon />
+                      </motion.div>
+                    </div>
+                  </div>
                 </motion.div>
-              )}
+                );
+              })()}
 
               {!legacyMode && dockTray && renderShortcut(
                 'tray', t('dockmenu.hiddenIcons'), 0.21,
@@ -1712,8 +3262,101 @@ const Dock = memo(function Dock() {
                   dx: (rect.left + rect.width / 2 - e.clientX) * window.devicePixelRatio,
                   dy: (rect.top - e.clientY) * window.devicePixelRatio,
                 }).catch((err) => console.error('Failed to open tray:', err)),
-                <ChevronUpIcon />
+                <ChevronUpIcon />,
+                { kind: 'tray' }
               )}
+
+              {!legacyMode && dockTray && trayBarEnabled && pinnedTrayKeys.length > 0 && (() => {
+                const iconByKey = new Map(
+                  trayIcons.filter((ic) => !ic.hidden_by_app).map((ic) => [ic.key, ic])
+                );
+                const pinnedTrayIcons = syncPinnedOrder(pinnedTrayKeys, trayOrder)
+                  .map((k) => iconByKey.get(k))
+                  .filter((ic): ic is TrayIconDto => Boolean(ic));
+                if (pinnedTrayIcons.length === 0) return null;
+                return (
+                  <div className="dock-pinned-tray-pill" onClick={(e) => e.stopPropagation()}>
+                    {pinnedTrayIcons.map((item) => {
+                      const label = trayLabels[item.key] || item.title || item.exe_name || "?";
+                      const resolvedIcon = customIcons[trayCustomIconKey(item.key)] || item.icon;
+                      const trayExcluded = isAppTintExcluded(item.exe_name || item.title, excludedTintApps);
+                      return (
+                        <button
+                          key={item.key}
+                          type="button"
+                          aria-label={label}
+                          className="dock-icon-wrapper dock-pinned-tray-item"
+                          onMouseEnter={() => setHoveredApp(`tray:${item.key}`)}
+                          onMouseLeave={() => setHoveredApp(null)}
+                          onFocus={() => setHoveredApp(`tray:${item.key}`)}
+                          onBlur={() => setHoveredApp(null)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const coords = trayInteractionCoords(e, scale);
+                            if (e.detail > 1) {
+                              return;
+                            }
+                            if (e.detail === 0) {
+                              invoke('interact_tray_icon', { key: item.key, action: 'left', ...coords })
+                                .catch((err) => console.error('Failed tray left click:', err));
+                              return;
+                            }
+                            const prevTimer = trayClickTimersRef.current[item.key];
+                            if (prevTimer) window.clearTimeout(prevTimer);
+                            trayClickTimersRef.current[item.key] = window.setTimeout(() => {
+                              delete trayClickTimersRef.current[item.key];
+                              invoke('interact_tray_icon', { key: item.key, action: 'left', ...coords })
+                                .catch((err) => console.error('Failed tray left click:', err));
+                            }, 210);
+                          }}
+                          onDoubleClick={(e) => {
+                            e.stopPropagation();
+                            const prevTimer = trayClickTimersRef.current[item.key];
+                            if (prevTimer) {
+                              window.clearTimeout(prevTimer);
+                              delete trayClickTimersRef.current[item.key];
+                            }
+                            const coords = trayInteractionCoords(e, scale);
+                            invoke('interact_tray_icon', { key: item.key, action: 'double', ...coords })
+                              .catch((err) => console.error('Failed tray double click:', err));
+                          }}
+                          onContextMenu={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const { screenX, screenY, rect } = trayInteractionCoords(e, scale);
+                            invoke('interact_tray_icon', { key: item.key, action: 'right', screenX, screenY, rect })
+                              .catch((err) => console.error('Failed tray context click:', err));
+                          }}
+                          onMouseDown={(e) => { if (e.button === 1) e.preventDefault(); }}
+                          onAuxClick={(e) => {
+                            if (e.button === 1) {
+                              e.stopPropagation();
+                              const { screenX, screenY, rect } = trayInteractionCoords(e, scale);
+                              invoke('interact_tray_icon', { key: item.key, action: 'middle', screenX, screenY, rect })
+                                .catch((err) => console.error('Failed tray middle click:', err));
+                            }
+                          }}
+                        >
+                          {hoveredApp === `tray:${item.key}` && <div className="tooltip">{label}</div>}
+                          <div className="dock-pinned-tray-icon" data-tint-excluded={trayExcluded ? "true" : undefined}>
+                            {resolvedIcon ? (
+                              <img
+                                src={resolvedIcon}
+                                alt={label}
+                                className={trayExcluded ? undefined : "nectar-tintable-icon"}
+                                data-tint-excluded={trayExcluded ? "true" : undefined}
+                                draggable={false}
+                              />
+                            ) : (
+                              <span>{label.slice(0, 2)}</span>
+                            )}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
 
               {!legacyMode && dockTaskView && renderShortcut(
                 'taskview', t('dockmenu.taskView'), 0.22,
@@ -1724,13 +3367,15 @@ const Dock = memo(function Dock() {
               {!legacyMode && dockDrives.map((letter, i) => renderShortcut(
                 `drive-${letter}`, t('dock.drive', { letter }), 0.24 + i * 0.02,
                 () => invoke('open_dock_extra', { target: letter }).catch((err) => console.error('Failed to open drive:', err)),
-                <DriveIcon letter={letter} />
+                <DriveIcon letter={letter} />,
+                { kind: 'drive', letter }
               ))}
 
               {!legacyMode && dockRecycle && renderShortcut(
                 'recycle', t('dockmenu.recycleBin'), 0.26 + dockDrives.length * 0.02,
                 () => invoke('open_dock_extra', { target: 'recycle' }).catch((err) => console.error('Failed to open Recycle Bin:', err)),
-                <RecycleIcon />
+                <RecycleIcon />,
+                { kind: 'recycle' }
               )}
 
               {!dockMixedReorder ? (
@@ -1742,80 +3387,7 @@ const Dock = memo(function Dock() {
                 onReorder={handleReorder}
                 className="dock-reorder-group"
               >
-                {pinnedItems.map((app) => (
-                  <Reorder.Item
-                    as="div"
-                    key={itemKey(app)}
-                    value={itemKey(app)}
-                    style={{ position: 'relative' }}
-                    onDragStart={() => { setIsDragging(true); setHoveredApp(null); setPressedApp(null); }}
-                    onDragEnd={handleDragEnd}
-                    onContextMenu={(e) => handleContextMenu(e, app)}
-                    onMouseDown={(e) => { if (e.button === 1) e.preventDefault(); }}
-                    onAuxClick={(e) => handleMiddleClick(e, app)}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (!isDragging) handleAppClick(app);
-                    }}
-                  >
-                    <motion.div
-                      className="dock-icon-wrapper"
-                      data-app-key={itemKey(app)}
-                      initial={ITEM_INITIAL}
-                      animate={ITEM_ANIMATE}
-                      exit={ITEM_EXIT}
-                      transition={ITEM_ENTRY_TRANSITION}
-                      onMouseEnter={() => setHoveredApp(itemKey(app))}
-                      onMouseLeave={() => { if (!isPreviewHoveredRef.current) { setHoveredApp(null); setPressedApp(null); } }}
-                    >
-                <AnimatePresence>
-                  {dockPreviewEnabled && previewData && previewData.id === itemKey(app) && hoveredApp === itemKey(app) && (
-                    <DockPreviewTooltip
-                      app={app}
-                      previews={previewData.previews}
-                      onClosePreview={handleClosePreview}
-                      renderMedia={renderPreviewMedia}
-                      zoom={scale}
-                      onMouseEnter={() => { isPreviewHoveredRef.current = true; }}
-                      onMouseLeave={() => { isPreviewHoveredRef.current = false; setHoveredApp(null); setPressedApp(null); }}
-                    />
-                  )}
-                </AnimatePresence>
-                
-                {/* Fallback to text tooltip if previews are disabled, app isn't running, or preview failed to load */}
-                {(!dockPreviewEnabled || (dockPreviewEnabled && hoveredApp === itemKey(app) && !previewData)) && (
-                  <div className="tooltip">{displayName(app)}</div>
-                )}
-                <motion.div 
-                  className="dock-icon"
-                  variants={ICON_VARIANTS}
-                  animate={pressedApp === itemKey(app) ? "tap" : (isDragging && !app.is_pinned ? "idle" : (hoveredApp === itemKey(app) && !isDragging ? "hover" : "idle"))}
-                  whileDrag="drag"
-                  onPointerDown={() => setPressedApp(itemKey(app))}
-                  onPointerUp={() => setPressedApp(null)}
-                  onPointerCancel={() => setPressedApp(null)}
-                >
-                  {(() => {
-                    const isHost = isBrowserHost(app.path);
-                    const cacheKey = isHost ? `${app.path}:${app.name.toLowerCase()}` : (app.hwnd ? `${app.path}-${app.hwnd}` : app.path);
-                    // Running host items skip the shared path fallback, or the browser's icon leaks onto its PWAs.
-                    const allowPathFallback = !isHost || !app.is_running;
-                    const icon = customIcons[cacheKey] || (allowPathFallback && customIcons[app.path]) || iconsRef.current[cacheKey] || (allowPathFallback && iconsRef.current[app.path]) || app.icon;
-                    
-                    const isNectarOrSettings = isNectarWindow(app);
-                    
-                    return (icon || isNectarOrSettings) ? (
-                      <DockAppIcon src={isNectarOrSettings ? "/nectar.png" : (icon ?? undefined)} alt={app.name} nectar={isNectarOrSettings} />
-                    ) : (
-                      <div className="fallback-icon">{app.name[0]}</div>
-                    );
-                  })()}
-                  {attentionBadge(app)}
-                </motion.div>
-                  {app.is_running && <WindowDots count={app.all_hwnds?.length ?? 1} mode={windowIndicator} />}
-                    </motion.div>
-                  </Reorder.Item>
-                ))}
+                {pinnedItems.map((app) => renderDockAppItem(app, "pinned"))}
               </Reorder.Group>
 
               {pinnedItems.length > 0 && unpinnedItems.length > 0 && (
@@ -1829,76 +3401,7 @@ const Dock = memo(function Dock() {
                 onReorder={handleUnpinnedReorder}
                 className="dock-reorder-group"
               >
-                {unpinnedItems.map((app) => (
-                  <Reorder.Item
-                    as="div"
-                    key={itemKey(app)}
-                    value={itemKey(app)}
-                    style={{ position: 'relative' }}
-                    onDragStart={() => { setIsDragging(true); setHoveredApp(null); setPressedApp(null); }}
-                    onDragEnd={handleUnpinnedDragEnd}
-                    onContextMenu={(e) => handleContextMenu(e, app)}
-                    onMouseDown={(e) => { if (e.button === 1) e.preventDefault(); }}
-                    onAuxClick={(e) => handleMiddleClick(e, app)}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (!isDragging) handleAppClick(app);
-                    }}
-                  >
-                    <motion.div
-                      className="dock-icon-wrapper"
-                      data-app-key={itemKey(app)}
-                      initial={{ opacity: 0, scale: 0 }}
-                      animate={{ opacity: 1, scale: 1 }}
-                      exit={{ opacity: 0, scale: 0, transition: { duration: 0.12 } }}
-                      transition={ITEM_ENTRY_TRANSITION}
-                      onMouseEnter={() => setHoveredApp(itemKey(app))}
-                      onMouseLeave={() => { if (!isPreviewHoveredRef.current) { setHoveredApp(null); setPressedApp(null); } }}
-                    >
-                      <AnimatePresence>
-                        {dockPreviewEnabled && previewData && previewData.id === itemKey(app) && hoveredApp === itemKey(app) && (
-                          <DockPreviewTooltip
-                            app={app}
-                            previews={previewData.previews}
-                            onClosePreview={handleClosePreview}
-                            renderMedia={renderPreviewMedia}
-                            zoom={scale}
-                            onMouseEnter={() => { isPreviewHoveredRef.current = true; }}
-                            onMouseLeave={() => { isPreviewHoveredRef.current = false; setHoveredApp(null); setPressedApp(null); }}
-                          />
-                        )}
-                      </AnimatePresence>
-                      {(!dockPreviewEnabled || (dockPreviewEnabled && hoveredApp === itemKey(app) && !previewData)) && (
-                        <div className="tooltip">{displayName(app)}</div>
-                      )}
-                      <motion.div
-                        className="dock-icon"
-                        variants={ICON_VARIANTS}
-                        animate={pressedApp === itemKey(app) ? "tap" : (isDragging && app.is_pinned ? "idle" : (hoveredApp === itemKey(app) && !isDragging ? "hover" : "idle"))}
-                        whileDrag="drag"
-                        onPointerDown={() => setPressedApp(itemKey(app))}
-                        onPointerUp={() => setPressedApp(null)}
-                        onPointerCancel={() => setPressedApp(null)}
-                      >
-                        {(() => {
-                          const isHost = isBrowserHost(app.path);
-                          const cacheKey = isHost ? `${app.path}:${app.name.toLowerCase()}` : (app.hwnd ? `${app.path}-${app.hwnd}` : app.path);
-                        // Running host items skip the shared path fallback, or the browser's icon leaks onto its PWAs.
-                    const allowPathFallback = !isHost || !app.is_running;
-                    const icon = customIcons[cacheKey] || (allowPathFallback && customIcons[app.path]) || iconsRef.current[cacheKey] || (allowPathFallback && iconsRef.current[app.path]) || app.icon;
-                          const isNectarOrSettings = isNectarWindow(app);
-                          return (icon || isNectarOrSettings) ? (
-                            <DockAppIcon src={isNectarOrSettings ? "/nectar.png" : (icon ?? undefined)} alt={app.name} nectar={isNectarOrSettings} />
-                          ) : (
-                            <div className="fallback-icon">{app.name[0]}</div>
-                          );
-                        })()}
-                        {attentionBadge(app)}
-                      </motion.div>
-                      {app.is_running && <WindowDots count={app.all_hwnds?.length ?? 1} mode={windowIndicator} />}
-                    </motion.div>
-                  </Reorder.Item>
-                ))}
+                {unpinnedItems.map((app) => renderDockAppItem(app, "unpinned"))}
               </Reorder.Group>
               </>
               ) : (
@@ -1909,77 +3412,7 @@ const Dock = memo(function Dock() {
                 onReorder={handleMixedReorder}
                 className="dock-reorder-group"
               >
-                {mixedItems.map((app) => (
-                  <Reorder.Item
-                    as="div"
-                    key={itemKey(app)}
-                    value={itemKey(app)}
-                    style={{ position: 'relative' }}
-                    onDragStart={() => { setIsDragging(true); setHoveredApp(null); setPressedApp(null); }}
-                    onDragEnd={() => handleMixedDragEnd(app)}
-                    onContextMenu={(e) => handleContextMenu(e, app)}
-                    onMouseDown={(e) => { if (e.button === 1) e.preventDefault(); }}
-                    onAuxClick={(e) => handleMiddleClick(e, app)}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (!isDragging) handleAppClick(app);
-                    }}
-                  >
-                    <motion.div
-                      className="dock-icon-wrapper"
-                      data-app-key={itemKey(app)}
-                      initial={ITEM_INITIAL}
-                      animate={ITEM_ANIMATE}
-                      exit={ITEM_EXIT}
-                      transition={ITEM_ENTRY_TRANSITION}
-                      onMouseEnter={() => setHoveredApp(itemKey(app))}
-                      onMouseLeave={() => { if (!isPreviewHoveredRef.current) { setHoveredApp(null); setPressedApp(null); } }}
-                    >
-                      <AnimatePresence>
-                        {dockPreviewEnabled && previewData && previewData.id === itemKey(app) && hoveredApp === itemKey(app) && (
-                          <DockPreviewTooltip
-                            app={app}
-                            previews={previewData.previews}
-                            onClosePreview={handleClosePreview}
-                            renderMedia={renderPreviewMedia}
-                            zoom={scale}
-                            onMouseEnter={() => { isPreviewHoveredRef.current = true; }}
-                            onMouseLeave={() => { isPreviewHoveredRef.current = false; setHoveredApp(null); setPressedApp(null); }}
-                          />
-                        )}
-                      </AnimatePresence>
-
-                      {(!dockPreviewEnabled || (dockPreviewEnabled && hoveredApp === itemKey(app) && !previewData)) && (
-                        <div className="tooltip">{displayName(app)}</div>
-                      )}
-                      <motion.div
-                        className="dock-icon"
-                        variants={ICON_VARIANTS}
-                        animate={pressedApp === itemKey(app) ? "tap" : (hoveredApp === itemKey(app) && !isDragging ? "hover" : "idle")}
-                        whileDrag="drag"
-                        onPointerDown={() => setPressedApp(itemKey(app))}
-                        onPointerUp={() => setPressedApp(null)}
-                        onPointerCancel={() => setPressedApp(null)}
-                      >
-                        {(() => {
-                          const isHost = isBrowserHost(app.path);
-                          const cacheKey = isHost ? `${app.path}:${app.name.toLowerCase()}` : (app.hwnd ? `${app.path}-${app.hwnd}` : app.path);
-                          // Running host items skip the shared path fallback, or the browser's icon leaks onto its PWAs.
-                    const allowPathFallback = !isHost || !app.is_running;
-                    const icon = customIcons[cacheKey] || (allowPathFallback && customIcons[app.path]) || iconsRef.current[cacheKey] || (allowPathFallback && iconsRef.current[app.path]) || app.icon;
-                          const isNectarOrSettings = isNectarWindow(app);
-                          return (icon || isNectarOrSettings) ? (
-                            <DockAppIcon src={isNectarOrSettings ? "/nectar.png" : (icon ?? undefined)} alt={app.name} nectar={isNectarOrSettings} />
-                          ) : (
-                            <div className="fallback-icon">{app.name[0]}</div>
-                          );
-                        })()}
-                        {attentionBadge(app)}
-                      </motion.div>
-                      {app.is_running && <WindowDots count={app.all_hwnds?.length ?? 1} mode={windowIndicator} />}
-                    </motion.div>
-                  </Reorder.Item>
-                ))}
+                {mixedItems.map((app) => renderDockAppItem(app, "mixed"))}
               </Reorder.Group>
               )}
 
@@ -1994,108 +3427,544 @@ const Dock = memo(function Dock() {
           )}
         </AnimatePresence>
       </motion.div>
+      </motion.div>
     </div>
 
       {contextMenu && (
         <div
           style={{
             position: 'fixed',
-            left: Math.min(
-              Math.max(8, contextMenu.x - (contextMenuWidth || 160 * scale) / 2),
-              Math.max(8, window.innerWidth - (contextMenuWidth || 160 * scale) - 8),
-            ),
+            left: contextMenuLeft,
             top: Math.max(8, contextMenu.y - 10 - (contextMenuHeight || (contextMenu.app ? 200 : 100) * scale)),
             zIndex: 9999,
           }}
         >
         <div
           ref={menuRef}
-          className="context-menu"
+          className="context-menu nectar-menu-pop"
           style={{
             position: 'static',
             zoom: scale
           }}
           onClick={(e) => e.stopPropagation()}
         >
-          {contextMenu.app ? (
+          {contextMenu.app && contextMenu.app.path !== 'start' ? (
             <>
-              {contextMenu.app.is_running && contextMenu.app.path !== 'start' && (
-                <>
-                  <div className="menu-item" onClick={() => { handleNewInstance(contextMenu.app!); closeMenu(); }}>
-                    {t("dockmenu.newInstance")}
-                  </div>
-                  <div className="menu-divider" />
-                </>
-              )}
-              <div className="menu-item" onClick={() => togglePin(contextMenu.app!)}>
-                {contextMenu.app.is_pinned ? t("dockmenu.unpin") : t("dockmenu.pin")}
-              </div>
-              {(contextMenu.app.is_pinned || contextMenu.app.is_running) && contextMenu.app.path !== 'start' && (
-                <div className="menu-item" onClick={() => hideFromDock(contextMenu.app!)}>
-                  {t("dockmenu.hide")}
+              {contextMenu.app.is_running ? (
+                <div className="menu-item" onClick={() => { handleNewInstance(contextMenu.app!); closeMenu(); }}>
+                  <span className="menu-item-icon"><PlusSquare size={14} /></span>
+                  <span className="menu-item-label">{t("dockmenu.newInstance")}</span>
+                </div>
+              ) : (
+                <div className="menu-item" onClick={() => { handleAppClick(contextMenu.app!); closeMenu(); }}>
+                  <span className="menu-item-icon"><ExternalLink size={14} /></span>
+                  <span className="menu-item-label">{t("start.ctx.open")}</span>
                 </div>
               )}
-              {contextMenu.app.is_pinned && contextMenu.app.path !== 'start' && (
-                <>
-                  <div className="menu-divider" />
-                  <div className="menu-item" onClick={() => {
-                    const isHost = isBrowserHost(contextMenu.app!.path);
-                    const ck = isHost ? `${contextMenu.app!.path}:${contextMenu.app!.name.toLowerCase()}` : contextMenu.app!.path;
-                    iconPickerTargetRef.current = ck;
-                    closeMenu();
-                    setTimeout(() => {
-                      document.getElementById('icon-file-input')?.click();
-                    }, 50);
-                  }}>
-                    {t("dockmenu.changeIcon")}
-                  </div>
-                  {(() => {
-                    const isHost = isBrowserHost(contextMenu.app!.path);
-                    const ck = isHost ? `${contextMenu.app!.path}:${contextMenu.app!.name.toLowerCase()}` : contextMenu.app!.path;
-                    return customIcons[ck] ? (
-                      <div className="menu-item" onClick={() => {
-                        handleRemoveCustomIcon(contextMenu.app!);
-                        closeMenu();
-                      }}>
-                        {t("dockmenu.resetIcon")}
+              {isExplorerApp(contextMenu.app) && explorerJumpList.length > 0 && renderExplorerJumpMenu(openSubmenuLeft)}
+              {supportsWinFileActions(contextMenu.app) && (
+                <div
+                  className={`menu-item has-submenu${activeSubmenu === "more" ? " submenu-open" : ""}`}
+                  onMouseEnter={() => openSubmenu("more")}
+                  onMouseLeave={() => scheduleSubmenuClose("more")}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    cancelSubmenuClose();
+                    setActiveSubmenu((prev) => (prev === "more" ? null : "more"));
+                  }}
+                >
+                  <span className="menu-item-icon"><MoreHorizontal size={14} /></span>
+                  <span className="menu-item-label">{t("dockmenu.more")}</span>
+                  <span className="submenu-arrow">▶</span>
+                  <div
+                    ref={activeSubmenu === "more" ? activeSubmenuRef : undefined}
+                    className={`submenu nectar-menu-pop${openSubmenuLeft ? " submenu-left" : ""}`}
+                    onMouseEnter={() => openSubmenu("more")}
+                    onMouseLeave={() => scheduleSubmenuClose("more")}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="submenu-scroll nectar-scroll">
+                      <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleRunAsAdmin(contextMenu.app!); closeMenu(); }}>
+                        <span className="menu-item-icon"><Shield size={14} /></span>
+                        <span className="menu-item-label">{t("start.ctx.runAsAdmin")}</span>
                       </div>
-                    ) : null;
-                  })()}
-                </>
+                      <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleOpenLocation(contextMenu.app!); closeMenu(); }}>
+                        <span className="menu-item-icon"><FolderOpen size={14} /></span>
+                        <span className="menu-item-label">{t("start.ctx.openLocation")}</span>
+                      </div>
+                      <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleOpenProperties(contextMenu.app!); closeMenu(); }}>
+                        <span className="menu-item-icon"><Info size={14} /></span>
+                        <span className="menu-item-label">{t("dockmenu.properties")}</span>
+                      </div>
+                      <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleCopyPath(contextMenu.app!); closeMenu(); }}>
+                        <span className="menu-item-icon"><Copy size={14} /></span>
+                        <span className="menu-item-label">{t("dockmenu.copyPath")}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
               )}
-              {contextMenu.app.is_pinned && contextMenu.app.path !== 'start' && (
-                <div className="menu-item" onClick={() => { setRenameApp(contextMenu.app!); closeMenu(); }}>
-                  {t("dockmenu.rename")}
+              {contextMenu.app.is_running && contextMenu.app.hwnd && (
+                <div
+                  className={`menu-item has-submenu${activeSubmenu === "window" ? " submenu-open" : ""}`}
+                  onMouseEnter={() => openSubmenu("window")}
+                  onMouseLeave={() => scheduleSubmenuClose("window")}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    cancelSubmenuClose();
+                    setActiveSubmenu((prev) => (prev === "window" ? null : "window"));
+                  }}
+                >
+                  <span className="menu-item-icon"><AppWindow size={14} /></span>
+                  <span className="menu-item-label">{t("dockmenu.windowMenu")}</span>
+                  <span className="submenu-arrow">▶</span>
+                  <div
+                    ref={activeSubmenu === "window" ? activeSubmenuRef : undefined}
+                    className={`submenu nectar-menu-pop${openSubmenuLeft ? " submenu-left" : ""}`}
+                    onMouseEnter={() => openSubmenu("window")}
+                    onMouseLeave={() => scheduleSubmenuClose("window")}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="submenu-scroll nectar-scroll">
+                      <div
+                        className="menu-item"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleWindowAction(contextMenu.app!, contextWindowState?.minimized ? "restore" : "minimize");
+                          closeMenu();
+                        }}
+                      >
+                        <span className="menu-item-icon"><Minimize2 size={14} /></span>
+                        <span className="menu-item-label">
+                          {contextWindowState?.minimized ? t("dockmenu.restore") : t("dockmenu.minimize")}
+                        </span>
+                      </div>
+                      <div
+                        className="menu-item"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleWindowAction(contextMenu.app!, "maximize");
+                          closeMenu();
+                        }}
+                      >
+                        <span className="menu-item-icon"><Maximize2 size={14} /></span>
+                        <span className="menu-item-label">
+                          {contextWindowState?.maximized ? t("dockmenu.restore") : t("dockmenu.maximize")}
+                        </span>
+                      </div>
+                      <div
+                        className="menu-item"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleToggleTopmost(contextMenu.app!);
+                          closeMenu();
+                        }}
+                      >
+                        <span className="menu-item-icon"><Pin size={14} /></span>
+                        <span className="menu-item-label">{t("dockmenu.alwaysOnTop")}</span>
+                        {contextWindowState?.topmost && <Check size={13} className="menu-item-check" />}
+                      </div>
+                      <div className="menu-divider" />
+                      <div
+                        className="menu-item quit"
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          await bridgeInvoke('end_task', {
+                            hwnd: contextMenu.app!.hwnd,
+                            allHwnds: contextMenu.app!.all_hwnds?.map(([h]) => h) ?? null,
+                          }).catch(() => {});
+                          closeMenu();
+                        }}
+                      >
+                        <span className="menu-item-icon"><XCircle size={14} /></span>
+                        <span className="menu-item-label">{t("dockmenu.endTask")}</span>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               )}
               <div className="menu-divider" />
-              <div className="menu-item" onClick={() => { setShowAddPopup(true); closeMenu(); }}>
-                {t("dockmenu.addApp")}
+              <div className="menu-item" onClick={() => togglePin(contextMenu.app!)}>
+                <span className="menu-item-icon">{contextMenu.app.is_pinned ? <PinOff size={14} /> : <Pin size={14} />}</span>
+                <span className="menu-item-label">{contextMenu.app.is_pinned ? t("dockmenu.unpin") : t("dockmenu.pin")}</span>
               </div>
-              {nectarOptionsMenu()}
-              {contextMenu.app.is_running && (
+              <div
+                className={`menu-item has-submenu${activeSubmenu === "appearance" ? " submenu-open" : ""}`}
+                onMouseEnter={() => openSubmenu("appearance")}
+                onMouseLeave={() => scheduleSubmenuClose("appearance")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  cancelSubmenuClose();
+                  setActiveSubmenu((prev) => (prev === "appearance" ? null : "appearance"));
+                }}
+              >
+                <span className="menu-item-icon"><Palette size={14} /></span>
+                <span className="menu-item-label">{t("dockmenu.customizeMenu")}</span>
+                <span className="submenu-arrow">▶</span>
+                <div
+                  ref={activeSubmenu === "appearance" ? activeSubmenuRef : undefined}
+                  className={`submenu nectar-menu-pop${openSubmenuLeft ? " submenu-left" : ""}`}
+                  onMouseEnter={() => openSubmenu("appearance")}
+                  onMouseLeave={() => scheduleSubmenuClose("appearance")}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="submenu-scroll nectar-scroll">
+                  {contextMenu.app.is_pinned && (
+                    <>
+                      <div
+                        className="menu-item"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setRenameApp(contextMenu.app!);
+                          closeMenu();
+                        }}
+                      >
+                        <span className="menu-item-icon"><Pencil size={14} /></span>
+                        <span className="menu-item-label">{t("dockmenu.rename")}</span>
+                      </div>
+                      <div
+                        className="menu-item"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const isHost = isBrowserHost(contextMenu.app!.path);
+                          const ck = isHost ? `${contextMenu.app!.path}:${contextMenu.app!.name.toLowerCase()}` : contextMenu.app!.path;
+                          iconPickerTargetRef.current = ck;
+                          closeMenu();
+                          setTimeout(() => {
+                            document.getElementById('icon-file-input')?.click();
+                          }, 50);
+                        }}
+                      >
+                        <span className="menu-item-icon"><ImageIcon size={14} /></span>
+                        <span className="menu-item-label">{t("dockmenu.changeIcon")}</span>
+                      </div>
+                      {(() => {
+                        const isHost = isBrowserHost(contextMenu.app!.path);
+                        const ck = isHost ? `${contextMenu.app!.path}:${contextMenu.app!.name.toLowerCase()}` : contextMenu.app!.path;
+                        return customIcons[ck] ? (
+                          <div
+                            className="menu-item"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleRemoveCustomIcon(contextMenu.app!);
+                              closeMenu();
+                            }}
+                          >
+                            <span className="menu-item-icon"><RotateCcw size={14} /></span>
+                            <span className="menu-item-label">{t("dockmenu.resetIcon")}</span>
+                          </div>
+                        ) : null;
+                      })()}
+                      <div className="menu-divider" />
+                    </>
+                  )}
+                  <div
+                    className="menu-item"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleAppTintExclusion(contextMenu.app!);
+                    }}
+                  >
+                    <span className="menu-item-icon"><Palette size={14} /></span>
+                    <span className="menu-item-label">
+                      {isAppTintExcluded(contextMenu.app.path || contextMenu.app.name, excludedTintApps)
+                        ? tr("dock.context.includeTint", "Include in icon tinting")
+                        : tr("dock.context.excludeTint", "Keep original icon colors")}
+                    </span>
+                  </div>
+                  <div className="menu-divider" />
+                  {(contextMenu.app.is_pinned || contextMenu.app.is_running) && (
+                    <div
+                      className="menu-item"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        hideFromDock(contextMenu.app!);
+                      }}
+                    >
+                      <span className="menu-item-icon"><EyeOff size={14} /></span>
+                      <span className="menu-item-label">{t("dockmenu.hide")}</span>
+                    </div>
+                  )}
+                  <div
+                    className="menu-item"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowAddPopup(true);
+                      closeMenu();
+                    }}
+                  >
+                    <span className="menu-item-icon"><Plus size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.addApp")}</span>
+                  </div>
+                  </div>
+                </div>
+              </div>
+              {nectarOptionsMenu(openSubmenuLeft)}
+              {contextMenu.app.is_running && contextMenu.app.hwnd && (
                 <>
                   <div className="menu-divider" />
-                  <div className="menu-item quit" onClick={async () => {
-                    if (contextMenu.app?.hwnd) {
-                      await invoke('end_task', {
-                        hwnd: contextMenu.app.hwnd,
-                        allHwnds: contextMenu.app.all_hwnds?.map(([h]) => h) ?? null,
-                      });
-                      closeMenu();
-                    }
-                  }}>
-                    {t("dockmenu.quitApp", { name: contextMenu.app.name })}
+                  <div className="menu-item quit" onClick={() => { handleWindowAction(contextMenu.app!, "close_all"); closeMenu(); }}>
+                    <span className="menu-item-icon"><X size={14} /></span>
+                    <span className="menu-item-label">
+                      {(contextMenu.app.all_hwnds?.length ?? 0) > 1
+                        ? t("dockmenu.closeAllWindows")
+                        : t("dockmenu.closeWindow")}
+                    </span>
                   </div>
                 </>
               )}
             </>
+          ) : contextMenu.app?.path === 'start' ? (
+            <>
+              <div className="menu-item" onClick={() => { handleOpenWindowsTool("terminal"); closeMenu(); }}>
+                <span className="menu-item-icon"><Terminal size={14} /></span>
+                <span className="menu-item-label">{t("dockmenu.winTerminal")}</span>
+              </div>
+              <div className="menu-item" onClick={() => { handleOpenWindowsTool("explorer"); closeMenu(); }}>
+                <span className="menu-item-icon"><Folder size={14} /></span>
+                <span className="menu-item-label">{t("dockmenu.winExplorer")}</span>
+              </div>
+              <div className="menu-item" onClick={() => { handleOpenWindowsTool("run_dialog"); closeMenu(); }}>
+                <span className="menu-item-icon"><Play size={14} /></span>
+                <span className="menu-item-label">{t("dockmenu.winRun")}</span>
+              </div>
+              <div className="menu-item" onClick={() => { bridgeInvoke('open_app', { appName: 'taskmgr' }); closeMenu(); }}>
+                <span className="menu-item-icon"><Activity size={14} /></span>
+                <span className="menu-item-label">{t("dockmenu.taskManager")}</span>
+              </div>
+              <div className="menu-divider" />
+              <div
+                className={`menu-item has-submenu${activeSubmenu === "system" ? " submenu-open" : ""}`}
+                onMouseEnter={() => openSubmenu("system")}
+                onMouseLeave={() => scheduleSubmenuClose("system")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  cancelSubmenuClose();
+                  setActiveSubmenu((prev) => (prev === "system" ? null : "system"));
+                }}
+              >
+                <span className="menu-item-icon"><Monitor size={14} /></span>
+                <span className="menu-item-label">{t("dockmenu.winSystemMenu")}</span>
+                <span className="submenu-arrow">▶</span>
+                <div
+                  ref={activeSubmenu === "system" ? activeSubmenuRef : undefined}
+                  className={`submenu nectar-menu-pop${openSubmenuLeft ? " submenu-left" : ""}`}
+                  onMouseEnter={() => openSubmenu("system")}
+                  onMouseLeave={() => scheduleSubmenuClose("system")}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="submenu-scroll nectar-scroll">
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleOpenWindowsTool("terminal_admin"); closeMenu(); }}>
+                    <span className="menu-item-icon"><Shield size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.winTerminalAdmin")}</span>
+                  </div>
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleOpenWindowsTool("win_settings"); closeMenu(); }}>
+                    <span className="menu-item-icon"><Settings size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.winSettings")}</span>
+                  </div>
+                  <div className="menu-divider" />
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleOpenWindowsTool("installed_apps"); closeMenu(); }}>
+                    <span className="menu-item-icon"><AppWindow size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.winInstalledApps")}</span>
+                  </div>
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleOpenWindowsTool("device_manager"); closeMenu(); }}>
+                    <span className="menu-item-icon"><Cpu size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.winDeviceManager")}</span>
+                  </div>
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleOpenWindowsTool("disk_management"); closeMenu(); }}>
+                    <span className="menu-item-icon"><HardDrive size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.winDiskManagement")}</span>
+                  </div>
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleOpenWindowsTool("network_connections"); closeMenu(); }}>
+                    <span className="menu-item-icon"><Wifi size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.winNetwork")}</span>
+                  </div>
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleOpenWindowsTool("event_viewer"); closeMenu(); }}>
+                    <span className="menu-item-icon"><FileText size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.winEventViewer")}</span>
+                  </div>
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleOpenWindowsTool("computer_mgmt"); closeMenu(); }}>
+                    <span className="menu-item-icon"><Monitor size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.winComputerMgmt")}</span>
+                  </div>
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleOpenWindowsTool("power_options"); closeMenu(); }}>
+                    <span className="menu-item-icon"><Power size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.winPowerOptions")}</span>
+                  </div>
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handleOpenWindowsTool("control_panel"); closeMenu(); }}>
+                    <span className="menu-item-icon"><Sliders size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.winControlPanel")}</span>
+                  </div>
+                  <div className="menu-divider" />
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); bridgeInvoke('show_desktop'); closeMenu(); }}>
+                    <span className="menu-item-icon"><Minimize2 size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.showDesktop")}</span>
+                  </div>
+                  </div>
+                </div>
+              </div>
+              <div
+                className={`menu-item has-submenu${activeSubmenu === "power" ? " submenu-open" : ""}`}
+                onMouseEnter={() => openSubmenu("power")}
+                onMouseLeave={() => scheduleSubmenuClose("power")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  cancelSubmenuClose();
+                  setActiveSubmenu((prev) => (prev === "power" ? null : "power"));
+                }}
+              >
+                <span className="menu-item-icon"><Power size={14} /></span>
+                <span className="menu-item-label">{t("dockmenu.powerMenu")}</span>
+                <span className="submenu-arrow">▶</span>
+                <div
+                  ref={activeSubmenu === "power" ? activeSubmenuRef : undefined}
+                  className={`submenu nectar-menu-pop${openSubmenuLeft ? " submenu-left" : ""}`}
+                  onMouseEnter={() => openSubmenu("power")}
+                  onMouseLeave={() => scheduleSubmenuClose("power")}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="submenu-scroll nectar-scroll">
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handlePowerAction("lock"); closeMenu(); }}>
+                    <span className="menu-item-icon"><Lock size={14} /></span>
+                    <span className="menu-item-label">{t("start.power.lock")}</span>
+                  </div>
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handlePowerAction("sign_out"); closeMenu(); }}>
+                    <span className="menu-item-icon"><LogOut size={14} /></span>
+                    <span className="menu-item-label">{t("start.power.signOut")}</span>
+                  </div>
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handlePowerAction("sleep"); closeMenu(); }}>
+                    <span className="menu-item-icon"><Moon size={14} /></span>
+                    <span className="menu-item-label">{t("start.power.sleep")}</span>
+                  </div>
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handlePowerAction("hibernate"); closeMenu(); }}>
+                    <span className="menu-item-icon"><Moon size={14} /></span>
+                    <span className="menu-item-label">{t("start.power.hibernate")}</span>
+                  </div>
+                  <div className="menu-item" onClick={(e) => { e.stopPropagation(); handlePowerAction("restart"); closeMenu(); }}>
+                    <span className="menu-item-icon"><RotateCcw size={14} /></span>
+                    <span className="menu-item-label">{t("start.power.restart")}</span>
+                  </div>
+                  <div className="menu-item quit" onClick={(e) => { e.stopPropagation(); handlePowerAction("shutdown"); closeMenu(); }}>
+                    <span className="menu-item-icon"><Power size={14} /></span>
+                    <span className="menu-item-label">{t("start.power.shutdown")}</span>
+                  </div>
+                  </div>
+                </div>
+              </div>
+              <div className="menu-divider" />
+              {nectarOptionsMenu(openSubmenuLeft)}
+            </>
+          ) : contextMenu.shortcut ? (
+            <>
+              {contextMenu.shortcut.kind === "recycle" && (
+                <>
+                  <div className="menu-item" onClick={() => { bridgeInvoke('open_dock_extra', { target: 'recycle' }).catch(() => {}); closeMenu(); }}>
+                    <span className="menu-item-icon"><ExternalLink size={14} /></span>
+                    <span className="menu-item-label">{t("start.ctx.open")}</span>
+                  </div>
+                  <div
+                    className="menu-item quit"
+                    onClick={async () => {
+                      closeMenu();
+                      try {
+                        await bridgeInvoke('empty_recycle_bin');
+                      } catch (err) {
+                        showDockToast(typeof err === 'string' ? err : tr('dock.shortcut.emptyBinFail', 'Could not empty Recycle Bin'), 3500);
+                      }
+                    }}
+                  >
+                    <span className="menu-item-icon"><Trash2 size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.emptyRecycleBin")}</span>
+                  </div>
+                  <div className="menu-item" onClick={() => { bridgeInvoke('open_app_properties', { appPath: 'recycle', hwnd: null }).catch(() => showDockToast(t("dockmenu.propertiesUnavailable"), 3500)); closeMenu(); }}>
+                    <span className="menu-item-icon"><Info size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.properties")}</span>
+                  </div>
+                </>
+              )}
+              {contextMenu.shortcut.kind === "drive" && (() => {
+                const letter = (contextMenu.shortcut as { kind: "drive"; letter: string }).letter;
+                const drivePath = `${letter}:\\`;
+                return (
+                  <>
+                    <div className="menu-item" onClick={() => { bridgeInvoke('open_dock_extra', { target: letter }).catch(() => {}); closeMenu(); }}>
+                      <span className="menu-item-icon"><HardDrive size={14} /></span>
+                      <span className="menu-item-label">{t("dock.drive", { letter })}</span>
+                    </div>
+                    <div className="menu-item" onClick={() => { bridgeInvoke('open_app_properties', { appPath: drivePath, hwnd: null }).catch(() => showDockToast(t("dockmenu.propertiesUnavailable"), 3500)); closeMenu(); }}>
+                      <span className="menu-item-icon"><Info size={14} /></span>
+                      <span className="menu-item-label">{t("dockmenu.properties")}</span>
+                    </div>
+                    <div className="menu-item" onClick={() => { handleOpenWindowsTool("disk_management"); closeMenu(); }}>
+                      <span className="menu-item-icon"><Sliders size={14} /></span>
+                      <span className="menu-item-label">{t("dockmenu.winDiskManagement")}</span>
+                    </div>
+                  </>
+                );
+              })()}
+              {contextMenu.shortcut.kind === "tray" && (
+                <>
+                  <div className="menu-item" onClick={() => { bridgeInvoke('open_native_tray').catch(() => {}); closeMenu(); }}>
+                    <span className="menu-item-icon"><ExternalLink size={14} /></span>
+                    <span className="menu-item-label">{t("traybar.nativeTray")}</span>
+                  </div>
+                  <div className="menu-item" onClick={() => { handleOpenWindowsTool("notif_settings"); closeMenu(); }}>
+                    <span className="menu-item-icon"><Bell size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.notificationSettings")}</span>
+                  </div>
+                </>
+              )}
+              {contextMenu.shortcut.kind === "search" && (
+                <>
+                  <div className="menu-item" onClick={() => { bridgeInvoke('open_app', { appName: 'search' }).catch(() => {}); closeMenu(); }}>
+                    <span className="menu-item-icon"><SearchLucide size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.search")}</span>
+                  </div>
+                  <div className="menu-item" onClick={() => { handleOpenWindowsTool("win_settings"); closeMenu(); }}>
+                    <span className="menu-item-icon"><Settings size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.winSettings")}</span>
+                  </div>
+                </>
+              )}
+              {contextMenu.shortcut.kind === "calendar" && (
+                <>
+                  <div className="menu-item" onClick={() => { bridgeInvoke('open_calendar_window').catch(() => {}); closeMenu(); }}>
+                    <span className="menu-item-icon"><ExternalLink size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.openCalendar")}</span>
+                  </div>
+                  <div className="menu-item" onClick={() => { bridgeInvoke('open_app', { appName: 'ms-settings:dateandtime' }).catch(() => {}); closeMenu(); }}>
+                    <span className="menu-item-icon"><Settings size={14} /></span>
+                    <span className="menu-item-label">{t("dockmenu.dateTimeSettings")}</span>
+                  </div>
+                </>
+              )}
+              <div className="menu-divider" />
+              {nectarOptionsMenu(openSubmenuLeft)}
+            </>
           ) : (
             <>
-              <div className="menu-item" onClick={() => { setShowAddPopup(true); closeMenu(); }}>
-                {t("dockmenu.addApp")}
+              <div className="menu-item" onClick={() => { bridgeInvoke('open_app', { appName: 'taskmgr' }); closeMenu(); }}>
+                <span className="menu-item-icon"><Activity size={14} /></span>
+                <span className="menu-item-label">{t("dockmenu.taskManager")}</span>
               </div>
-              {nectarOptionsMenu()}
+              <div className="menu-item" onClick={() => { bridgeInvoke('show_desktop'); closeMenu(); }}>
+                <span className="menu-item-icon"><Minimize2 size={14} /></span>
+                <span className="menu-item-label">{t("dockmenu.showDesktop")}</span>
+              </div>
+              <div className="menu-item" onClick={() => { handleOpenWindowsTool("win_settings"); closeMenu(); }}>
+                <span className="menu-item-icon"><Settings size={14} /></span>
+                <span className="menu-item-label">{t("dockmenu.winSettings")}</span>
+              </div>
+              <div className="menu-item" onClick={() => { handleOpenWindowsTool("run_dialog"); closeMenu(); }}>
+                <span className="menu-item-icon"><Play size={14} /></span>
+                <span className="menu-item-label">{t("dockmenu.winRun")}</span>
+              </div>
+              <div className="menu-divider" />
+              <div className="menu-item" onClick={() => { setShowAddPopup(true); closeMenu(); }}>
+                <span className="menu-item-icon"><Plus size={14} /></span>
+                <span className="menu-item-label">{t("dockmenu.addApp")}</span>
+              </div>
+              {nectarOptionsMenu(openSubmenuLeft)}
             </>
           )}
         </div>
@@ -2131,6 +4000,7 @@ const Dock = memo(function Dock() {
             runningApps={activeApps}
             pinned={pinnedApps}
             bottom={popupBottom}
+            excludedTintApps={excludedTintApps}
           />
         )}
       </AnimatePresence>
@@ -2217,7 +4087,8 @@ function AddAppPopup({
   scale,
   runningApps,
   pinned,
-  bottom
+  bottom,
+  excludedTintApps,
 }: {
   onClose: () => void;
   onAdd: (app: AppInfo) => void;
@@ -2226,13 +4097,17 @@ function AddAppPopup({
   runningApps: AppInfo[];
   pinned: AppInfo[];
   bottom: number;
+  excludedTintApps: ReadonlySet<string>;
 }) {
   const t = useT();
   const [apps, setApps] = useState<AppInfo[]>([]);
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [loading, setLoading] = useState(true);
-  const [listIcons, setListIcons] = useState<Record<string, string>>({});
+  const [listIcons, setListIcons] = useState<Record<string, string | null>>({});
+  const listIconsRef = useRef(listIcons);
+  listIconsRef.current = listIcons;
+  const inFlightIconsRef = useRef<Set<string>>(new Set());
   const [selectedIndex, setSelectedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -2335,15 +4210,21 @@ function AddAppPopup({
   }, [selectedIndex]);
 
   useEffect(() => {
+    let cancelled = false;
     const load = async () => {
       try {
         const res = await invoke<AppInfo[]>("get_installed_apps");
-        setApps(res.sort((a, b) => a.name.localeCompare(b.name)));
+        if (!cancelled) {
+          setApps(res.sort((a, b) => a.name.localeCompare(b.name)));
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     };
     load();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -2386,32 +4267,47 @@ function AddAppPopup({
     };
   }, [onClose, containerRef, flat, selectedIndex, onAdd, pinned]);
 
-  // Fetch icons in parallel and apply them as one batch, one at a time looked like the list
-  // shifting. Boxes are fixed size and images fade in.
+  // Fetch icons in parallel and apply them as one batch, deduplicating in-flight and negative results.
   useEffect(() => {
     let active = true;
-    const targets = flat.slice(0, 25).filter((a) => !listIcons[a.path]);
+    const seen = new Set<string>();
+    const targets = flat.slice(0, 25).filter((a) => {
+      if (!a.path || seen.has(a.path)) return false;
+      seen.add(a.path);
+      if (Object.prototype.hasOwnProperty.call(listIconsRef.current, a.path)) return false;
+      if (inFlightIconsRef.current.has(a.path)) return false;
+      return true;
+    });
     if (targets.length === 0) return;
+
+    const targetPaths = targets.map((a) => a.path);
+    for (const p of targetPaths) inFlightIconsRef.current.add(p);
+
     Promise.all(
       targets.map(async (app) => {
         try {
           const icon = await invoke<string | null>("get_app_icon", { path: app.path });
-          return [app.path, icon] as const;
+          return [app.path, icon || null] as const;
         } catch (err) {
           console.error(err);
           return [app.path, null] as const;
         }
       })
     ).then((pairs) => {
+      for (const p of targetPaths) inFlightIconsRef.current.delete(p);
       if (!active) return;
-      const batch: Record<string, string> = {};
-      for (const [path, icon] of pairs) if (icon) batch[path] = icon;
+      const batch: Record<string, string | null> = {};
+      for (const [path, icon] of pairs) {
+        batch[path] = icon;
+      }
       if (Object.keys(batch).length > 0) setListIcons((prev) => ({ ...prev, ...batch }));
     });
+
     return () => {
       active = false;
+      for (const p of targetPaths) inFlightIconsRef.current.delete(p);
     };
-  }, [flat, listIcons]);
+  }, [flat]);
 
   return (
     <div className="add-popup-anchor" style={{ zoom: scale, bottom }}>
@@ -2470,6 +4366,7 @@ function AddAppPopup({
                   const gi = flatIndex.get(app) ?? 0;
                   const icon = listIcons[app.path];
                   const alreadyPinned = pinned.some((p) => isSameApp(p, app));
+                  const tintExcluded = isAppTintExcluded(app.path || app.name, excludedTintApps);
                   return (
                     <div
                       key={`${app.path}::${app.name}`}
@@ -2484,6 +4381,8 @@ function AddAppPopup({
                             key={icon}
                             src={icon}
                             alt=""
+                            className={!tintExcluded ? "nectar-tintable-icon" : undefined}
+                            data-tint-excluded={tintExcluded ? "true" : undefined}
                             draggable={false}
                             style={{ opacity: 0 }}
                             onLoad={(e) => {

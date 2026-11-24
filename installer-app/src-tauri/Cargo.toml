@@ -29,3 +29,6 @@ windows = { version = "0.61", features = [
 ] }
 window-vibrancy = "0.7.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[patch.crates-io]
+webview2-com-sys = { path = "../../src-tauri/vendor/webview2-com-sys" }

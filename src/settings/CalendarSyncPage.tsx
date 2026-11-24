@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useRef, useState } from "react";
 import { CalendarDays, ChevronLeft, CloudCog, Link2, Plus, RefreshCw, Timer, Trash2, Unplug } from "lucide-react";
 import { SettingRow } from "./SettingRow";
 import { Dropdown } from "./Dropdown";
 import { useCaldav } from "../hooks/useCaldav";
 import { timeAgo, useT, type TFunction } from "../i18n";
+import { bridgeInvoke } from "../utils/tauriBridge";
 
 const PROVIDER_LABELS: Record<string, string> = {
   google: "Google Calendar",
@@ -65,17 +65,27 @@ export function CalendarSyncPage({ onBack }: { onBack: () => void }) {
   const [url, setUrl] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const mountedRef = useRef(true);
 
   useEffect(() => {
-    invoke<Record<string, string>>("load_settings")
+    mountedRef.current = true;
+    let alive = true;
+    bridgeInvoke<Record<string, unknown>>("load_settings")
       .then((s) => {
-        const savedUrl = s["nectar-caldav-url"] ?? "";
+        if (!alive || !s) return;
+        const savedUrl = typeof s["nectar-caldav-url"] === "string" ? s["nectar-caldav-url"] : "";
         setUrl(savedUrl);
         if (savedUrl.includes("icloud.com")) setProvider("icloud");
-        setUsername(s["nectar-caldav-username"] ?? "");
-        setIntervalValue(s["nectar-caldav-interval"] ?? "15");
+        setUsername(typeof s["nectar-caldav-username"] === "string" ? s["nectar-caldav-username"] : "");
+        setIntervalValue(
+          s["nectar-caldav-interval"] != null ? String(s["nectar-caldav-interval"]) : "15"
+        );
       })
       .catch(() => {});
+    return () => {
+      alive = false;
+      mountedRef.current = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -84,11 +94,18 @@ export function CalendarSyncPage({ onBack }: { onBack: () => void }) {
       return;
     }
     let alive = true;
-    invoke<Detection | null>("ics_detect", { url: linkUrl })
-      .then((d) => alive && setDetection(d))
-      .catch(() => alive && setDetection(null));
+    const timer = window.setTimeout(() => {
+      bridgeInvoke<Detection | null>("ics_detect", { url: linkUrl })
+        .then((d) => {
+          if (alive) setDetection(d);
+        })
+        .catch(() => {
+          if (alive) setDetection(null);
+        });
+    }, 150);
     return () => {
       alive = false;
+      window.clearTimeout(timer);
     };
   }, [linkUrl]);
 
@@ -96,18 +113,24 @@ export function CalendarSyncPage({ onBack }: { onBack: () => void }) {
     setBusy(id);
     setMessage(null);
     try {
-      await invoke(command, args);
+      await bridgeInvoke(command, args);
+      if (!mountedRef.current) return;
       onOk?.();
     } catch (e) {
-      setMessage(String(e));
+      if (mountedRef.current) setMessage(String(e));
     } finally {
-      setBusy(null);
+      if (mountedRef.current) setBusy(null);
     }
   };
 
   const changeInterval = (minutes: string) => {
     setIntervalValue(minutes);
-    invoke("save_setting", { key: "nectar-caldav-interval", value: minutes }).catch(() => {});
+    try {
+      localStorage.setItem("nectar-caldav-interval", minutes);
+    } catch {
+      /* ignore */
+    }
+    bridgeInvoke("save_setting", { key: "nectar-caldav-interval", value: minutes }).catch(() => {});
   };
 
   const pickProvider = (next: Provider) => {
@@ -137,7 +160,7 @@ export function CalendarSyncPage({ onBack }: { onBack: () => void }) {
         </button>
         <div className="caldav-actions">
           {sources > 0 && (
-            <button className="caldav-btn" onClick={() => invoke("open_calendar_window").catch(() => {})}>
+            <button className="caldav-btn" onClick={() => bridgeInvoke("open_calendar_window").catch(() => {})}>
               <CalendarDays size={11} /> {t("calsync.openCalendar")}
             </button>
           )}

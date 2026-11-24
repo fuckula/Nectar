@@ -73,6 +73,13 @@ fn mode_setting_keys(kind: WindowKind) -> (&'static str, &'static str) {
     }
 }
 
+pub(crate) fn default_mode_for_kind(kind: WindowKind) -> &'static str {
+    match kind {
+        WindowKind::Dock => "smart",
+        WindowKind::Notch => "fixed",
+    }
+}
+
 /// Resolves which mode (fixed/smart/peek) a specific dock or notch window
 /// should use. Per-monitor overrides live in a JSON map keyed by the same
 /// stable monitor id used elsewhere (`nectar-dock-mode-by-monitor` etc.);
@@ -80,8 +87,8 @@ fn mode_setting_keys(kind: WindowKind) -> (&'static str, &'static str) {
 pub fn resolve_mode_for_label(app: &AppHandle, kind: WindowKind, label: &str) -> String {
     let (default_key, map_key) = mode_setting_keys(kind);
     let normalize = |m: String| if m == "auto-hide" { "smart".to_string() } else { m };
-    // Fresh installs: smart dock, fixed notch.
-    let fallback = if matches!(kind, WindowKind::Dock) { "smart" } else { "fixed" };
+    // Fresh installs: smart auto-hiding Dock, fixed floating Notch.
+    let fallback = default_mode_for_kind(kind);
     let default_mode = normalize(get_setting_str(app, default_key).unwrap_or_else(|| fallback.to_string()));
 
     let Some(monitor) = monitor_for_window_label(app, kind, label) else { return default_mode };
@@ -103,7 +110,7 @@ pub fn set_mode_for_label(app: &AppHandle, kind: WindowKind, label: &str, mode: 
         .unwrap_or_default();
     map.insert(monitor_id, mode.to_string());
     let json = serde_json::to_string(&map).map_err(|e| e.to_string())?;
-    crate::commands::save_setting(app.clone(), map_key.to_string(), serde_json::Value::String(json))
+    crate::commands::save_setting_sync(app, map_key, serde_json::Value::String(json))
 }
 
 pub fn list_monitors(app: &AppHandle) -> Vec<MonitorInfo> {
@@ -150,6 +157,7 @@ fn desired_extra_windows(app: &AppHandle, kind: WindowKind, monitors: &[Monitor]
 pub fn destroy_monitor_window(app: &AppHandle, label: &str) {
     if let Some(win) = app.get_webview_window(label) {
         if let Ok(hwnd) = win.hwnd() {
+            let _ = crate::live_preview::clear_thumbnails_for_dest(hwnd.0 as isize);
             crate::services::unregister_appbar_native(hwnd);
         }
         let _ = win.destroy();
@@ -191,17 +199,41 @@ fn sync_kind(app: &AppHandle, kind: WindowKind, monitors: &[Monitor]) {
     }
 }
 
+static MONITOR_SYNC_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct MonitorSyncGuard;
+
+impl Drop for MonitorSyncGuard {
+    fn drop(&mut self) {
+        MONITOR_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+}
+
 pub fn sync_monitor_windows(app: &AppHandle) {
+    MONITOR_SYNC_DIRTY.store(true, Ordering::SeqCst);
     if MONITOR_SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
         return;
     }
+    let _guard = MonitorSyncGuard;
 
-    let monitors = app.available_monitors().unwrap_or_default();
-    if !monitors.is_empty() {
-        sync_kind(app, WindowKind::Dock, &monitors);
-        sync_kind(app, WindowKind::Notch, &monitors);
-        let _ = app.emit("monitors-changed", ());
+    while MONITOR_SYNC_DIRTY.swap(false, Ordering::SeqCst) {
+        let monitors = app.available_monitors().unwrap_or_default();
+        if !monitors.is_empty() {
+            sync_kind(app, WindowKind::Dock, &monitors);
+            sync_kind(app, WindowKind::Notch, &monitors);
+            let _ = app.emit("monitors-changed", ());
+        }
     }
+}
 
-    MONITOR_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+#[cfg(test)]
+mod tests {
+    use super::default_mode_for_kind;
+    use crate::types::WindowKind;
+
+    #[test]
+    fn default_modes_match_smart_dock_and_fixed_notch() {
+        assert_eq!(default_mode_for_kind(WindowKind::Dock), "smart");
+        assert_eq!(default_mode_for_kind(WindowKind::Notch), "fixed");
+    }
 }

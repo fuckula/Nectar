@@ -1,19 +1,14 @@
-import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { MousePointer2 } from "lucide-react";
 import { SettingRow } from "./SettingRow";
 import { Dropdown } from "./Dropdown";
 import { useT } from "../i18n";
+import { useSyncedSetting } from "./useSyncedSetting";
+
+const parseEdgeArea = (raw: unknown): string => (raw === "narrow" ? "narrow" : "full");
 
 export function EdgeArea({ settingKey }: { settingKey: "nectar-notch-edge-area" | "nectar-dock-edge-area" }) {
   const t = useT();
-  const [value, setValue] = useState(() => (localStorage.getItem(settingKey) === "narrow" ? "narrow" : "full"));
-
-  const change = (next: string) => {
-    setValue(next);
-    localStorage.setItem(settingKey, next);
-    invoke("save_setting", { key: settingKey, value: next }).catch(() => { });
-  };
+  const [value, change] = useSyncedSetting(settingKey, parseEdgeArea, (v) => v);
 
   return (
     <SettingRow icon={MousePointer2} label={t("edgeArea.label")} desc={t(settingKey === "nectar-notch-edge-area" ? "edgeArea.notch.desc" : "edgeArea.dock.desc")}>

@@ -38,6 +38,156 @@ pub static ORIGINAL_TRAY_RECT: std::sync::Mutex<Option<windows::Win32::Foundatio
 static ORIGINAL_SEC_TRAY_RECTS: std::sync::Mutex<Vec<(isize, windows::Win32::Foundation::RECT)>> = std::sync::Mutex::new(Vec::new());
 static ORIGINAL_TASKBAR_STATE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+const BLOCKED_ATTACH_EXES: &[&str] = &[
+    "amdow.exe",
+    "werfault.exe",
+    "werfaultsecure.exe",
+    "wermgr.exe",
+    "rtss.exe",
+    "rtsshooksloader64.exe",
+    "presentmon.exe",
+    "gamebar.exe",
+    "gamebarftserver.exe",
+    "nvcontainer.exe",
+    "nvidia overlay.exe",
+    "steamwebhelper.exe",
+];
+
+pub fn is_blocked_attach_exe(exe_name: &str) -> bool {
+    let lower = exe_name.trim().to_ascii_lowercase();
+    !lower.is_empty() && BLOCKED_ATTACH_EXES.iter().any(|blocked| lower == *blocked)
+}
+
+pub(crate) fn process_image_name_for_pid(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 520];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(handle);
+        if !ok || len == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+    }
+}
+
+pub fn is_hwnd_responsive(hwnd: HWND, timeout_ms: u32) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    unsafe {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            IsHungAppWindow, IsWindow, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL,
+        };
+        if !IsWindow(Some(hwnd)).as_bool() || IsHungAppWindow(hwnd).as_bool() {
+            return false;
+        }
+        SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            timeout_ms,
+            None,
+        )
+        .0 != 0
+    }
+}
+
+pub fn is_hwnd_responsive_for_attach(hwnd: HWND) -> bool {
+    if !is_hwnd_responsive(hwnd, 50) {
+        return false;
+    }
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+        let mut pid = 0u32;
+        let tid = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if tid == 0 || pid == 0 {
+            return false;
+        }
+        if let Some(exe) = process_image_name_for_pid(pid) {
+            if is_blocked_attach_exe(&exe) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+pub fn write_atomic_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("data.tmp");
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = path.with_file_name(format!(".{}.{}.{}.tmp", file_name, std::process::id(), seq));
+    if let Err(err) = std::fs::write(&tmp_path, bytes) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.to_string());
+    }
+    if let Err(first_err) = std::fs::rename(&tmp_path, path) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        if std::fs::rename(&tmp_path, path).is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(first_err.to_string());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn spawn_shell_open(target: &'static str) {
+    let target_bytes = target.as_bytes();
+    if !target_bytes.ends_with(b"\0") {
+        crate::diagnostics::log(&format!("shell_open: non-nul target {target}"));
+        return;
+    }
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::UI::Shell::ShellExecuteA;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let _com = ComApartmentGuard::init_mta();
+        let res = ShellExecuteA(
+            None,
+            windows::core::PCSTR(c"open".as_ptr() as *const u8),
+            windows::core::PCSTR(target_bytes.as_ptr()),
+            windows::core::PCSTR::null(),
+            windows::core::PCSTR::null(),
+            SW_SHOWNORMAL,
+        );
+        if (res.0 as isize) <= 32 {
+            crate::diagnostics::log(&format!(
+                "shell_open failed for {}: code={}",
+                target.trim_end_matches('\0'),
+                res.0 as isize
+            ));
+        }
+    });
+}
+
 static TASKBAR_MARKER: OnceLock<PathBuf> = OnceLock::new();
 
 /// Point the crash-recovery marker at this user's app config dir (called from setup).
@@ -84,7 +234,7 @@ fn taskbar_monitor(monitors: &[(windows::Win32::Foundation::RECT, bool)], primar
     }
 }
 
-unsafe fn park_below_monitor(hwnd: windows::Win32::Foundation::HWND, primary: bool) {
+pub unsafe fn park_below_monitor(hwnd: windows::Win32::Foundation::HWND, primary: bool) {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER};
     let mut cur = RECT::default();
@@ -94,6 +244,17 @@ unsafe fn park_below_monitor(hwnd: windows::Win32::Foundation::HWND, primary: bo
         None => (-10000, -10000),
     };
     let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+pub fn hide_and_park_taskbar_window(hwnd: windows::Win32::Foundation::HWND, primary: bool) {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, IsWindowVisible, ShowWindow, SW_HIDE};
+        if hwnd.0.is_null() || !IsWindow(Some(hwnd)).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+            return;
+        }
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        park_below_monitor(hwnd, primary);
+    }
 }
 
 unsafe fn restore_tray_position(hwnd: windows::Win32::Foundation::HWND, primary: bool, saved: Option<windows::Win32::Foundation::RECT>) {
@@ -166,15 +327,13 @@ pub fn set_taskbar_visibility(visible: bool, always_on_top: bool) {
     }
 
     unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::{FindWindowA, ShowWindow, SW_HIDE, SW_SHOW, GetWindowRect};
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW, GetWindowRect};
         use windows::Win32::UI::Shell::{SHAppBarMessage, APPBARDATA, ABM_SETSTATE, ABM_GETSTATE};
 
         // Startup retries and display handlers can try to hide the taskbar after shutdown restored it.
         if !visible && crate::state::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-
-        let tray_class = windows::core::PCSTR(c"Shell_TrayWnd".as_ptr() as *const u8);
 
         // Save original taskbar state before modifying
         if ORIGINAL_TASKBAR_STATE.load(std::sync::atomic::Ordering::Relaxed) == -1 {
@@ -217,8 +376,8 @@ pub fn set_taskbar_visibility(visible: bool, always_on_top: bool) {
         };
         SHAppBarMessage(ABM_SETSTATE, &mut abd);
 
-        // 2. Control visibility of the primary taskbar
-        if let Ok(tray_hwnd) = FindWindowA(tray_class, windows::core::PCSTR::null()) {
+        // 2. Control visibility of the primary taskbar (skipping Nectar's tray proxy)
+        if let Some(tray_hwnd) = crate::tray_host::explorer_tray_hwnd() {
             use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, GetWindowLongA, SetWindowLongA, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT, SetLayeredWindowAttributes, LWA_ALPHA};
             if visible {
                 // Revert any lingering WS_EX_LAYERED / WS_EX_TRANSPARENT left by
@@ -300,6 +459,8 @@ pub fn set_taskbar_visibility(visible: bool, always_on_top: bool) {
                 1000,
                 None,
             );
+        } else {
+            crate::tray_host::outrank();
         }
     }
 }
@@ -377,43 +538,64 @@ pub unsafe fn icon_from_parsing_name(name: &str) -> Option<String> {
     icon
 }
 
-pub unsafe fn icon_to_base64(hicon: HICON) -> Option<String> {
-    let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
-    let bitmap = factory.CreateBitmapFromHICON(hicon).ok()?;
-    
-    let stream = CreateStreamOnHGlobal(HGLOBAL(std::ptr::null_mut()), true).ok()?;
-    let encoder = factory.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null()).ok()?;
-    encoder.Initialize(&stream, WICBitmapEncoderNoCache).ok()?;
-    
-    let mut frame = None;
-    encoder.CreateNewFrame(&mut frame, std::ptr::null_mut()).ok()?;
-    let frame = frame?;
-    frame.Initialize(None).ok()?;
-    
+pub(crate) unsafe fn wic_source_to_rgba(
+    factory: &IWICImagingFactory,
+    source: &windows::Win32::Graphics::Imaging::IWICBitmapSource,
+    unpremultiply: bool,
+) -> Option<image::RgbaImage> {
+    use windows::Win32::Graphics::Imaging::{
+        GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, WICBitmapPaletteTypeMedianCut,
+    };
+
     let (mut width, mut height) = (0u32, 0u32);
-    bitmap.GetSize(&mut width, &mut height).ok()?;
-    frame.SetSize(width, height).ok()?;
-    
-    let mut format = GUID_WICPixelFormat32bppPBGRA;
-    frame.SetPixelFormat(&mut format).ok()?;
-    
-    frame.WriteSource(&bitmap, std::ptr::null()).ok()?;
-    frame.Commit().ok()?;
-    encoder.Commit().ok()?;
-    
-    let hglobal = GetHGlobalFromStream(&stream).ok()?;
-    let ptr = windows::Win32::System::Memory::GlobalLock(hglobal);
-    let size = windows::Win32::System::Memory::GlobalSize(hglobal);
-    
-    let data = std::slice::from_raw_parts(ptr as *const u8, size);
-    let png_bytes = data.to_vec();
+    source.GetSize(&mut width, &mut height).ok()?;
+    if width == 0 || height == 0 || width > 4096 || height > 4096 {
+        return None;
+    }
 
-    let _ = windows::Win32::System::Memory::GlobalUnlock(hglobal);
+    let converter = factory.CreateFormatConverter().ok()?;
+    converter
+        .Initialize(
+            source,
+            &GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeMedianCut,
+        )
+        .ok()?;
 
-    let normalized = normalize_icon_padding(&png_bytes).unwrap_or(png_bytes);
-    let base64_str = general_purpose::STANDARD.encode(&normalized);
+    let stride = width.checked_mul(4)?;
+    let buf_len = (stride as usize).checked_mul(height as usize)?;
+    let mut pixels = vec![0u8; buf_len];
+    converter.CopyPixels(std::ptr::null(), stride, &mut pixels).ok()?;
 
-    Some(format!("data:image/png;base64,{}", base64_str))
+    for px in pixels.chunks_exact_mut(4) {
+        px.swap(0, 2);
+        if unpremultiply {
+            let a = px[3];
+            if a > 0 && a < 255 {
+                let scale = 255.0 / a as f32;
+                px[0] = ((px[0] as f32 * scale).round() as u32).min(255) as u8;
+                px[1] = ((px[1] as f32 * scale).round() as u32).min(255) as u8;
+                px[2] = ((px[2] as f32 * scale).round() as u32).min(255) as u8;
+            }
+        }
+    }
+
+    image::RgbaImage::from_raw(width, height, pixels)
+}
+
+pub(crate) unsafe fn hicon_to_rgba(hicon: HICON) -> Option<image::RgbaImage> {
+    let factory: IWICImagingFactory =
+        CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+    let bitmap = factory.CreateBitmapFromHICON(hicon).ok()?;
+    wic_source_to_rgba(&factory, &bitmap.cast().ok()?, false)
+}
+
+pub unsafe fn icon_to_base64(hicon: HICON) -> Option<String> {
+    let rgba = hicon_to_rgba(hicon)?;
+    normalize_rgba_to_base64_png(rgba)
 }
 
 // Drops a near-black plate behind an icon (Figma, Zen).
@@ -457,13 +639,21 @@ fn strip_dark_plate(img: &mut image::RgbaImage) {
     }
 }
 
-fn normalize_icon_padding(png_bytes: &[u8]) -> Option<Vec<u8>> {
+fn encode_rgba_to_base64_png(rgba: image::RgbaImage) -> Option<String> {
+    let mut out: Vec<u8> = Vec::new();
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(format!("data:image/png;base64,{}", general_purpose::STANDARD.encode(&out)))
+}
+
+fn normalize_rgba_to_base64_png(mut rgba: image::RgbaImage) -> Option<String> {
     const TARGET_FILL_RATIO: f64 = 0.82;
 
-    let img = image::load_from_memory(png_bytes).ok()?;
-    let mut rgba = img.to_rgba8();
     for px in rgba.pixels_mut() {
-        if px[3] < 40 { *px = image::Rgba([0, 0, 0, 0]); }
+        if px[3] < 40 {
+            *px = image::Rgba([0, 0, 0, 0]);
+        }
     }
     let (w, h) = rgba.dimensions();
     strip_dark_plate(&mut rgba);
@@ -484,7 +674,9 @@ fn normalize_icon_padding(png_bytes: &[u8]) -> Option<Vec<u8>> {
             }
         }
     }
-    if !found { return None; }
+    if !found {
+        return encode_rgba_to_base64_png(rgba);
+    }
 
     let content_w = (maxx as u32).saturating_sub(minx) + 1;
     let content_h = (maxy as u32).saturating_sub(miny) + 1;
@@ -504,11 +696,7 @@ fn normalize_icon_padding(png_bytes: &[u8]) -> Option<Vec<u8>> {
     let oy = ((canvas_size - content_h) / 2) as i64;
     image::imageops::overlay(&mut canvas, &cropped, ox, oy);
 
-    let mut out: Vec<u8> = Vec::new();
-    image::DynamicImage::ImageRgba8(canvas)
-        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
-        .ok()?;
-    Some(out)
+    encode_rgba_to_base64_png(canvas)
 }
 
 pub fn get_now_ms() -> i64 {
@@ -519,9 +707,188 @@ fn settings_cache() -> &'static std::sync::Mutex<std::collections::HashMap<Strin
     crate::state::SETTINGS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+pub const NECTAR_INJECTED_EXTRA_INFO: usize = 0x4E45_4354_4152;
+
+fn json_value_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Bool(b) => Some(if *b { "true".to_string() } else { "false".to_string() }),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn cache_bool_setting(
+    cache: &std::collections::HashMap<String, serde_json::Value>,
+    key: &str,
+    default: bool,
+) -> bool {
+    match cache.get(key) {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => true,
+            "false" => false,
+            _ => default,
+        },
+        _ => default,
+    }
+}
+
+fn sync_hook_atomics_from_cache() {
+    use std::sync::atomic::Ordering;
+    let Some(cache) = crate::state::SETTINGS_CACHE.get() else { return };
+    let Ok(guard) = cache.lock() else { return };
+    crate::state::HOOK_CUSTOM_START_ENABLED.store(
+        cache_bool_setting(&guard, "nectar-start-custom-enabled", true),
+        Ordering::SeqCst,
+    );
+    crate::state::HOOK_WINKEY_ENABLED.store(
+        cache_bool_setting(&guard, "nectar-start-winkey-hook", true),
+        Ordering::SeqCst,
+    );
+    crate::state::HOOK_LEGACY_MODE.store(
+        cache_bool_setting(&guard, "nectar-legacy-mode", false),
+        Ordering::SeqCst,
+    );
+    crate::state::HOOK_DOCK_WIN_NUMBER_ENABLED.store(
+        cache_bool_setting(&guard, "nectar-dock-win-number-enabled", true),
+        Ordering::SeqCst,
+    );
+    crate::state::HOOK_VOLUME_OVERLAY_ENABLED.store(
+        cache_bool_setting(&guard, "nectar-volume-overlay-enabled", true),
+        Ordering::SeqCst,
+    );
+    crate::state::HOOK_BRIGHTNESS_OVERLAY_ENABLED.store(
+        cache_bool_setting(&guard, "nectar-brightness-overlay-enabled", true),
+        Ordering::SeqCst,
+    );
+    crate::state::HOOK_DOCK_ENABLED.store(
+        cache_bool_setting(&guard, "nectar-dock-enabled", true),
+        Ordering::SeqCst,
+    );
+    crate::state::HOOK_DOCK_SHOW_DESKTOP_CORNER.store(
+        cache_bool_setting(&guard, "nectar-dock-show-desktop-corner", false),
+        Ordering::SeqCst,
+    );
+
+    let ram_legacy = cache_bool_setting(&guard, "nectar-ram-saver", false);
+    let perf_profile = match guard
+        .get("nectar-perf-profile")
+        .and_then(json_value_to_string)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("eco") => 1u8,
+        Some("max") => 2u8,
+        Some("balanced") => 0u8,
+        _ => if ram_legacy { 1u8 } else { 0u8 },
+    };
+    crate::state::PERF_PROFILE.store(perf_profile, Ordering::Relaxed);
+    crate::state::RAM_SAVER_ENABLED.store(perf_profile == 1, Ordering::Relaxed);
+
+    crate::state::GAME_MODE_ENABLED.store(
+        cache_bool_setting(&guard, "nectar-game-mode", true),
+        Ordering::Relaxed,
+    );
+    crate::state::GAME_MODE_PAUSE_POLLS.store(
+        cache_bool_setting(&guard, "nectar-game-mode-pause-polls", true),
+        Ordering::Relaxed,
+    );
+    crate::state::HOOK_PREVIEW_PRECAPTURE.store(
+        cache_bool_setting(&guard, "nectar-preview-precapture", false),
+        Ordering::Relaxed,
+    );
+    crate::state::HOOK_DOCK_PREVIEW_ENABLED.store(
+        cache_bool_setting(&guard, "nectar-dock-preview-enabled", true),
+        Ordering::Relaxed,
+    );
+
+    let dock_icon_size = guard
+        .get("nectar-dock-icon-size")
+        .and_then(json_value_to_string)
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|v| v.round() as i32)
+        .unwrap_or(36)
+        .clamp(28, 48);
+    crate::state::DOCK_ICON_SIZE.store(dock_icon_size, Ordering::Relaxed);
+
+    let overlay_vpos = match guard
+        .get("nectar-overlay-vpos")
+        .and_then(json_value_to_string)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("top") => 1u8,
+        Some("bottom") => 2u8,
+        _ => 0u8,
+    };
+    crate::state::OVERLAY_VPOS.store(overlay_vpos, Ordering::Relaxed);
+
+    let overlay_width_style = match guard
+        .get("nectar-overlay-style")
+        .and_then(json_value_to_string)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("slim") => 1u8,
+        Some("wide") => 2u8,
+        _ => 0u8,
+    };
+    crate::state::OVERLAY_WIDTH_STYLE.store(overlay_width_style, Ordering::Relaxed);
+
+    let scale = guard
+        .get("nectar-scale")
+        .and_then(json_value_to_string)
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(1.0)
+        .clamp(0.75, 1.75);
+    crate::state::NECTAR_SCALE_BITS.store(scale.to_bits(), Ordering::Relaxed);
+
+    crate::state::MOUSE_SETTINGS_EPOCH.fetch_add(1, Ordering::Release);
+
+    let reset_win = !crate::state::HOOK_CUSTOM_START_ENABLED.load(Ordering::Relaxed)
+        || !crate::state::HOOK_WINKEY_ENABLED.load(Ordering::Relaxed)
+        || crate::state::HOOK_LEGACY_MODE.load(Ordering::Relaxed);
+    drop(guard);
+    if reset_win {
+        crate::start_menu::reset_win_hook_state();
+    }
+}
+
+pub struct ComApartmentGuard {
+    initialized: bool,
+}
+
+impl ComApartmentGuard {
+    pub fn init_mta() -> Self {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        Self { initialized: hr.is_ok() }
+    }
+}
+
+impl Drop for ComApartmentGuard {
+    fn drop(&mut self) {
+        if self.initialized {
+            unsafe {
+                windows::Win32::System::Com::CoUninitialize();
+            }
+        }
+    }
+}
+
+static SETTINGS_CACHE_HYDRATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn sync_hook_atomics(_app: &tauri::AppHandle) {
+    sync_hook_atomics_from_cache();
+}
+
 /// Load settings.json into the in-memory cache. Call once at startup.
 pub fn init_settings_cache(app: &tauri::AppHandle) {
     use tauri::Manager;
+    let _ = settings_cache();
     if let Some(path) = app.path().app_config_dir().ok().map(|p| p.join("settings.json")) {
         if let Ok(content) = std::fs::read_to_string(path) {
             if let Ok(settings) = serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&content) {
@@ -531,6 +898,8 @@ pub fn init_settings_cache(app: &tauri::AppHandle) {
             }
         }
     }
+    SETTINGS_CACHE_HYDRATED.store(true, std::sync::atomic::Ordering::Release);
+    sync_hook_atomics(app);
 }
 
 /// Replace the entire settings cache (used by the file watcher on external changes).
@@ -538,12 +907,43 @@ pub fn replace_settings_cache(new_settings: std::collections::HashMap<String, se
     if let Ok(mut cache) = settings_cache().lock() {
         *cache = new_settings;
     }
+    SETTINGS_CACHE_HYDRATED.store(true, std::sync::atomic::Ordering::Release);
+    sync_hook_atomics_from_cache();
+}
+
+pub fn cached_settings_snapshot() -> Option<std::collections::HashMap<String, serde_json::Value>> {
+    if !SETTINGS_CACHE_HYDRATED.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    settings_cache().lock().ok().map(|g| g.clone())
+}
+
+pub fn store_cached_thumbnail(hwnd_raw: isize, img: String) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+    let Some(cache) = crate::state::THUMBNAIL_CACHE.get() else { return };
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(hwnd_raw, (img, get_now_ms()));
+        if guard.len() > 12 {
+            guard.retain(|&k, _| unsafe { IsWindow(Some(HWND(k as *mut _))).as_bool() });
+            while guard.len() > 12 {
+                if let Some(&oldest_k) = guard.iter().min_by_key(|(_, (_, ts))| *ts).map(|(k, _)| k) {
+                    guard.remove(&oldest_k);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 pub fn get_nectar_scale(_app: &tauri::AppHandle) -> f64 {
-    get_setting_str(_app, "nectar-scale")
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(1.0)
+    let bits = crate::state::NECTAR_SCALE_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    if bits == 0 {
+        return 1.0;
+    }
+    let v = f32::from_bits(bits) as f64;
+    if v.is_finite() { v.clamp(0.75, 1.75) } else { 1.0 }
 }
 
 /// Read any string value from the settings cache. Returns None if the key is absent.
@@ -560,11 +960,622 @@ pub fn setting_flag(key: &str) -> bool {
 pub fn get_setting_str(_app: &tauri::AppHandle, key: &str) -> Option<String> {
     let cache = crate::state::SETTINGS_CACHE.get()?;
     let guard = cache.lock().ok()?;
-    guard.get(key)?.as_str().map(|s| s.to_string())
+    json_value_to_string(guard.get(key)?)
 }
 
-/// Re-assert HWND_TOPMOST without activating the window.
+/// Checks whether `hwnd` (or a child/owned window of it) currently holds foreground focus.
+pub fn hwnd_owns_foreground(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GA_ROOTOWNER, GetAncestor, GetForegroundWindow, IsChild,
+        };
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() {
+            return false;
+        }
+        fg == hwnd || IsChild(hwnd, fg).as_bool() || GetAncestor(fg, GA_ROOTOWNER) == hwnd
+    }
+}
+
+static FORCE_FG_ALT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct AltKeyGuard {
+    released: bool,
+    injected: bool,
+    alt_seen: bool,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl AltKeyGuard {
+    fn press() -> Self {
+        let lock = FORCE_FG_ALT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let already_down = unsafe {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LMENU};
+            (GetAsyncKeyState(VK_LMENU.0 as i32) as u16 & 0x8000) != 0
+        };
+        let mut alt_seen = already_down;
+        if !already_down {
+            crate::state::SYNTHETIC_ALT_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+            unsafe {
+                use windows::Win32::UI::Input::KeyboardAndMouse::{
+                    GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS,
+                    KEYBDINPUT, SendInput, VK_LMENU,
+                };
+                let down = [INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VK_LMENU,
+                            wScan: 0,
+                            dwFlags: KEYBD_EVENT_FLAGS(0),
+                            time: 0,
+                            dwExtraInfo: NECTAR_INJECTED_EXTRA_INFO,
+                        },
+                    },
+                }];
+                let _ = SendInput(&down, std::mem::size_of::<INPUT>() as i32);
+                for _ in 0..10 {
+                    if (GetAsyncKeyState(VK_LMENU.0 as i32) as u16 & 0x8000) != 0 {
+                        alt_seen = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+        Self {
+            released: false,
+            injected: !already_down,
+            alt_seen,
+            _lock: lock,
+        }
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        if self.injected {
+            unsafe {
+                use windows::Win32::UI::Input::KeyboardAndMouse::{
+                    GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+                    KEYEVENTF_KEYUP, SendInput, VK_LMENU,
+                };
+                let up = [INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VK_LMENU,
+                            wScan: 0,
+                            dwFlags: KEYEVENTF_KEYUP,
+                            time: 0,
+                            dwExtraInfo: NECTAR_INJECTED_EXTRA_INFO,
+                        },
+                    },
+                }];
+                let _ = SendInput(&up, std::mem::size_of::<INPUT>() as i32);
+                for _ in 0..8 {
+                    if (GetAsyncKeyState(VK_LMENU.0 as i32) as u16 & 0x8000) == 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            crate::state::SYNTHETIC_ALT_RELEASED_MS
+                .store(get_now_ms(), std::sync::atomic::Ordering::Release);
+            crate::state::SYNTHETIC_ALT_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for AltKeyGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Runs `activate` while an RAII guard is held and guarantees release afterward (press -> activate -> release).
+#[allow(dead_code)]
+fn run_with_guard<G, P: FnOnce() -> G, A: FnOnce() -> bool>(press: P, activate: A) -> bool {
+    let _guard = press();
+    activate()
+}
+
+struct ShellFlyoutInfo {
+    is_shell: bool,
+    visible: bool,
+    cloaked: u32,
+}
+
+pub(crate) fn is_native_start_or_search_exe(exe_lowercase: &str) -> bool {
+    matches!(
+        exe_lowercase,
+        "startmenuexperiencehost.exe" | "searchhost.exe" | "searchapp.exe" | "searchui.exe"
+    )
+}
+
+unsafe fn hwnd_exe_lowercase(hwnd: HWND) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+    if hwnd.is_invalid() {
+        return None;
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == 0 {
+        return None;
+    }
+    let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+        return None;
+    };
+    let mut buf = [0u16; 520];
+    let mut len = buf.len() as u32;
+    let ok = QueryFullProcessImageNameW(
+        proc_handle,
+        PROCESS_NAME_WIN32,
+        windows::core::PWSTR(buf.as_mut_ptr()),
+        &mut len,
+    );
+    let _ = CloseHandle(proc_handle);
+    if ok.is_err() {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    Some(path.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase())
+}
+
+unsafe fn window_visibility_and_cloak(hwnd: HWND) -> (bool, u32) {
+    use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+    use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+    if hwnd.is_invalid() {
+        return (false, 0);
+    }
+    let visible = IsWindowVisible(hwnd).as_bool();
+    let mut cloaked = 0u32;
+    let _ = DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CLOAKED,
+        &mut cloaked as *mut _ as *mut _,
+        std::mem::size_of::<u32>() as u32,
+    );
+    (visible, cloaked)
+}
+
+unsafe fn classify_shell_flyout(fg: HWND) -> ShellFlyoutInfo {
+    let (visible, cloaked) = window_visibility_and_cloak(fg);
+    let Some(exe) = hwnd_exe_lowercase(fg) else {
+        return ShellFlyoutInfo {
+            is_shell: false,
+            visible,
+            cloaked,
+        };
+    };
+    let is_shell = is_native_start_or_search_exe(&exe)
+        || matches!(
+            exe.as_str(),
+            "shellexperiencehost.exe"
+                | "shellhost.exe"
+                | "widgetboard.exe"
+                | "screenclippinghost.exe"
+        );
+    ShellFlyoutInfo {
+        is_shell,
+        visible,
+        cloaked,
+    }
+}
+
+/// True if `hwnd` belongs to the native Windows Start or Search flyout host.
+pub(crate) fn is_native_start_or_search_hwnd(hwnd: HWND) -> bool {
+    unsafe {
+        hwnd_exe_lowercase(hwnd).is_some_and(|exe| is_native_start_or_search_exe(&exe))
+    }
+}
+
+/// True if `hwnd` belongs to a Windows shell Start/Search/flyout host (StartMenuExperienceHost, SearchHost, etc.).
+pub(crate) fn is_shell_flyout_hwnd(hwnd: HWND) -> bool {
+    unsafe { classify_shell_flyout(hwnd).is_shell }
+}
+
+unsafe fn visible_native_start_hwnds() -> Vec<HWND> {
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
+    use windows::core::BOOL;
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let list = &mut *(lparam.0 as *mut Vec<HWND>);
+        let (visible, cloaked) = window_visibility_and_cloak(hwnd);
+        if visible && cloaked == 0 && is_native_start_or_search_hwnd(hwnd) {
+            list.push(hwnd);
+        }
+        BOOL(1)
+    }
+
+    let mut out: Vec<HWND> = Vec::new();
+    let _ = EnumWindows(Some(enum_proc), LPARAM(&mut out as *mut Vec<HWND> as isize));
+    out
+}
+
+/// True when any native Windows Start or Search top-level flyout is visibly uncloaked.
+pub fn has_visible_native_start_window() -> bool {
+    unsafe { !visible_native_start_hwnds().is_empty() }
+}
+
+fn should_keep_waiting_for_flyout_dismiss(
+    fg_same: bool,
+    cloaked: u32,
+    post_cloak_polls: u32,
+) -> bool {
+    if !fg_same {
+        return false;
+    }
+    if cloaked == 0 {
+        return true;
+    }
+    post_cloak_polls < 6
+}
+
+/// Dismiss a visible Windows native Start/Search flyout so Nectar's Start menu can claim foreground.
+pub fn dismiss_visible_shell_flyout() {
+    unsafe {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, PostMessageW, WA_INACTIVE, WM_ACTIVATE, WM_CANCELMODE,
+        };
+
+        let fg_now = GetForegroundWindow();
+        let info = classify_shell_flyout(fg_now);
+        if info.is_shell && info.visible && info.cloaked == 0 {
+            let _ = PostMessageW(Some(fg_now), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+            send_injected_escape();
+            let mut post_cloak_polls = 0u32;
+            for _ in 0..30 {
+                let fg_after = GetForegroundWindow();
+                let mut cloaked = 0u32;
+                if fg_after == fg_now {
+                    let _ = DwmGetWindowAttribute(
+                        fg_now,
+                        DWMWA_CLOAKED,
+                        &mut cloaked as *mut _ as *mut _,
+                        std::mem::size_of::<u32>() as u32,
+                    );
+                }
+                if !should_keep_waiting_for_flyout_dismiss(
+                    fg_after == fg_now,
+                    cloaked,
+                    post_cloak_polls,
+                ) {
+                    break;
+                }
+                if cloaked != 0 {
+                    post_cloak_polls += 1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        for hwnd in visible_native_start_hwnds() {
+            let _ = PostMessageW(Some(hwnd), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(Some(hwnd), WM_ACTIVATE, WPARAM(WA_INACTIVE as usize), LPARAM(0));
+        }
+    }
+}
+
+fn should_execute_uia_set_focus(
+    still_valid: bool,
+    window_visible: bool,
+    fg_is_null_or_shell: bool,
+) -> bool {
+    still_valid && window_visible && fg_is_null_or_shell
+}
+
+/// Fallback activation via UI Automation when an AppContainer CoreWindow shell flyout blocks SetForegroundWindow.
+/// Must run on a clean dedicated background thread (never on the UI/main thread) to avoid STA reentrancy deadlocks.
+pub(crate) fn uia_focus_hwnd(hwnd_raw: isize, still_valid: impl Fn() -> bool) -> bool {
+    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsWindow, IsWindowVisible};
+
+    let hwnd = HWND(hwnd_raw as *mut _);
+    unsafe {
+        if hwnd.0.is_null() {
+            return false;
+        }
+        let is_eligible = || {
+            let valid = still_valid();
+            let vis = IsWindow(Some(hwnd)).as_bool() && IsWindowVisible(hwnd).as_bool();
+            let fg = GetForegroundWindow();
+            let fg_null_or_shell = fg.is_invalid() || classify_shell_flyout(fg).is_shell;
+            should_execute_uia_set_focus(valid, vis, fg_null_or_shell)
+        };
+        if hwnd_owns_foreground(hwnd) {
+            return still_valid();
+        }
+        if !is_eligible() {
+            return false;
+        }
+        let _com = ComApartmentGuard::init_mta();
+        if !_com.initialized {
+            return false;
+        }
+        let Ok(auto) = CoCreateInstance::<_, IUIAutomation>(
+            &CUIAutomation,
+            None,
+            CLSCTX_INPROC_SERVER,
+        ) else {
+            return false;
+        };
+        let Ok(elem) = auto.ElementFromHandle(hwnd) else {
+            return false;
+        };
+        if hwnd_owns_foreground(hwnd) {
+            return still_valid();
+        }
+        if !is_eligible() {
+            return false;
+        }
+        let _ = elem.SetFocus();
+        hwnd_owns_foreground(hwnd)
+    }
+}
+
+unsafe fn send_injected_escape() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
+        SendInput, VK_ESCAPE,
+    };
+    let inputs = [
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_ESCAPE,
+                    wScan: 0,
+                    dwFlags: KEYBD_EVENT_FLAGS(0),
+                    time: 0,
+                    dwExtraInfo: NECTAR_INJECTED_EXTRA_INFO,
+                },
+            },
+        },
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_ESCAPE,
+                    wScan: 0,
+                    dwFlags: KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: NECTAR_INJECTED_EXTRA_INFO,
+                },
+            },
+        },
+    ];
+    let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+}
+
+/// Reliably bring `hwnd` to foreground across Win32 focus lock rules without blocking the UI thread.
+pub fn force_foreground(hwnd: HWND) -> bool {
+    unsafe {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+        use windows::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            ASFW_ANY, AllowSetForegroundWindow, BringWindowToTop, GWL_EXSTYLE, GetClassNameA,
+            GetForegroundWindow, GetShellWindow, GetWindowLongW, GetWindowThreadProcessId,
+            HWND_TOP, HWND_TOPMOST, IsWindow, IsWindowVisible, PostMessageW,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos,
+            SwitchToThisWindow, WM_CANCELMODE, WS_EX_TOPMOST,
+        };
+
+        if hwnd.0.is_null() || !IsWindow(Some(hwnd)).as_bool() {
+            return false;
+        }
+        if hwnd_owns_foreground(hwnd) {
+            return true;
+        }
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+
+        let mut last_attach_fg = false;
+        let mut last_alt_seen = false;
+
+        let mut try_activate = || -> bool {
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+            let cur = GetCurrentThreadId();
+            let fg = GetForegroundWindow();
+            let fg_tid = if is_hwnd_responsive_for_attach(fg) {
+                GetWindowThreadProcessId(fg, None)
+            } else {
+                0
+            };
+            let raw_target_tid = GetWindowThreadProcessId(hwnd, None);
+            let target_tid = if raw_target_tid != 0 && (raw_target_tid == cur || is_hwnd_responsive_for_attach(hwnd)) {
+                raw_target_tid
+            } else {
+                0
+            };
+
+            let attach_fg =
+                fg_tid != 0 && fg_tid != cur && AttachThreadInput(cur, fg_tid, true).as_bool();
+            last_attach_fg = attach_fg;
+
+            // SearchHost/CoreWindow in an AppContainer frequently denies AttachThreadInput; attach to Explorer's shell thread as fallback.
+            let shell_wnd = GetShellWindow();
+            let shell_tid = if !attach_fg && is_hwnd_responsive_for_attach(shell_wnd) {
+                GetWindowThreadProcessId(shell_wnd, None)
+            } else {
+                0
+            };
+            let attach_shell = shell_tid != 0
+                && shell_tid != cur
+                && shell_tid != fg_tid
+                && AttachThreadInput(cur, shell_tid, true).as_bool();
+
+            let attach_target = target_tid != 0
+                && target_tid != cur
+                && target_tid != fg_tid
+                && target_tid != shell_tid
+                && AttachThreadInput(cur, target_tid, true).as_bool();
+
+            let z_after = if (GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST.0 as i32) != 0 {
+                HWND_TOPMOST
+            } else {
+                HWND_TOP
+            };
+            let _ = SetWindowPos(
+                hwnd,
+                Some(z_after),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetActiveWindow(hwnd);
+
+            if attach_target {
+                let _ = AttachThreadInput(cur, target_tid, false);
+            }
+            if attach_shell {
+                let _ = AttachThreadInput(cur, shell_tid, false);
+            }
+            if attach_fg {
+                let _ = AttachThreadInput(cur, fg_tid, false);
+            }
+            hwnd_owns_foreground(hwnd)
+        };
+
+        if try_activate() {
+            return true;
+        }
+
+        // Send a non-blocking cancel message if a native shell flyout is still visible (blocking dismiss runs off-thread in show_surface_async).
+        let fg_now = GetForegroundWindow();
+        let flyout = classify_shell_flyout(fg_now);
+        if flyout.is_shell && flyout.visible && flyout.cloaked == 0 {
+            let _ = PostMessageW(Some(fg_now), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+            if try_activate() {
+                return true;
+            }
+        }
+
+        // Hold Alt across SetForegroundWindow (releasing beforehand loses the unlock).
+        {
+            let guard = AltKeyGuard::press();
+            last_alt_seen = last_alt_seen || guard.alt_seen;
+            if try_activate() {
+                return true;
+            }
+            // If an AppContainer shell host (e.g. cloaked SearchHost.exe CoreWindow) still owns foreground, cancel its mode and force activation.
+            let fg_mid = GetForegroundWindow();
+            if classify_shell_flyout(fg_mid).is_shell {
+                let _ = PostMessageW(Some(fg_mid), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+                SwitchToThisWindow(hwnd, true);
+                SwitchToThisWindow(hwnd, false);
+                if try_activate() {
+                    return true;
+                }
+            }
+        }
+
+        SwitchToThisWindow(hwnd, true);
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+
+        if hwnd_owns_foreground(hwnd) {
+            return true;
+        }
+
+        let fg = GetForegroundWindow();
+        let mut fg_pid = 0u32;
+        let fg_cls = if fg.is_invalid() {
+            "none".to_string()
+        } else {
+            GetWindowThreadProcessId(fg, Some(&mut fg_pid));
+            let mut buf = [0u8; 64];
+            let len = GetClassNameA(fg, &mut buf).max(0) as usize;
+            String::from_utf8_lossy(&buf[..len]).into_owned()
+        };
+        let fg_info = classify_shell_flyout(fg);
+        let visible = IsWindowVisible(hwnd).as_bool();
+        crate::diagnostics::log(&format!(
+            "focus: force_foreground failed for hwnd={:?} visible={} fg={:?} fg_class={} fg_pid={} fg_vis={} fg_cloaked={} attach_fg={} alt_seen={}",
+            hwnd.0,
+            visible,
+            fg.0,
+            fg_cls,
+            fg_pid,
+            fg_info.visible,
+            fg_info.cloaked,
+            last_attach_fg,
+            last_alt_seen
+        ));
+        false
+    }
+}
+
+/// Prevent non-focusable chrome windows from activating on mouse click even when WebView2 handles input.
+pub fn install_noactivate_subclass(hwnd: HWND) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+        use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, MA_NOACTIVATE, WM_MOUSEACTIVATE, WM_NCDESTROY};
+
+        const NOACTIVATE_SUBCLASS_ID: usize = 0x4E41_4354;
+
+        unsafe extern "system" fn noactivate_proc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+            id: usize,
+            _data: usize,
+        ) -> LRESULT {
+            if msg == WM_MOUSEACTIVATE {
+                let allow_focus = !hwnd.0.is_null()
+                    && crate::state::KEYBOARD_FOCUS_HWND.load(std::sync::atomic::Ordering::Relaxed)
+                        == hwnd.0 as isize;
+                if !allow_focus {
+                    return LRESULT(MA_NOACTIVATE as isize);
+                }
+            } else if msg == WM_NCDESTROY {
+                let _ = RemoveWindowSubclass(hwnd, Some(noactivate_proc), id);
+            }
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+
+        if IsWindow(Some(hwnd)).as_bool() {
+            let _ = SetWindowSubclass(hwnd, Some(noactivate_proc), NOACTIVATE_SUBCLASS_ID, 0);
+        }
+    }
+}
+
+/// Re-assert HWND_TOPMOST without activating the window, checking per-HWND keyboard focus.
 pub fn re_assert_topmost(hwnd: HWND) {
+    let keep_focusable = !hwnd.0.is_null()
+        && crate::state::KEYBOARD_FOCUS_HWND.load(std::sync::atomic::Ordering::Relaxed) == hwnd.0 as isize;
+    re_assert_topmost_with_focus(hwnd, keep_focusable);
+}
+
+/// Re-assert HWND_TOPMOST with explicit focusability control.
+pub fn re_assert_topmost_with_focus(hwnd: HWND, keep_focusable: bool) {
+    if hwnd.0.is_null() {
+        return;
+    }
     unsafe {
         use windows::Win32::UI::WindowsAndMessaging::{
             SetWindowPos, GetWindowLongPtrW, SetWindowLongPtrW,
@@ -581,10 +1592,14 @@ pub fn re_assert_topmost(hwnd: HWND) {
         // Re-stamp NOACTIVATE + TOOLWINDOW — HWND_TOPMOST can cause these to be reset
         // by the shell on some Windows builds
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as usize;
-        let keep_focusable = crate::state::KEYBOARD_FOCUS_LABEL.lock().ok().is_some_and(|l| l.is_some());
-        let noactivate = if keep_focusable { 0 } else { WS_EX_NOACTIVATE.0 as usize };
-        let new_ex = ex | noactivate | WS_EX_TOOLWINDOW.0 as usize;
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
+        let new_ex = if keep_focusable {
+            (ex & !(WS_EX_NOACTIVATE.0 as usize)) | WS_EX_TOOLWINDOW.0 as usize
+        } else {
+            ex | WS_EX_NOACTIVATE.0 as usize | WS_EX_TOOLWINDOW.0 as usize
+        };
+        if new_ex != ex {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
+        }
     }
 }
 
@@ -592,20 +1607,35 @@ fn mostly_painted(pixels: &[u8]) -> bool {
     pixels.chunks_exact(4).step_by(7).filter(|c| c[0] != 0 || c[1] != 0 || c[2] != 0).count() * 50 > pixels.len() / 28
 }
 
-fn encode_thumbnail(mut pixels: Vec<u8>, width: u32, height: u32, max_width: u32, max_height: u32) -> Option<String> {
-    for chunk in pixels.chunks_exact_mut(4) {
-        chunk.swap(0, 2);
-        chunk[3] = 255;
+fn encode_thumbnail(pixels: Vec<u8>, width: u32, height: u32, max_width: u32, max_height: u32) -> Option<String> {
+    if width == 0 || height == 0 || max_width == 0 || max_height == 0 {
+        return None;
     }
-    let mut img = image::RgbaImage::from_raw(width, height, pixels)?;
+    let expected = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    if pixels.len() < expected {
+        return None;
+    }
+    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    for chunk in pixels[..expected].chunks_exact(4) {
+        rgb.push(chunk[2]);
+        rgb.push(chunk[1]);
+        rgb.push(chunk[0]);
+    }
+    let mut img = image::RgbImage::from_raw(width, height, rgb)?;
     if img.width() > max_width || img.height() > max_height {
-        let dyn_img = image::DynamicImage::ImageRgba8(img);
-        img = dyn_img.resize(max_width, max_height, image::imageops::FilterType::Lanczos3).into_rgba8();
+        let dyn_img = image::DynamicImage::ImageRgb8(img);
+        img = dyn_img
+            .resize(max_width, max_height, image::imageops::FilterType::Triangle)
+            .into_rgb8();
     }
-    let mut buf = std::io::Cursor::new(Vec::new());
-    image::write_buffer_with_format(&mut buf, &img, img.width(), img.height(), image::ColorType::Rgba8, image::ImageFormat::Png).ok()?;
+    let mut out = Vec::with_capacity(8192);
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 82);
+    img.write_with_encoder(encoder).ok()?;
     use base64::Engine;
-    Some(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(buf.into_inner())))
+    Some(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(out)
+    ))
 }
 
 /// Captures an HWND to a base64-encoded PNG thumbnail, scaling it down if it exceeds max_width x max_height.
@@ -684,26 +1714,10 @@ pub fn capture_hwnd_to_base64(hwnd: HWND, max_width: u32, max_height: u32) -> Op
 
         let mut result = None;
         if captured {
-            for chunk in pixels.chunks_exact_mut(4) {
-                chunk.swap(0, 2);
-                chunk[3] = 255;
-            }
-            if let Ok(Some(png_base64)) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Some(mut img) = image::RgbaImage::from_raw(width as u32, height as u32, pixels) {
-                    if img.width() > max_width || img.height() > max_height {
-                        let dyn_img = image::DynamicImage::ImageRgba8(img);
-                        img = dyn_img.resize(max_width, max_height, image::imageops::FilterType::Lanczos3).into_rgba8();
-                    }
-                    let mut buf = std::io::Cursor::new(Vec::new());
-                    if image::write_buffer_with_format(&mut buf, &img, img.width(), img.height(), image::ColorType::Rgba8, image::ImageFormat::Png).is_ok() {
-                        use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
-                        return Some(format!("data:image/png;base64,{}", b64));
-                    }
-                }
-                None
+            if let Ok(encoded) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                encode_thumbnail(pixels, width as u32, height as u32, max_width, max_height)
             })) {
-                result = Some(png_base64);
+                result = encoded;
             }
         }
         SelectObject(hdc_mem, h_old);
@@ -732,6 +1746,10 @@ pub fn get_shortcut_icon_location(path: &str) -> Option<String> {
         if raw.is_empty() { return None; }
 
         let location = expand_env_vars(&raw);
+        let lower = location.to_lowercase();
+        if lower.contains("\\tinted-icons\\") || lower.contains("/tinted-icons/") {
+            return None;
+        }
         let ext = std::path::Path::new(&location).extension()?.to_str()?.to_lowercase();
         if !matches!(ext.as_str(), "ico" | "png" | "jpg" | "jpeg" | "bmp" | "webp" | "gif") { return None; }
         if !std::path::Path::new(&location).exists() { return None; }
@@ -790,18 +1808,24 @@ pub fn image_file_to_base64(path: &str) -> Option<String> {
     Some(format!("data:image/png;base64,{}", general_purpose::STANDARD.encode(&png)))
 }
 
-/// True for real fullscreen: client area covers the monitor and it isn't a captioned maximized window.
+/// True for real fullscreen: client area covers the monitor (or D3D fullscreen) and it isn't maximized.
 pub fn is_window_fullscreen(hwnd: HWND) -> bool {
     unsafe {
         use windows::Win32::Foundation::{POINT, RECT};
         use windows::Win32::Graphics::Gdi::{ClientToScreen, GetMonitorInfoA, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
-        use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowLongW, IsZoomed, GWL_STYLE, WS_CAPTION, WS_MAXIMIZE};
+        use windows::Win32::UI::Shell::{QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
+        use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetForegroundWindow, GetWindowLongW, IsZoomed, GWL_STYLE, WS_MAXIMIZE};
 
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         if monitor.is_invalid() { return false; }
         let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         if !GetMonitorInfoA(monitor, &mut info).as_bool() { return false; }
         let screen = info.rcMonitor;
+
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        if IsZoomed(hwnd).as_bool() || (style & WS_MAXIMIZE.0) != 0 {
+            return false;
+        }
 
         let mut client = RECT::default();
         if GetClientRect(hwnd, &mut client).is_err() { return false; }
@@ -810,12 +1834,14 @@ pub fn is_window_fullscreen(hwnd: HWND) -> bool {
         let _ = ClientToScreen(hwnd, &mut top_left);
         let _ = ClientToScreen(hwnd, &mut bottom_right);
 
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        let is_maximized_standard = (IsZoomed(hwnd).as_bool() || (style & WS_MAXIMIZE.0) != 0) && (style & WS_CAPTION.0) != 0;
-
         let client_fullscreen = top_left.x <= screen.left && top_left.y <= screen.top
             && bottom_right.x >= screen.right && bottom_right.y >= screen.bottom;
-        client_fullscreen && !is_maximized_standard
+        if client_fullscreen {
+            return true;
+        }
+
+        hwnd == GetForegroundWindow()
+            && SHQueryUserNotificationState().is_ok_and(|s| s == QUNS_RUNNING_D3D_FULL_SCREEN)
     }
 }
 
@@ -936,12 +1962,21 @@ pub fn get_window_app_user_model_id(hwnd: HWND) -> Option<String> {
 
         let store: IPropertyStore = SHGetPropertyStoreForWindow(hwnd).ok()?;
         let mut prop = store.GetValue(&PKEY_APP_USER_MODEL_ID).ok()?;
-        let result = PropVariantToStringAlloc(&prop)
-            .ok()
-            .map(|pwstr| String::from_utf16_lossy(pwstr.as_wide()).trim().to_string());
+        let result = PropVariantToStringAlloc(&prop).ok().map(|pwstr| {
+            let s = String::from_utf16_lossy(pwstr.as_wide()).trim().to_string();
+            windows::Win32::System::Com::CoTaskMemFree(Some(pwstr.0 as *const _));
+            s
+        });
         let _ = PropVariantClear(&mut prop);
         result.filter(|s| !s.is_empty())
     }
+}
+
+/// HBITMAP to straight-alpha RGBA image.
+pub(crate) unsafe fn hbitmap_to_rgba(hbitmap: windows::Win32::Graphics::Gdi::HBITMAP) -> Option<image::RgbaImage> {
+    let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+    let bitmap = factory.CreateBitmapFromHBITMAP(hbitmap, windows::Win32::Graphics::Gdi::HPALETTE::default(), windows::Win32::Graphics::Imaging::WICBitmapUsePremultipliedAlpha).ok()?;
+    wic_source_to_rgba(&factory, &bitmap.cast().ok()?, true)
 }
 
 /// HBITMAP to base64 PNG.
@@ -975,12 +2010,18 @@ unsafe fn wic_bitmap_to_base64(factory: &IWICImagingFactory, bitmap: &windows::W
     let hglobal = GetHGlobalFromStream(&stream).ok()?;
     let ptr = windows::Win32::System::Memory::GlobalLock(hglobal);
     let size = windows::Win32::System::Memory::GlobalSize(hglobal);
-    
+    if ptr.is_null() || size == 0 {
+        if !ptr.is_null() {
+            let _ = windows::Win32::System::Memory::GlobalUnlock(hglobal);
+        }
+        return None;
+    }
+
     let data = std::slice::from_raw_parts(ptr as *const u8, size);
     let base64_str = general_purpose::STANDARD.encode(data);
-    
+
     let _ = windows::Win32::System::Memory::GlobalUnlock(hglobal);
-    
+
     Some(format!("data:image/png;base64,{}", base64_str))
 }
 
@@ -1039,5 +2080,128 @@ mod tests {
         assert_eq!(resolve_executable_path("C:\\Windows\\notepad.exe"), None);
         assert_eq!(resolve_executable_path("nectar-definitely-not-installed"), None);
         assert_eq!(resolve_executable_path(""), None);
+    }
+
+    #[test]
+    fn json_setting_str_converts_bool_and_number() {
+        use super::json_value_to_string;
+        use serde_json::json;
+
+        assert_eq!(json_value_to_string(&json!("smart")), Some("smart".to_string()));
+        assert_eq!(json_value_to_string(&json!(true)), Some("true".to_string()));
+        assert_eq!(json_value_to_string(&json!(false)), Some("false".to_string()));
+        assert_eq!(json_value_to_string(&json!(1.25)), Some("1.25".to_string()));
+        assert_eq!(json_value_to_string(&json!(6)), Some("6".to_string()));
+        assert_eq!(json_value_to_string(&json!(null)), None);
+    }
+
+    #[test]
+    fn alt_guard_holds_across_activation_and_releases_after() {
+        use std::cell::RefCell;
+
+        struct TraceGuard<'a>(&'a RefCell<Vec<&'static str>>);
+        impl<'a> Drop for TraceGuard<'a> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("release");
+            }
+        }
+
+        for result in [true, false] {
+            let trace = RefCell::new(Vec::new());
+            let out = super::run_with_guard(
+                || {
+                    trace.borrow_mut().push("press");
+                    TraceGuard(&trace)
+                },
+                || {
+                    trace.borrow_mut().push("activate");
+                    result
+                },
+            );
+            assert_eq!(out, result);
+            assert_eq!(*trace.borrow(), vec!["press", "activate", "release"]);
+        }
+    }
+
+    #[test]
+    fn flyout_dismiss_wait_allows_post_cloak_foreground_transfer() {
+        use super::should_keep_waiting_for_flyout_dismiss;
+
+        // Once foreground moved off the flyout, stop waiting immediately regardless of cloak state.
+        assert!(!should_keep_waiting_for_flyout_dismiss(false, 0, 0));
+        assert!(!should_keep_waiting_for_flyout_dismiss(false, 2, 0));
+
+        // Still uncloaked and still foreground: keep waiting.
+        assert!(should_keep_waiting_for_flyout_dismiss(true, 0, 0));
+        assert!(should_keep_waiting_for_flyout_dismiss(true, 0, 10));
+
+        // Cloaked (e.g. DWM_CLOAKED_SHELL=2) while still foreground: allow bounded post-cloak polls, then stop.
+        assert!(should_keep_waiting_for_flyout_dismiss(true, 2, 0));
+        assert!(should_keep_waiting_for_flyout_dismiss(true, 2, 5));
+        assert!(!should_keep_waiting_for_flyout_dismiss(true, 2, 6));
+    }
+
+    #[test]
+    fn uia_set_focus_guard_blocks_stale_hidden_or_user_foreground() {
+        use super::should_execute_uia_set_focus;
+
+        assert!(should_execute_uia_set_focus(true, true, true));
+        assert!(!should_execute_uia_set_focus(false, true, true));
+        assert!(!should_execute_uia_set_focus(true, false, true));
+        assert!(!should_execute_uia_set_focus(true, true, false));
+    }
+
+    #[test]
+    fn blocked_attach_exes_rejects_overlays_and_wer() {
+        use super::is_blocked_attach_exe;
+
+        assert!(is_blocked_attach_exe("amdow.exe"));
+        assert!(is_blocked_attach_exe("AMDOW.EXE"));
+        assert!(is_blocked_attach_exe("WerFault.exe"));
+        assert!(is_blocked_attach_exe("  rtss.exe  "));
+        assert!(is_blocked_attach_exe("GameBar.exe"));
+        assert!(!is_blocked_attach_exe("explorer.exe"));
+        assert!(!is_blocked_attach_exe("notepad.exe"));
+        assert!(!is_blocked_attach_exe(""));
+    }
+
+    #[test]
+    fn atomic_write_helper_replaces_file_cleanly() {
+        use super::write_atomic_bytes;
+
+        let dir = std::env::temp_dir().join(format!("nectar-atomic-test-{}", std::process::id()));
+        let target = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        write_atomic_bytes(&target, br#"{"v":1}"#).expect("initial atomic write");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"v":1}"#);
+
+        write_atomic_bytes(&target, br#"{"v":2}"#).expect("overwrite atomic write");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"v":2}"#);
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "expected zero leftover temp files");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_start_exe_classifier_matches_windows_start_hosts() {
+        use super::is_native_start_or_search_exe;
+
+        for exe in [
+            "startmenuexperiencehost.exe",
+            "searchhost.exe",
+            "searchapp.exe",
+            "searchui.exe",
+        ] {
+            assert!(is_native_start_or_search_exe(exe));
+        }
+        assert!(!is_native_start_or_search_exe("shellexperiencehost.exe"));
+        assert!(!is_native_start_or_search_exe("explorer.exe"));
+        assert!(!is_native_start_or_search_exe("nectar.exe"));
     }
 }

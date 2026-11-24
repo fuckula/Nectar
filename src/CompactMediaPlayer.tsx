@@ -7,6 +7,7 @@ import { PlayIcon, PauseIcon, SkipBackIcon, SkipForwardIcon, MusicNoteIcon, Spea
 import { ChevronRight } from 'lucide-react';
 import { MediaSourceButton, type MediaSession } from "./components/MediaSourceButton";
 import { setVisibleInterval } from "./hooks/visibleInterval";
+import { useSurfaceMetrics } from './hooks/useSurfaceMetrics';
 
 interface MediaInfo {
   title: string;
@@ -124,6 +125,7 @@ export function CompactMediaPlayer({
   onNextPanel,
 }: CompactMediaPlayerProps) {
   const t = useT();
+  const { scaleSpring, scaleDuration } = useSurfaceMetrics();
 
   const scrollVolume = (e: React.WheelEvent) => {
     if (localStorage.getItem("nectar-notch-scroll-volume") !== "true") return;
@@ -142,6 +144,7 @@ export function CompactMediaPlayer({
   const backendPosRef = useRef(positionMs);
   const backendTimeRef = useRef(positionUpdatedAt || Date.now());
   const isSeekingRef = useRef(false);
+  const activeSeekPointerRef = useRef<number | null>(null);
 
   // Update refs when backend sends new position (ignore during seek)
   useEffect(() => {
@@ -156,6 +159,8 @@ export function CompactMediaPlayer({
     const elapsed = Date.now() - (positionUpdatedAt || Date.now());
     return Math.min(positionMs + (isPlaying ? elapsed : 0), durationMs || Infinity);
   });
+  const displayPositionRef = useRef(displayPosition);
+  displayPositionRef.current = displayPosition;
 
   // Tick: extrapolate position every 250ms
   useEffect(() => {
@@ -171,23 +176,67 @@ export function CompactMediaPlayer({
     return () => clearInterval(interval);
   }, [isPlaying, durationMs]);
 
-  // Seek handlers
-  const handleSeekStart = useCallback(() => {
+  const releaseSeekCapture = (el: HTMLInputElement, pointerId: number) => {
+    try {
+      if (el.hasPointerCapture(pointerId)) {
+        el.releasePointerCapture(pointerId);
+      }
+    } catch {
+      // Ignore if pointer capture is unavailable or already released
+    }
+  };
+
+  // Seek handlers using Pointer Capture so dragging off-element never leaves isSeeking stuck
+  const handleSeekPointerDown = useCallback((e: React.PointerEvent<HTMLInputElement>) => {
+    e.stopPropagation();
     isSeekingRef.current = true;
+    activeSeekPointerRef.current = e.pointerId;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // Ignore if pointer capture is unsupported
+    }
   }, []);
 
   const handleSeekChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    setDisplayPosition(Number(e.target.value));
+    const nextPos = Number(e.target.value);
+    displayPositionRef.current = nextPos;
+    setDisplayPosition(nextPos);
   }, []);
 
-  const handleSeekEnd = useCallback(() => {
-    const seekPos = displayPosition;
+  const handleSeekPointerUp = useCallback((e: React.PointerEvent<HTMLInputElement>) => {
+    const wasSeeking = isSeekingRef.current;
     isSeekingRef.current = false;
-    // Update backend refs to the seek position so extrapolation continues from there
+    if (activeSeekPointerRef.current === e.pointerId) {
+      activeSeekPointerRef.current = null;
+    }
+    releaseSeekCapture(e.currentTarget, e.pointerId);
+    if (!wasSeeking) return;
+    const seekPos = Number(e.currentTarget.value);
+    displayPositionRef.current = seekPos;
+    setDisplayPosition(seekPos);
     backendPosRef.current = seekPos;
     backendTimeRef.current = Date.now();
     invoke('media_seek', { positionMs: seekPos }).catch(() => {});
-  }, [displayPosition]);
+  }, []);
+
+  const handleSeekPointerCancel = useCallback((e: React.PointerEvent<HTMLInputElement>) => {
+    isSeekingRef.current = false;
+    if (activeSeekPointerRef.current === e.pointerId) {
+      activeSeekPointerRef.current = null;
+    }
+    releaseSeekCapture(e.currentTarget, e.pointerId);
+  }, []);
+
+  const handleSeekLostCapture = useCallback(() => {
+    activeSeekPointerRef.current = null;
+    if (!isSeekingRef.current) return;
+    isSeekingRef.current = false;
+    const seekPos = seekRef.current ? Number(seekRef.current.value) : displayPositionRef.current;
+    backendPosRef.current = seekPos;
+    backendTimeRef.current = Date.now();
+    invoke('media_seek', { positionMs: seekPos }).catch(() => {});
+  }, []);
 
   const progressPercent = durationMs > 0 ? (displayPosition / durationMs) * 100 : 0;
 
@@ -206,7 +255,7 @@ export function CompactMediaPlayer({
                 initial={{ rotateY: 90, opacity: 0 }}
                 animate={{ rotateY: 0, opacity: 1 }}
                 exit={{ rotateY: -90, opacity: 0 }}
-                transition={{ duration: 0.3, ease: "easeInOut" }}
+                transition={{ duration: scaleDuration(0.3), ease: "easeInOut" }}
               />
             ) : (
               <motion.div
@@ -215,7 +264,7 @@ export function CompactMediaPlayer({
                 initial={{ rotateY: 90, opacity: 0 }}
                 animate={{ rotateY: 0, opacity: 1 }}
                 exit={{ rotateY: -90, opacity: 0 }}
-                transition={{ duration: 0.3, ease: "easeInOut" }}
+                transition={{ duration: scaleDuration(0.3), ease: "easeInOut" }}
               >
                 <MusicNoteIcon size={22} />
               </motion.div>
@@ -250,11 +299,11 @@ export function CompactMediaPlayer({
                 max={durationMs}
                 step={100}
                 value={displayPosition}
-                onMouseDown={handleSeekStart}
-                onTouchStart={handleSeekStart}
+                onPointerDown={handleSeekPointerDown}
                 onChange={handleSeekChange}
-                onMouseUp={handleSeekEnd}
-                onTouchEnd={handleSeekEnd}
+                onPointerUp={handleSeekPointerUp}
+                onPointerCancel={handleSeekPointerCancel}
+                onLostPointerCapture={handleSeekLostCapture}
                 onClick={(e) => e.stopPropagation()}
               />
             )}
@@ -290,7 +339,7 @@ export function CompactMediaPlayer({
                 initial={{ opacity: 0, scale: 0.7 }}
                 animate={{ opacity: 1, scale: 1 }}
                 exit={{ opacity: 0, scale: 0.7 }}
-                transition={{ duration: 0.12 }}
+                transition={{ duration: scaleDuration(0.12) }}
                 style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}
               >
                 {isPlaying ? <PauseIcon size={26} /> : <PlayIcon size={26} />}
@@ -327,7 +376,7 @@ export function CompactMediaPlayer({
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: 36, opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
-            transition={{ type: "spring", stiffness: 500, damping: 30 }}
+            transition={scaleSpring({ type: "spring", stiffness: 500, damping: 30 })}
           >
             <div className="cmp-volume-row" onWheel={scrollVolume}>
               <VolumeLowIcon size={14} style={{ opacity: 0.65, flexShrink: 0 }} />

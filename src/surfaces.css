@@ -11,6 +11,115 @@
 
 :root {
     --surface-grain: linear-gradient(transparent, transparent);
+
+    --nectar-font-sans: 'Segoe UI Variable Text', 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+    --nectar-font-mono: 'Cascadia Mono', 'JetBrains Mono', Consolas, ui-monospace, monospace;
+    --nectar-glass-blur-mult: 1;
+    --nectar-popover-blur: calc(16px * var(--nectar-glass-blur-mult, 1));
+    --nectar-edge-intensity: 1;
+    --nectar-rim-alpha: 0.22;
+    --nectar-radius-scale: 1;
+    --nectar-motion-scale: 1;
+    --nectar-ease: cubic-bezier(0.22, 1.15, 0.32, 1);
+
+    --nectar-icon-tint-filter: none;
+    --nectar-icon-tile-bg: transparent;
+    --nectar-icon-tile-border: transparent;
+    --nectar-icon-tile-shadow: none;
+    --nectar-icon-tile-radius: 27%;
+
+    --shell-popover-hover-shadow: none;
+
+    --density-pad: 12px;
+    --density-gap: 8px;
+    --density-row-h: 40px;
+
+    --shell-radius: clamp(12px, calc(20px * var(--nectar-radius-scale, 1)), 32px);
+    --shell-inner-radius: clamp(8px, calc(12px * var(--nectar-radius-scale, 1)), 20px);
+    --shell-chip-radius: clamp(6px, calc(10px * var(--nectar-radius-scale, 1)), 16px);
+
+    --shell-accent: var(--nectar-accent, #0a84ff);
+    --shell-highlight: var(--nectar-highlight, var(--nectar-accent, #0a84ff));
+    /* WCAG-safe accent ink: lifts dark accents in dark mode, deepens pastel accents in light mode */
+    --shell-accent-ink: color-mix(in srgb, var(--shell-accent) 74%, #ffffff);
+    --shell-divider: rgba(255, 255, 255, 0.08);
+    --shell-divider-strong: rgba(255, 255, 255, 0.13);
+    --shell-card-bg: rgba(255, 255, 255, 0.048);
+    --shell-card-bg-hover: rgba(255, 255, 255, 0.095);
+    --shell-card-border: rgba(255, 255, 255, 0.085);
+    --shell-card-border-hover: rgba(255, 255, 255, 0.17);
+    --shell-well-bg: rgba(255, 255, 255, 0.075);
+    --shell-well-border: rgba(255, 255, 255, 0.1);
+    --shell-footer-bg: rgba(0, 0, 0, 0.10);
+    --shell-kbd-bg: rgba(255, 255, 255, 0.085);
+    --shell-kbd-border: rgba(255, 255, 255, 0.16);
+    --shell-kbd-shadow: 0 1px 0 rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+    --shell-focus-ring: 0 0 0 2px color-mix(in srgb, var(--shell-accent) 76%, #ffffff);
+
+    --shell-popover-bg: var(--nectar-bg-elevated, rgba(22, 23, 29, 0.97));
+    --shell-popover-border: rgba(255, 255, 255, 0.14);
+    --shell-popover-hover-bg: color-mix(in srgb, var(--shell-accent) 22%, rgba(255, 255, 255, 0.09));
+    --shell-popover-hover-border: color-mix(in srgb, var(--shell-accent) 38%, transparent);
+    --shell-popover-shadow:
+        0 20px 48px rgba(0, 0, 0, 0.58),
+        0 4px 12px rgba(0, 0, 0, 0.34),
+        inset 0 1px 0 rgba(255, 255, 255, 0.14);
+}
+
+body {
+    font-family: var(--nectar-font-sans);
+}
+
+:root[data-density="compact"] {
+    --density-pad: 8px;
+    --density-gap: 5px;
+    --density-row-h: 34px;
+}
+
+:root[data-density="comfortable"] {
+    --density-pad: 12px;
+    --density-gap: 8px;
+    --density-row-h: 40px;
+}
+
+:root[data-density="spacious"] {
+    --density-pad: 16px;
+    --density-gap: 11px;
+    --density-row-h: 46px;
+}
+
+::selection {
+    background: var(--nectar-selection-bg, rgba(10, 132, 255, 0.3));
+    color: inherit;
+}
+
+.nectar-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--nectar-scrollbar-thumb, rgba(255, 255, 255, 0.18)) transparent;
+}
+
+.nectar-scroll::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+.nectar-scroll::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.nectar-scroll::-webkit-scrollbar-thumb {
+    background: var(--nectar-scrollbar-thumb, rgba(255, 255, 255, 0.18));
+    border-radius: 999px;
+}
+
+.nectar-scroll::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in srgb, var(--nectar-scrollbar-thumb, rgba(255, 255, 255, 0.2)) 75%, var(--nectar-text, #ffffff));
+}
+
+.nectar-scroll::-webkit-scrollbar-button {
+    display: none;
+    width: 0;
+    height: 0;
 }
 
 .surface-fill {
@@ -54,7 +163,31 @@
 }
 
 :root.light-mode {
-    --surface-outline: rgba(0, 0, 0, 0.14);
+    --surface-outline: rgba(0, 0, 0, clamp(0, calc(0.14 * var(--nectar-edge-intensity, 1)), 0.55));
+
+    --shell-accent-ink: color-mix(in srgb, var(--shell-accent) 56%, #101016);
+    --shell-divider: rgba(15, 23, 42, 0.085);
+    --shell-divider-strong: rgba(15, 23, 42, 0.13);
+    --shell-card-bg: rgba(15, 23, 42, 0.036);
+    --shell-card-bg-hover: rgba(15, 23, 42, 0.068);
+    --shell-card-border: rgba(15, 23, 42, 0.08);
+    --shell-card-border-hover: rgba(15, 23, 42, 0.14);
+    --shell-well-bg: rgba(255, 255, 255, 0.74);
+    --shell-well-border: rgba(15, 23, 42, 0.09);
+    --shell-footer-bg: rgba(15, 23, 42, 0.036);
+    --shell-kbd-bg: rgba(255, 255, 255, 0.86);
+    --shell-kbd-border: rgba(15, 23, 42, 0.14);
+    --shell-kbd-shadow: 0 1px 0 rgba(15, 23, 42, 0.11), inset 0 1px 0 rgba(255, 255, 255, 0.92);
+    --shell-focus-ring: 0 0 0 2px color-mix(in srgb, var(--shell-accent) 68%, #101016);
+
+    --shell-popover-bg: color-mix(in srgb, var(--nectar-bg-elevated, rgba(250, 250, 253, 0.96)) 90%, #ffffff);
+    --shell-popover-border: rgba(15, 23, 42, 0.12);
+    --shell-popover-hover-bg: color-mix(in srgb, var(--shell-accent) 16%, rgba(15, 23, 42, 0.05));
+    --shell-popover-hover-border: color-mix(in srgb, var(--shell-accent) 34%, transparent);
+    --shell-popover-shadow:
+        0 16px 38px rgba(15, 23, 42, 0.16),
+        0 3px 10px rgba(15, 23, 42, 0.07),
+        inset 0 1px 0 rgba(255, 255, 255, 0.92);
 }
 
 :root.style-material {
@@ -148,22 +281,22 @@
     --backdrop-y: var(--backdrop-bottom);
 }
 
-/* Frosted: milky haze and a thin top sheen */
+/* Frosted: subtle haze and a thin top sheen without washing out custom dark hues */
 :root.style-frosted .surface-fill {
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), inset 0 0 0 999px rgba(255, 255, 255, 0.13);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), inset 0 0 0 999px rgba(255, 255, 255, 0.04);
 }
 
 :root.style-frosted.light-mode .surface-fill {
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6), inset 0 0 0 999px rgba(255, 255, 255, 0.33);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6), inset 0 0 0 999px rgba(255, 255, 255, 0.24);
 }
 
 /* The notch hangs from the top edge of the screen, so it has no top sheen line */
 :root.style-frosted .nectar > .surface-fill {
-    box-shadow: inset 0 0 0 999px rgba(255, 255, 255, 0.13);
+    box-shadow: inset 0 0 0 999px rgba(255, 255, 255, 0.04);
 }
 
 :root.style-frosted.light-mode .nectar > .surface-fill {
-    box-shadow: inset 0 0 0 999px rgba(255, 255, 255, 0.33);
+    box-shadow: inset 0 0 0 999px rgba(255, 255, 255, 0.24);
 }
 
 /* Liquid: clear body, sheen and depth. The notch hangs from the top edge and the dock sits on the
@@ -273,10 +406,245 @@
 }
 
 :root:is(.style-frosted, .style-liquid) .dock:not(.dock-icon-only) .dock-icon {
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
+    background: rgba(255, 255, 255, 0.1);
 }
 
-:root:is(.style-frosted, .style-liquid) .dock:not(.dock-icon-only) .dock-icon {
-    background: rgba(255, 255, 255, 0.1);
+:root.light-mode:is(.style-frosted, .style-liquid) .dock:not(.dock-icon-only) .dock-icon {
+    background: rgba(15, 23, 42, 0.065);
+    border-color: rgba(15, 23, 42, 0.09);
+}
+
+/* ── Floating Shell Surfaces (Launcher, Start Menu, Hidden Tray Bar) ── */
+:where(.nectar-shell-surface) {
+    border-radius: var(--nectar-shell-radius, var(--shell-radius));
+}
+
+.nectar-shell-surface {
+    position: relative;
+    isolation: isolate;
+    overflow: hidden;
+    background-color: var(--nectar-bg-panel, rgba(20, 21, 28, 0.95));
+    color: var(--nectar-text, #ffffff);
+    border: 1px solid rgba(255, 255, 255, clamp(0, calc(0.14 * var(--nectar-edge-intensity, 1)), 0.55));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+    transition: background-color 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
+}
+
+:root.style-frosted .nectar-shell-surface {
+    background-color: var(--nectar-bg-panel, rgba(20, 21, 28, 0.95));
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.055) 0%, rgba(255, 255, 255, 0) 40%);
+    border-color: rgba(255, 255, 255, clamp(0, calc(0.15 * var(--nectar-edge-intensity, 1)), 0.55));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+}
+
+:root.style-liquid .nectar-shell-surface {
+    background-color: var(--nectar-bg-panel, rgba(20, 21, 28, 0.94));
+    background-image:
+        radial-gradient(115% 85% at 50% -18%, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0) 45%);
+    border-color: rgba(255, 255, 255, clamp(0, calc(0.2 * var(--nectar-edge-intensity, 1)), 0.55));
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.24),
+        inset 0 -1px 0 rgba(255, 255, 255, 0.06);
+}
+
+:root.style-material .nectar-shell-surface {
+    background-color: var(--nectar-bg-panel, var(--nectar-bg, rgba(22, 22, 26, 0.96)));
+    background-image: none;
+    border-color: color-mix(
+        in srgb,
+        var(--nectar-border, rgba(255, 255, 255, 0.14)) clamp(0%, calc(100% * var(--nectar-edge-intensity, 1)), 100%),
+        transparent
+    );
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+:root.light-mode .nectar-shell-surface {
+    background-color: var(--nectar-bg-panel, rgba(246, 246, 250, 0.95));
+    color: var(--nectar-text, #16161a);
+    border-color: rgba(15, 23, 42, clamp(0, calc(0.12 * var(--nectar-edge-intensity, 1)), 0.45));
+}
+
+:root.light-mode:not(.style-frosted):not(.style-liquid) .nectar-shell-surface {
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.78);
+}
+
+:root.style-frosted.light-mode .nectar-shell-surface {
+    background-color: var(--nectar-bg-panel, rgba(246, 246, 250, 0.95));
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.42) 0%, rgba(255, 255, 255, 0) 42%);
+    border-color: rgba(15, 23, 42, clamp(0, calc(0.12 * var(--nectar-edge-intensity, 1)), 0.45));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.88);
+}
+
+:root.style-liquid.light-mode .nectar-shell-surface {
+    background-color: var(--nectar-bg-panel, rgba(246, 246, 250, 0.94));
+    background-image:
+        radial-gradient(115% 85% at 50% -18%, rgba(255, 255, 255, 0.45), rgba(255, 255, 255, 0) 45%);
+    border-color: rgba(15, 23, 42, clamp(0, calc(0.12 * var(--nectar-edge-intensity, 1)), 0.45));
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.95),
+        inset 0 -1px 0 rgba(255, 255, 255, 0.55);
+}
+
+:root.style-material.light-mode .nectar-shell-surface {
+    background-color: var(--nectar-bg-panel, var(--nectar-bg, rgba(246, 246, 250, 0.96)));
+    background-image: none;
+    border-color: color-mix(
+        in srgb,
+        var(--nectar-border, rgba(15, 23, 42, 0.14)) clamp(0%, calc(100% * var(--nectar-edge-intensity, 1)), 100%),
+        transparent
+    );
+}
+
+/* Pure GPU transform/opacity entrance without unmounting the shell surface DOM */
+.shell-anim-surface {
+    will-change: transform, opacity;
+}
+
+.shell-anim-surface.shell-anim-start.is-hidden {
+    opacity: 0;
+    transform: translate3d(0, 14px, 0) scale(0.975);
+    transition: none;
+}
+
+.shell-anim-surface.shell-anim-launcher.is-hidden {
+    opacity: 0;
+    transform: translate3d(0, -10px, 0) scale(0.982);
+    transition: none;
+}
+
+.shell-anim-surface.shell-anim-traybar.is-hidden {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0) scale(0.965);
+    transition: none;
+}
+
+.shell-anim-surface.is-open {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+    transition:
+        transform calc(185ms / max(0.35, var(--nectar-motion-scale, 1))) cubic-bezier(0.22, 1, 0.36, 1),
+        opacity calc(135ms / max(0.35, var(--nectar-motion-scale, 1))) cubic-bezier(0.2, 0, 0, 1),
+        background-color 0.2s ease,
+        border-color 0.2s ease,
+        box-shadow 0.2s ease;
+}
+
+:root.reduced-motion *,
+:root.reduced-motion *::before,
+:root.reduced-motion *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+}
+
+:root.reduced-motion .shell-anim-surface.is-hidden,
+:root.reduced-motion .shell-anim-surface.is-open {
+    transform: none;
+    transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .shell-anim-surface.is-hidden,
+    .shell-anim-surface.is-open {
+        transform: none;
+        transition: none;
+    }
+}
+
+/* Wave 9: Customizable Menu Styles (Glass / Frosted / Solid / Neon Rim) */
+:root[data-menu-style="frosted"] {
+    --nectar-popover-blur: calc(26px * var(--nectar-glass-blur-mult, 1));
+    --shell-popover-bg: color-mix(in srgb, var(--nectar-bg-elevated, rgba(24, 26, 34, 0.86)) 76%, rgba(255, 255, 255, 0.08));
+}
+
+:root.light-mode[data-menu-style="frosted"] {
+    --shell-popover-bg: color-mix(in srgb, rgba(255, 255, 255, 0.84) 78%, var(--nectar-bg-elevated, #f6f7fb));
+}
+
+:root[data-menu-style="solid"] {
+    --nectar-popover-blur: 0px;
+    --shell-popover-bg: color-mix(in srgb, var(--nectar-bg-elevated, #181920) 98%, #101116);
+}
+
+:root.light-mode[data-menu-style="solid"] {
+    --shell-popover-bg: #f7f8fc;
+}
+
+:root[data-menu-style="neon-rim"] {
+    --shell-popover-border: color-mix(in srgb, var(--shell-accent) 62%, transparent);
+    --shell-popover-shadow:
+        0 20px 52px rgba(0, 0, 0, 0.62),
+        0 0 22px color-mix(in srgb, var(--shell-accent) 26%, transparent),
+        inset 0 1px 0 color-mix(in srgb, var(--shell-accent) 34%, rgba(255, 255, 255, 0.2));
+}
+
+:root.light-mode[data-menu-style="neon-rim"] {
+    --shell-popover-border: color-mix(in srgb, var(--shell-accent) 56%, transparent);
+    --shell-popover-shadow:
+        0 16px 38px rgba(15, 23, 42, 0.16),
+        0 0 18px color-mix(in srgb, var(--shell-accent) 20%, transparent),
+        inset 0 1px 0 rgba(255, 255, 255, 0.92);
+}
+
+/* Wave 9: Customizable Menu Hover Styles (Pill / Accent Bar / Glow / Outline) */
+:root[data-menu-hover="accent-bar"] {
+    --shell-popover-hover-bg: color-mix(in srgb, var(--shell-accent) 16%, rgba(255, 255, 255, 0.06));
+    --shell-popover-hover-border: transparent;
+    --shell-popover-hover-shadow: inset 3px 0 0 var(--shell-accent);
+}
+
+:root.light-mode[data-menu-hover="accent-bar"] {
+    --shell-popover-hover-bg: color-mix(in srgb, var(--shell-accent) 14%, rgba(15, 23, 42, 0.04));
+}
+
+:root[data-menu-hover="glow"] {
+    --shell-popover-hover-bg: color-mix(in srgb, var(--shell-accent) 28%, rgba(255, 255, 255, 0.08));
+    --shell-popover-hover-border: color-mix(in srgb, var(--shell-accent) 46%, transparent);
+    --shell-popover-hover-shadow: 0 0 14px color-mix(in srgb, var(--shell-accent) 28%, transparent);
+}
+
+:root[data-menu-hover="outline"] {
+    --shell-popover-hover-bg: color-mix(in srgb, var(--shell-accent) 10%, transparent);
+    --shell-popover-hover-border: color-mix(in srgb, var(--shell-accent) 68%, transparent);
+    --shell-popover-hover-shadow: none;
+}
+
+/* Wave 9: Popover & Context Menu GPU Entrance */
+@keyframes nectarMenuPopIn {
+    from {
+        opacity: 0;
+        transform: translate3d(0, 6px, 0) scale(0.965);
+    }
+    to {
+        opacity: 1;
+        transform: translate3d(0, 0, 0) scale(1);
+    }
+}
+
+.nectar-menu-pop {
+    animation: nectarMenuPopIn calc(165ms / max(0.35, var(--nectar-motion-scale, 1))) var(--nectar-ease, cubic-bezier(0.22, 1.15, 0.32, 1)) both;
+    transform-origin: center bottom;
+}
+
+:root.reduced-motion .nectar-menu-pop {
+    animation: none;
+}
+
+/* Wave 9: Unified Icon Tinting */
+.nectar-tintable-icon {
+    filter: var(--nectar-icon-tint-filter, none);
+    transition: filter 160ms ease;
+}
+
+[data-tint-excluded="true"] .nectar-tintable-icon,
+.nectar-tintable-icon[data-tint-excluded="true"] {
+    filter: none;
+}
+
+:root:not([data-icon-tint="original"]):not([data-icon-tile-shape="none"]) .nectar-tint-tile:not([data-tint-excluded="true"]) {
+    background: var(--nectar-icon-tile-bg) !important;
+    border-color: var(--nectar-icon-tile-border) !important;
+    box-shadow: var(--nectar-icon-tile-shadow);
+    border-radius: var(--nectar-icon-tile-radius, 27%);
 }

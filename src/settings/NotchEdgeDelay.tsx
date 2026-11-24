@@ -1,24 +1,19 @@
-import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { Timer } from "lucide-react";
 import { SettingRow } from "./SettingRow";
 import { Dropdown } from "./Dropdown";
 import { useT } from "../i18n";
+import { useSyncedSetting } from "./useSyncedSetting";
 
 const DELAYS = ["0", "200", "400", "700", "1000", "2000"];
 
+const parseNotchEdgeDelay = (raw: unknown): string => {
+  const s = raw === null || raw === undefined ? "" : String(raw);
+  return DELAYS.includes(s) ? s : "200";
+};
+
 export function NotchEdgeDelay() {
   const t = useT();
-  const [value, setValue] = useState(() => {
-    const saved = localStorage.getItem("nectar-notch-edge-delay");
-    return saved && DELAYS.includes(saved) ? saved : "200";
-  });
-
-  const change = (next: string) => {
-    setValue(next);
-    localStorage.setItem("nectar-notch-edge-delay", next);
-    invoke("save_setting", { key: "nectar-notch-edge-delay", value: next }).catch(() => { });
-  };
+  const [value, change] = useSyncedSetting("nectar-notch-edge-delay", parseNotchEdgeDelay, (v) => v);
 
   return (
     <SettingRow icon={Timer} label={t("notch.edgeDelay")} desc={t("notch.edgeDelay.desc")}>

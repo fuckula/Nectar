@@ -296,6 +296,9 @@ pub async fn caldav_sync_now(app: AppHandle) -> Result<CalendarState, String> {
 }
 
 #[tauri::command]
-pub fn caldav_get_cache(app: AppHandle) -> CalendarState {
-    current_state(&app)
+pub async fn caldav_get_cache(app: AppHandle) -> CalendarState {
+    let app_c = app.clone();
+    tauri::async_runtime::spawn_blocking(move || current_state(&app_c))
+        .await
+        .unwrap_or_else(|_| current_state(&app))
 }

@@ -4,11 +4,13 @@ import { KEYWORDS, SEARCH_ENTRIES, TAB_ENTRIES, TAB_KEYS, type SearchEntry } fro
 type Messages = Record<string, string>;
 
 const LOADERS: Record<string, () => Promise<{ default: Messages }>> = {
+  ru: () => import("../locales/ru.json"),
   tr: () => import("../locales/tr.json"),
   de: () => import("../locales/de.json"),
   ar: () => import("../locales/ar.json"),
   es: () => import("../locales/es.json"),
   fr: () => import("../locales/fr.json"),
+  pl: () => import("../locales/pl.json"),
 };
 
 let catalogs: Promise<Record<string, Messages>> | null = null;

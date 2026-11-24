@@ -9,9 +9,13 @@ import "./surfaces.css";
 import { initTheme } from "./theme";
 import { PlayIcon, PauseIcon, SkipBackIcon, SkipForwardIcon, VolumeLowIcon, VolumeHighIcon, VolumeLevelIcon, MusicNoteIcon } from "./icons";
 import { CompactMediaPlayer } from "./CompactMediaPlayer";
-import { artTheme, FALLBACK_THEME, type ArtTheme } from "./music/palette";
+import { artTheme, FALLBACK_THEME, rgbStringToHex, type ArtTheme } from "./music/palette";
+import { useSurfaceMetrics } from "./hooks/useSurfaceMetrics";
+import { useGameMode } from "./hooks/useGameMode";
+import { bridgeInvoke } from "./utils/tauriBridge";
 import { useWeather } from "./hooks/useWeather";
 import { useSettingsSync } from "./hooks/useSettingsSync";
+import { clearSettingsPreservingOnboarding, hydrateSettingsFromBackend } from "./utils/settingsHydration";
 import { useTrailingThrottle } from "./hooks/useTrailingThrottle";
 import { useCaldav } from "./hooks/useCaldav";
 import { NotchCalendar } from "./components/NotchCalendar";
@@ -168,7 +172,7 @@ function BatteryIcon({ charging, level, threshold = 20 }: { charging: boolean; l
           x="3.8" y="2.5"
           width={Math.max(0.5, (percentage / 100) * 10.4)}
           height="5" rx="1"
-          fill={charging ? "#32D74B" : (percentage <= threshold ? "#FF453A" : "white")}
+          fill={charging ? "#32D74B" : (percentage <= threshold ? "#FF453A" : "currentColor")}
         />
       </svg>
       {/* Charging Bolt - Centered on the battery body */}
@@ -225,9 +229,13 @@ export const Visualizer = memo(function Visualizer({ isPlaying, bars = 5, height
 
     // Frames arrive in bursts faster than the screen refreshes; keep the newest and render it
     // once per frame instead of re-rendering (and restarting the bar springs) for every event.
+    let cancelled = false;
     let latest: number[] | null = null;
     let frame = 0;
-    const unlisten = listen<{ frequencies: number[] }>("audio-visualization", (event) => {
+    let stopVis: (() => void) | undefined;
+
+    listen<{ frequencies: number[] }>("audio-visualization", (event) => {
+      if (cancelled) return;
       // If we receive fewer frequencies than bars, repeat or interpolate
       // If more, slice
       let data = event.payload.frequencies;
@@ -237,13 +245,19 @@ export const Visualizer = memo(function Visualizer({ isPlaying, bars = 5, height
       if (!frame) {
         frame = requestAnimationFrame(() => {
           frame = 0;
-          if (latest) setAudioData(latest);
+          if (!cancelled && latest) setAudioData(latest);
         });
       }
-    });
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else stopVis = fn;
+      })
+      .catch(() => {});
 
     return () => {
-      unlisten.then(fn => fn());
+      cancelled = true;
+      stopVis?.();
       cancelAnimationFrame(frame);
     };
   }, [isPlaying, bars]);
@@ -356,13 +370,23 @@ function TimeDisplay({ hour12 }: { hour12: boolean }) {
   const [text, setText] = useState(format);
 
   useEffect(() => {
-    let timer: number;
-    const tick = () => {
+    let timer: number | undefined;
+    const schedule = () => {
       setText(format());
-      timer = window.setTimeout(tick, 1000 - (Date.now() % 1000));
+      if (document.hidden) return;
+      const delay = 60_000 - (Date.now() % 60_000) + 25;
+      timer = window.setTimeout(schedule, delay);
     };
-    timer = window.setTimeout(tick, 1000 - (Date.now() % 1000));
-    return () => clearTimeout(timer);
+    const onVisibility = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      if (!document.hidden) schedule();
+    };
+    schedule();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      if (timer !== undefined) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, [hour12]);
 
   return <>{text}</>;
@@ -370,6 +394,11 @@ function TimeDisplay({ hour12 }: { hour12: boolean }) {
 
 function App() {
   const t = useT();
+  const { metricsIntervalMs, scaleSpring, scaleDuration, scaledRadius } = useSurfaceMetrics();
+  const { shouldPausePolls, shouldSuppressToasts } = useGameMode();
+  const shouldSuppressToastsRef = useRef(shouldSuppressToasts);
+  shouldSuppressToastsRef.current = shouldSuppressToasts;
+  const scaledShellSpring = useMemo(() => scaleSpring(SHELL_SPRING), [scaleSpring]);
   useEffect(() => {
     return initTheme({ backdrop: true });
   }, []);
@@ -392,17 +421,25 @@ function App() {
   const [showLowBatteryPulse, setShowLowBatteryPulse] = useState(false);
   const [lowBatteryThreshold, setLowBatteryThreshold] = useState(() => parseInt(localStorage.getItem("nectar-low-battery-threshold") || "20"));
   const prevChargingRef = useRef<boolean | null>(null);
-  const powerPulseTimeoutRef = useRef<any>(null);
+  const powerPulseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lowBatteryPulseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lowBatteryPulseShownRef = useRef<boolean>(false);
   const batteryLow = hasBattery && !isCharging && batteryLevel <= lowBatteryThreshold;
 
   const [eventPeek, setEventPeek] = useState(false);
-  const eventPeekTimeoutRef = useRef<any>(null);
-  const updatePulseTimerRef = useRef<any>(null);
+  const eventPeekTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const updatePulseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [dndActive, setDndActive] = useState(() => localStorage.getItem("nectar-dnd-enabled") === "true");
+  const dndActiveRef = useRef(dndActive);
+  dndActiveRef.current = dndActive;
   const triggerEventPeek = useCallback((duration = 3000) => {
+    if (dndActiveRef.current || shouldSuppressToastsRef.current) return;
     setEventPeek(true);
     if (eventPeekTimeoutRef.current) clearTimeout(eventPeekTimeoutRef.current);
-    eventPeekTimeoutRef.current = setTimeout(() => setEventPeek(false), duration);
+    eventPeekTimeoutRef.current = setTimeout(() => {
+      eventPeekTimeoutRef.current = null;
+      setEventPeek(false);
+    }, duration);
   }, []);
 
   const [notchMode, setNotchMode] = useState(() => {
@@ -410,34 +447,67 @@ function App() {
     if (raw === "auto-hide") return "smart";
     return raw;
   });
+  const notchModeRef = useRef(notchMode);
+  notchModeRef.current = notchMode;
 
 
   useEffect(() => {
     if (hasBattery && isReady && prevChargingRef.current !== null && prevChargingRef.current !== isCharging) {
-      setShowPowerPulse(true);
-      if (notchMode === 'peek') triggerEventPeek(4000);
-      if (powerPulseTimeoutRef.current) clearTimeout(powerPulseTimeoutRef.current);
-      powerPulseTimeoutRef.current = setTimeout(() => {
-        setShowPowerPulse(false);
-      }, 4000);
+      if (!shouldSuppressToasts) {
+        setShowPowerPulse(true);
+        if (notchMode === 'peek') triggerEventPeek(4000);
+        if (powerPulseTimeoutRef.current) clearTimeout(powerPulseTimeoutRef.current);
+        powerPulseTimeoutRef.current = setTimeout(() => {
+          powerPulseTimeoutRef.current = null;
+          setShowPowerPulse(false);
+        }, 4000);
+      }
     }
     prevChargingRef.current = isCharging;
-  }, [isCharging, isReady, notchMode, triggerEventPeek, hasBattery]);
+  }, [isCharging, isReady, notchMode, triggerEventPeek, hasBattery, shouldSuppressToasts]);
 
   useEffect(() => {
     // Trigger pulse when dropping below threshold while discharging
     if (hasBattery && isReady && batteryLevel <= lowBatteryThreshold && !isCharging && !lowBatteryPulseShownRef.current) {
-      setShowLowBatteryPulse(true);
-      if (notchMode === 'peek') triggerEventPeek(5000);
       lowBatteryPulseShownRef.current = true;
-      setTimeout(() => setShowLowBatteryPulse(false), 5000);
+      if (!shouldSuppressToasts) {
+        setShowLowBatteryPulse(true);
+        if (notchMode === 'peek') triggerEventPeek(5000);
+        if (lowBatteryPulseTimeoutRef.current) clearTimeout(lowBatteryPulseTimeoutRef.current);
+        lowBatteryPulseTimeoutRef.current = setTimeout(() => {
+          lowBatteryPulseTimeoutRef.current = null;
+          setShowLowBatteryPulse(false);
+        }, 5000);
+      }
     }
 
     // Reset the "shown" state if battery is charged or threshold is lowered
     if (isCharging || batteryLevel > lowBatteryThreshold) {
       lowBatteryPulseShownRef.current = false;
+      if (lowBatteryPulseTimeoutRef.current) {
+        clearTimeout(lowBatteryPulseTimeoutRef.current);
+        lowBatteryPulseTimeoutRef.current = null;
+      }
+      setShowLowBatteryPulse(false);
     }
-  }, [batteryLevel, isCharging, lowBatteryThreshold, isReady, notchMode, triggerEventPeek, hasBattery]);
+  }, [batteryLevel, isCharging, lowBatteryThreshold, isReady, notchMode, triggerEventPeek, hasBattery, shouldSuppressToasts]);
+
+  useEffect(() => {
+    return () => {
+      if (powerPulseTimeoutRef.current) {
+        clearTimeout(powerPulseTimeoutRef.current);
+        powerPulseTimeoutRef.current = null;
+      }
+      if (lowBatteryPulseTimeoutRef.current) {
+        clearTimeout(lowBatteryPulseTimeoutRef.current);
+        lowBatteryPulseTimeoutRef.current = null;
+      }
+      if (eventPeekTimeoutRef.current) {
+        clearTimeout(eventPeekTimeoutRef.current);
+        eventPeekTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
   // Weather state (managed by useWeather hook)
 
@@ -461,7 +531,9 @@ function App() {
   const [wifiStatus, setWifiStatus] = useState<WifiStatus | null>(null);
   const wifiEnabled = wifiStatus?.enabled ?? false;
   const wifiConnected = wifiStatus?.connected ?? false;
-  const [bluetoothEnabled, setBluetoothEnabled] = useState(true);
+  const [bluetoothEnabled, setBluetoothEnabled] = useState(false);
+  const [bluetoothAvailable, setBluetoothAvailable] = useState<boolean | null>(null);
+  const [connectionsInputOpen, setConnectionsInputOpen] = useState(false);
   const [settingsLegacyMode, setSettingsLegacyMode] = useState(() => localStorage.getItem("nectar-legacy-mode") === "true");
   const [ccView, setCcView] = useState<'main' | 'wifi' | 'bluetooth' | 'audio'>('main');
   const showConnections = !settingsLegacyMode && ccView !== 'main';
@@ -497,33 +569,71 @@ function App() {
     let disposed = false;
 
     listen<UpdateCheckResult>("update-available", (event) => {
+      if (disposed) return;
       setUpdateAvailable(event.payload.available);
       if (!event.payload.available) {
         setShowUpdatePulse(false);
-        if (updatePulseTimerRef.current) clearTimeout(updatePulseTimerRef.current);
+        if (updatePulseTimerRef.current) {
+          clearTimeout(updatePulseTimerRef.current);
+          updatePulseTimerRef.current = null;
+        }
         return;
       }
+      if (shouldSuppressToastsRef.current) return;
       setShowUpdatePulse(true);
-      if (notchMode === 'peek') triggerEventPeek(6000);
+      if (notchModeRef.current === 'peek') triggerEventPeek(6000);
       if (updatePulseTimerRef.current) clearTimeout(updatePulseTimerRef.current);
       updatePulseTimerRef.current = setTimeout(() => {
+        updatePulseTimerRef.current = null;
         setShowUpdatePulse(false);
       }, 6000);
-    }).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
-    });
+    })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
 
     invoke<UpdateCheckResult>("get_update_state")
-      .then((state) => setUpdateAvailable(state.available))
+      .then((state) => {
+        if (!disposed) setUpdateAvailable(state.available);
+      })
       .catch((e) => console.error("Failed to read update state:", e));
 
     return () => {
       disposed = true;
       unlisten?.();
-      if (updatePulseTimerRef.current) clearTimeout(updatePulseTimerRef.current);
+      if (updatePulseTimerRef.current) {
+        clearTimeout(updatePulseTimerRef.current);
+        updatePulseTimerRef.current = null;
+      }
     };
-  }, [windowLabel, notchMode, triggerEventPeek]);
+  }, [windowLabel, triggerEventPeek]);
+
+  useEffect(() => {
+    if (shouldSuppressToasts) {
+      setShowPowerPulse(false);
+      setShowLowBatteryPulse(false);
+      setShowUpdatePulse(false);
+      setEventPeek(false);
+      if (powerPulseTimeoutRef.current) {
+        clearTimeout(powerPulseTimeoutRef.current);
+        powerPulseTimeoutRef.current = null;
+      }
+      if (lowBatteryPulseTimeoutRef.current) {
+        clearTimeout(lowBatteryPulseTimeoutRef.current);
+        lowBatteryPulseTimeoutRef.current = null;
+      }
+      if (updatePulseTimerRef.current) {
+        clearTimeout(updatePulseTimerRef.current);
+        updatePulseTimerRef.current = null;
+      }
+      if (eventPeekTimeoutRef.current) {
+        clearTimeout(eventPeekTimeoutRef.current);
+        eventPeekTimeoutRef.current = null;
+      }
+    }
+  }, [shouldSuppressToasts]);
 
   const [isVisible, setIsVisible] = useState(true);
   const [isImpacted, setIsImpacted] = useState(false);
@@ -535,7 +645,7 @@ function App() {
     if (raw === "auto-hide") return "smart";
     return raw;
   });
-  const [dndActive, setDndActive] = useState(false);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [dockEnabled, setDockEnabled] = useState(() => localStorage.getItem("nectar-dock-enabled") !== "false");
   const [isNotchHovered, setIsNotchHovered] = useState(false);
   const [agentActivity, setAgentActivity] = useState<AgentActivity | null>(null);
@@ -557,7 +667,7 @@ function App() {
   const [nectarMode, setNectarMode] = useState<'music' | 'calendar' | 'command-center' | 'status' | 'shelf' | 'agent'>('status');
   const [tourActive, setTourActive] = useState(false);
 
-  const isAnyInteraction = isHovered || isNotchHovered || isEdgeHovered;
+  const isAnyInteraction = isHovered || isNotchHovered || isEdgeHovered || connectionsInputOpen;
   const isHidden = hotkeyHidden || ((notchMode === 'smart' || notchMode === 'peek') && isFullscreen) ||
     (!startupAnimating && !tourActive && !(agentActivity && isNotchWindow) && (
       (notchMode === 'smart' && isOverlapped && interactionState === 'none') ||
@@ -587,32 +697,40 @@ function App() {
     }
   }, [isVisible, isHidden, isNotchWindow]);
 
+  const lastNotchRectSentRef = useRef("");
+  const updateNotchRectRef = useRef<() => void>(() => {});
+
   useEffect(() => {
-    let lastSent = "";
     const updateRect = () => {
-      if (nectarRef.current && isNotchWindow) {
-        const rect = nectarRef.current.getBoundingClientRect();
-        const card = tourActive ? document.querySelector('.tour-bar')?.getBoundingClientRect() : undefined;
-        const left = card ? Math.min(rect.left, card.left) : rect.left;
-        const right = card ? Math.max(rect.right, card.right) : rect.right;
-        const bottom = card ? Math.max(rect.bottom, card.bottom) : rect.bottom;
-        const next = {
-          x: Math.round(left),
-          y: Math.round(rect.y),
-          width: Math.round(right - left),
-          height: Math.round(bottom - rect.y)
-        };
-        const key = `${next.x},${next.y},${next.width},${next.height}`;
-        if (key === lastSent) return;
-        lastSent = key;
-        invoke('update_notch_rect', { rect: next }).catch(() => { lastSent = ""; });
-      }
+      if (!nectarRef.current || !isNotchWindow) return;
+      // C4: Freeze the resting visible pill rect while hidden/collapsed so overlap detection
+      // never oscillates on the 39x29 hidden animation frame.
+      if (isHidden || !isReady || !isExpanded) return;
+      const rect = nectarRef.current.getBoundingClientRect();
+      if (rect.width < 60 * scale || rect.height < 20 || rect.y < -4) return;
+      const card = tourActive ? document.querySelector('.tour-bar')?.getBoundingClientRect() : undefined;
+      const left = card ? Math.min(rect.left, card.left) : rect.left;
+      const right = card ? Math.max(rect.right, card.right) : rect.right;
+      const bottom = card ? Math.max(rect.bottom, card.bottom) : rect.bottom;
+      const next = {
+        x: Math.round(left),
+        y: Math.round(rect.y),
+        width: Math.round(right - left),
+        height: Math.round(bottom - rect.y)
+      };
+      const key = `${next.x},${next.y},${next.width},${next.height}`;
+      if (key === lastNotchRectSentRef.current) return;
+      lastNotchRectSentRef.current = key;
+      invoke('update_notch_rect', { rect: next }).catch(() => { lastNotchRectSentRef.current = ""; });
     };
+    updateNotchRectRef.current = updateRect;
 
     updateRect();
     window.addEventListener('resize', updateRect);
     const observer = new ResizeObserver(updateRect);
     if (nectarRef.current) observer.observe(nectarRef.current);
+    const tourEl = tourActive ? document.querySelector('.tour-bar') : null;
+    if (tourEl) observer.observe(tourEl);
 
     const poll = setVisibleInterval(updateRect, 500);
 
@@ -621,7 +739,7 @@ function App() {
       observer.disconnect();
       clearInterval(poll);
     };
-  }, [isExpanded, isHidden, windowLabel, scale, tourActive]);
+  }, [isReady, isExpanded, isHidden, windowLabel, scale, tourActive, isNotchWindow]);
 
   useEffect(() => {
     if (!windowLabel) return;
@@ -634,19 +752,33 @@ function App() {
       return;
     }
 
+    let cancelled = false;
+    let interval: ReturnType<typeof setInterval> | undefined;
+    let syncTimer: ReturnType<typeof setTimeout> | undefined;
+    let impactTimer: ReturnType<typeof setTimeout> | undefined;
+    let startupTimer: ReturnType<typeof setTimeout> | undefined;
+    let safetyTimer: ReturnType<typeof setTimeout> | undefined;
+    let stopSplash: (() => void) | undefined;
+
     const proceedWithStartup = () => {
+      if (cancelled) return;
       const checkVisibility = async () => {
+        if (cancelled) return false;
         try {
           const win = getCurrentWebviewWindow();
           const visible = await win.isVisible();
+          if (cancelled) return false;
           if (visible) {
             setStartupAnimating(true);
             setIsReady(true);
-            setTimeout(() => {
+            impactTimer = setTimeout(() => {
+              if (cancelled) return;
               setIsImpacted(true);
               setIsExpanded(true);
             }, 240);
-            setTimeout(() => setStartupAnimating(false), 1500);
+            startupTimer = setTimeout(() => {
+              if (!cancelled) setStartupAnimating(false);
+            }, 1500);
             return true;
           }
         } catch (e) { }
@@ -654,43 +786,59 @@ function App() {
       };
 
       let attempts = 0;
-      const interval = setInterval(async () => {
+      interval = setInterval(async () => {
+        if (cancelled) {
+          if (interval) clearInterval(interval);
+          return;
+        }
         attempts++;
         if (attempts > 50 && attempts % 10 !== 0) return;
-        if (await checkVisibility()) clearInterval(interval);
+        if (await checkVisibility() && interval) {
+          clearInterval(interval);
+          interval = undefined;
+        }
       }, 100);
 
-      checkVisibility();
-      return interval;
+      void checkVisibility().then((ok) => {
+        if (ok && interval) {
+          clearInterval(interval);
+          interval = undefined;
+        }
+      });
     };
 
     const DOCK_SYNC_DELAY_MS = 400;
-    const waitForSplash = () => {
-      let started = false;
-      let interval: any;
-      let syncTimer: any;
-      const begin = () => {
-        if (started) return;
-        started = true;
-        syncTimer = setTimeout(() => { interval = proceedWithStartup(); }, DOCK_SYNC_DELAY_MS);
-      };
-      const unlistenSplash = listen("splash-done", () => {
-        begin();
-        unlistenSplash.then(fn => fn());
-      });
-      const safetyTimer = setTimeout(() => {
-        begin();
-        unlistenSplash.then(fn => fn());
-      }, 6000);
-      return () => {
+    let started = false;
+    const begin = () => {
+      if (started || cancelled) return;
+      started = true;
+      if (safetyTimer) {
         clearTimeout(safetyTimer);
-        clearTimeout(syncTimer);
-        if (interval) clearInterval(interval);
-        unlistenSplash.then(fn => fn());
-      };
+        safetyTimer = undefined;
+      }
+      stopSplash?.();
+      stopSplash = undefined;
+      syncTimer = setTimeout(proceedWithStartup, DOCK_SYNC_DELAY_MS);
     };
 
-    return waitForSplash();
+    listen("splash-done", begin)
+      .then((fn) => {
+        if (cancelled || started) fn();
+        else stopSplash = fn;
+      })
+      .catch(() => {});
+
+    safetyTimer = setTimeout(begin, 6000);
+
+    return () => {
+      cancelled = true;
+      if (safetyTimer) clearTimeout(safetyTimer);
+      if (syncTimer) clearTimeout(syncTimer);
+      if (impactTimer) clearTimeout(impactTimer);
+      if (startupTimer) clearTimeout(startupTimer);
+      if (interval) clearInterval(interval);
+      stopSplash?.();
+    };
   }, [windowLabel]);
 
   // Settings state
@@ -735,6 +883,17 @@ function App() {
   const [settingsAmbienceEnabled, setSettingsAmbienceEnabled] = useState(() => localStorage.getItem("nectar-media-ambience-enabled") !== "false");
   const [settingsCompactGlowEnabled, setSettingsCompactGlowEnabled] = useState(() => localStorage.getItem("nectar-media-compact-glow-enabled") !== "false");
   const [settingsArtworkTheme, setSettingsArtworkTheme] = useState(() => localStorage.getItem("nectar-media-artwork-theme") === "true");
+  const [themeAccentMode, setThemeAccentMode] = useState(() => localStorage.getItem("nectar-theme-accent") || "mono");
+  const [notchClockFont, setNotchClockFont] = useState(() => {
+    const v = localStorage.getItem("nectar-notch-clock-font");
+    return v === "mono" || v === "rounded" || v === "bold" ? v : "default";
+  });
+  const [notchIdleOpacity, setNotchIdleOpacity] = useState(() => {
+    const v = parseFloat(localStorage.getItem("nectar-notch-idle-opacity") || "1");
+    return Number.isFinite(v) ? Math.max(0.4, Math.min(1, v)) : 1;
+  });
+  const [resolvedMusicThemeUrl, setResolvedMusicThemeUrl] = useState<string | null>(null);
+  const lastBroadcastMediaAccentRef = useRef<string | null | undefined>(undefined);
   const [settingsCornersEnabled, setSettingsCornersEnabled] = useState(() => localStorage.getItem("nectar-corners-enabled") === "true");
   const [mediaLayout, setMediaLayout] = useState<'classic' | 'compact'>(() => (localStorage.getItem("nectar-media-layout") as 'classic' | 'compact') || 'classic');
   const [compactVolumeExpanded, setCompactVolumeExpanded] = useState(false);
@@ -742,45 +901,81 @@ function App() {
   // Album-art color grading: extract the palette once per artwork URL and cache
   // it (Rust re-emits the same data URL for the same track, see services.rs).
   useEffect(() => {
-    if (!settingsArtworkTheme || !albumArtUrl) {
+    if ((!settingsArtworkTheme && themeAccentMode !== "artwork") || !albumArtUrl) {
       setMusicTheme(FALLBACK_THEME);
+      setResolvedMusicThemeUrl(null);
       return;
     }
     const cached = musicThemeCache.current.get(albumArtUrl);
     if (cached) {
       setMusicTheme(cached);
+      setResolvedMusicThemeUrl(albumArtUrl);
       return;
     }
     let cancelled = false;
     artTheme(albumArtUrl).then((theme) => {
       musicThemeCache.current.set(albumArtUrl, theme);
-      if (!cancelled) setMusicTheme(theme);
+      if (!cancelled) {
+        setMusicTheme(theme);
+        setResolvedMusicThemeUrl(albumArtUrl);
+      }
     });
     return () => {
       cancelled = true;
     };
-  }, [albumArtUrl, settingsArtworkTheme]);
+  }, [albumArtUrl, settingsArtworkTheme, themeAccentMode]);
+
+  useEffect(() => {
+    if (windowLabel !== "main") return;
+    if (mediaInfo.has_media && albumArtUrl && themeAccentMode === "artwork") {
+      if (resolvedMusicThemeUrl !== albumArtUrl) return;
+    }
+    const nextHex =
+      mediaInfo.has_media && albumArtUrl && themeAccentMode === "artwork"
+        ? rgbStringToHex(musicTheme.accent)
+        : null;
+    if (lastBroadcastMediaAccentRef.current === nextHex) return;
+    lastBroadcastMediaAccentRef.current = nextHex;
+    void bridgeInvoke("broadcast_media_accent", { hex: nextHex }).catch(() => {});
+  }, [windowLabel, mediaInfo.has_media, albumArtUrl, resolvedMusicThemeUrl, musicTheme, themeAccentMode]);
 
   // Weather hook
   const { temperature, weatherCondition, weatherIcon: WeatherIcon, cityName, tempUnit } = useWeather(settingsWeatherEnabled);
 
-  const refreshNotchMode = () => {
+  const refreshNotchMode = () =>
     invoke<string>('get_notch_mode_for_window').then(setNotchMode).catch(() => {});
-  };
 
-  const refreshDockMode = () => {
+  const refreshDockMode = () =>
     invoke<string>('get_dock_mode_for_window').then(setDockMode).catch(() => {});
-  };
 
   useEffect(() => {
-    const unlisten = listen("monitors-changed", () => { refreshNotchMode(); refreshDockMode(); });
-    return () => { unlisten.then(f => f()); };
+    let cancelled = false;
+    let stopMonitors: (() => void) | undefined;
+    listen("monitors-changed", () => {
+      if (cancelled) return;
+      refreshNotchMode();
+      refreshDockMode();
+    })
+      .then((f) => {
+        if (cancelled) f();
+        else stopMonitors = f;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      stopMonitors?.();
+    };
   }, []);
 
   useEffect(() => {
     if (!windowLabel) return;
+    let cancelled = false;
+    let dockSyncTimer: ReturnType<typeof setTimeout> | undefined;
+    let dockSafetyTimer: ReturnType<typeof setTimeout> | undefined;
+    let stopDockSplash: (() => void) | undefined;
 
-    invoke("load_settings").then((settings: any) => {
+    hydrateSettingsFromBackend().then(async (settings) => {
+      if (cancelled) return;
       const getVal = (key: string, fallback: string | null = null) => {
         const val = settings[key];
         if (val !== undefined && val !== null) return String(val);
@@ -793,6 +988,7 @@ function App() {
       setSettingsCalendarEnabled(getVal("nectar-calendar-enabled", "true") !== "false");
       setSettingsTimerEnabled((getVal("nectar-timer-enabled") ?? getVal("nectar-calendar-enabled", "true")) !== "false");
       setSettingsTimerSoundEnabled(getVal("nectar-timer-sound-enabled", "true") !== "false");
+      setSettingsTimerProgressEnabled(getVal("nectar-notch-timer-progress", "true") !== "false");
       setSettingsStopwatchEnabled((getVal("nectar-stopwatch-enabled") ?? getVal("nectar-calendar-enabled", "true")) !== "false");
       setSettingsDualClockEnabled(getVal("nectar-dual-clock-enabled", "false") === "true");
       setDualClockZone(getVal("nectar-dual-clock-zone") || DEFAULT_DUAL_CLOCK_ZONE);
@@ -808,6 +1004,24 @@ function App() {
       setSettingsCornersEnabled(getVal("nectar-corners-enabled", "false") === "true");
       setTimeFormat24h(getVal("nectar-time-format-24h") === "true");
       setSettingsLegacyMode(getVal("nectar-legacy-mode") === "true");
+      setDndActive(getVal("nectar-dnd-enabled") === "true");
+      setSettingsShelfPersist(getVal("nectar-shelf-persist", "false") === "true");
+      setSettingsRememberMode(getVal("nectar-notch-remember-mode", "false") === "true");
+      setPanelControlCenter(getVal("nectar-panel-control-center-enabled", "true") !== "false");
+      setPanelShelf(getVal("nectar-panel-shelf-enabled", "true") !== "false");
+      setPanelStatus(getVal("nectar-panel-status-enabled", "true") !== "false");
+      setPanelOrder(parsePanelOrder(getVal("nectar-panel-order")));
+      setCcLayout(parseCcLayout(getVal("nectar-cc-layout")));
+      setShowUpdateIndicator(getVal("nectar-show-update-indicator", "true") !== "false");
+      setDockEnabled(getVal("nectar-dock-enabled", "true") !== "false");
+      if (getVal("nectar-tour-seen") === "1") {
+        localStorage.setItem("nectar-tour-seen", "1");
+      }
+      const mediaLayoutVal = getVal("nectar-media-layout");
+      if (mediaLayoutVal === "classic" || mediaLayoutVal === "compact") {
+        setMediaLayout(mediaLayoutVal);
+        localStorage.setItem("nectar-media-layout", mediaLayoutVal);
+      }
       setReversePanelScroll(getVal("nectar-notch-scroll-direction") === "up");
       const scrollVolume = getVal("nectar-notch-scroll-volume") === "true";
       localStorage.setItem("nectar-notch-scroll-volume", String(scrollVolume));
@@ -816,8 +1030,8 @@ function App() {
       const thresholdStr = getVal("nectar-low-battery-threshold", "20");
       if (thresholdStr) setLowBatteryThreshold(parseInt(thresholdStr as string));
 
-      refreshNotchMode();
-      refreshDockMode();
+      await Promise.all([refreshNotchMode(), refreshDockMode()]);
+      if (cancelled) return;
 
       if (windowLabel === 'main') {
         const firstRun = localStorage.getItem("nectar-first-run") === null;
@@ -828,54 +1042,68 @@ function App() {
           localStorage.setItem("nectar-first-run", "done");
         }
         const rawDockMode = getVal("nectar-dock-mode", "smart") as string;
-        const dockMode = rawDockMode === "auto-hide" ? "smart" : rawDockMode;
+        const dockModeFallback = rawDockMode === "auto-hide" ? "smart" : rawDockMode;
         const syncWindows = async () => {
-          const dockEnabled = getVal("nectar-dock-enabled", "true") === "true";
-          const resolvedNotchMode = await invoke<string>('get_notch_mode_for_window').catch(() => "fixed");
+          if (cancelled) return;
+          const isDockOn = getVal("nectar-dock-enabled", "true") !== "false";
+          const [resolvedNotchMode, resolvedDockMode] = await Promise.all([
+            invoke<string>('get_notch_mode_for_window').catch(() => "fixed"),
+            invoke<string>('get_dock_mode_for_window').catch(() => dockModeFallback),
+          ]);
+          if (cancelled) return;
           await Promise.all([
-            dockEnabled ? invoke("init_dock", { mode: dockMode }) : Promise.resolve(),
+            isDockOn ? invoke("init_dock", { mode: resolvedDockMode }) : Promise.resolve(),
             invoke("change_notch_mode", { mode: resolvedNotchMode }),
           ]);
-          await invoke("sync_appbar");
+          if (!cancelled) await invoke("sync_appbar");
         };
 
-        const dockEnabled = getVal("nectar-dock-enabled", "true") === "true";
         const runDockInit = () => {
-          // 1. Snappy initial sync
-          setTimeout(syncWindows, 400);
-          // 2. Safety-net dock retry
-          if (dockEnabled) {
-            setTimeout(() => invoke("init_dock", { mode: dockMode }).catch(() => {}), 1500);
-          }
-          // 3. Layout corrections
-          setTimeout(() => invoke("sync_appbar"), 1000);
-          setTimeout(() => invoke("sync_appbar"), 2500);
-          setTimeout(() => invoke("sync_appbar"), 5000);
+          if (cancelled) return;
+          dockSyncTimer = setTimeout(() => { void syncWindows(); }, 400);
         };
 
         const runDockInitAfterSplash = () => {
           let dockStarted = false;
-          const unlistenDock = listen("splash-done", () => {
-            if (dockStarted) return;
+          const startDock = () => {
+            if (dockStarted || cancelled) return;
             dockStarted = true;
+            if (dockSafetyTimer) {
+              clearTimeout(dockSafetyTimer);
+              dockSafetyTimer = undefined;
+            }
+            stopDockSplash?.();
+            stopDockSplash = undefined;
             runDockInit();
-            unlistenDock.then(fn => fn());
-          });
-          setTimeout(() => {
-            if (dockStarted) return;
-            dockStarted = true;
-            runDockInit();
-            unlistenDock.then(fn => fn());
-          }, 6000);
+          };
+          listen("splash-done", startDock)
+            .then((fn) => {
+              if (cancelled || dockStarted) fn();
+              else stopDockSplash = fn;
+            })
+            .catch(() => {});
+          dockSafetyTimer = setTimeout(startDock, 6000);
         };
 
         runDockInitAfterSplash();
       }
 
       const scaleVal = getVal("nectar-scale");
-      if (scaleVal !== null) setScale(parseFloat(scaleVal));
+      if (scaleVal !== null) {
+        const parsedScale = parseFloat(scaleVal);
+        if (!Number.isNaN(parsedScale)) setScale(parsedScale);
+      }
 
       setNetWidgetMode(getVal("nectar-net-widget-mode") === "status" ? "status" : "speed");
+
+      const clockFontVal = getVal("nectar-notch-clock-font", "default");
+      setNotchClockFont(clockFontVal === "mono" || clockFontVal === "rounded" || clockFontVal === "bold" ? clockFontVal : "default");
+
+      const idleOpacityParsed = parseFloat(getVal("nectar-notch-idle-opacity", "1") || "1");
+      setNotchIdleOpacity(Number.isFinite(idleOpacityParsed) ? Math.max(0.4, Math.min(1, idleOpacityParsed)) : 1);
+
+      const accentModeVal = getVal("nectar-theme-accent", "mono");
+      if (accentModeVal) setThemeAccentMode(accentModeVal);
 
       const widgetsVal = getVal("nectar-status-widgets");
       if (widgetsVal) {
@@ -886,93 +1114,152 @@ function App() {
           }
         } catch {}
       }
-    }).catch(console.error);
+    }).catch(console.error).finally(() => {
+      if (!cancelled) setSettingsLoaded(true);
+    });
+    return () => {
+      cancelled = true;
+      if (dockSyncTimer) clearTimeout(dockSyncTimer);
+      if (dockSafetyTimer) clearTimeout(dockSafetyTimer);
+      stopDockSplash?.();
+    };
   }, [windowLabel]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const compactTargetModeRef = useRef<'music' | 'status'>('status');
+  compactTargetModeRef.current = settingsMusicModeEnabled && settingsMusicCompactNotch && mediaInfo.has_media && isPlaying ? 'music' : 'status';
+
+  const collapseNotch = useCallback((closeConnections = false) => {
+    clearTimeout(shelfCollapseTimer.current);
+    setIsHovered(false);
+    setIsNotchHovered(false);
+    setIsEdgeHovered(false);
+    setWidgetTip(null);
+    setCompactVolumeExpanded(false);
+    if (closeConnections) {
+      setCcView('main');
+      setConnectionsInputOpen(false);
+    }
+    setNectarMode(compactTargetModeRef.current);
+  }, []);
+
   useEffect(() => {
+    let cancelled = false;
     // Disable context menu globally
     const preventContext = (e: MouseEvent) => e.preventDefault();
     document.addEventListener('contextmenu', preventContext);
 
-    const unlistenVisibility = listen<boolean>("visibility-change", (event) => {
-      setIsVisible(event.payload);
-    });
+    const cleanups: Array<() => void> = [];
+    const register = (promise: Promise<() => void>) => {
+      promise
+        .then((fn) => {
+          if (cancelled) fn();
+          else cleanups.push(fn);
+        })
+        .catch(() => {});
+    };
+
+    register(listen<boolean>("visibility-change", (event) => {
+      if (!cancelled) setIsVisible(event.payload);
+    }));
 
     // Only this notch's events, the other monitor's notch shouldn't react.
     const thisWindow = getCurrentWebviewWindow();
 
-    const unlistenNotchOverlap = thisWindow.listen<boolean>("notch-overlap", (event) => {
-      setIsOverlapped(event.payload);
-    });
+    register(thisWindow.listen<boolean>("notch-overlap", (event) => {
+      if (!cancelled) setIsOverlapped(event.payload);
+    }));
 
-    const unlistenNotchEdgeHover = thisWindow.listen<boolean>("notch-edge-hover", (event) => {
-      setIsEdgeHovered(event.payload);
-    });
+    register(thisWindow.listen<boolean>("notch-edge-hover", (event) => {
+      if (!cancelled) setIsEdgeHovered(event.payload);
+    }));
 
-    const unlistenHotkey = listen("notch-hotkey-toggle", () => {
+    register(listen("notch-hotkey-toggle", () => {
+      if (cancelled) return;
       setHotkeyHidden(prev => !prev);
       setIsEdgeHovered(false);
       setIsNotchHovered(false);
-    });
+    }));
 
-    const unlistenNotchFullscreen = thisWindow.listen<boolean>("notch-fullscreen", (event) => {
+    register(thisWindow.listen<boolean>("notch-fullscreen", (event) => {
+      if (cancelled) return;
       setIsFullscreen(event.payload);
       if (event.payload) {
         setIsEdgeHovered(false);
         setIsNotchHovered(false);
       }
-    });
+    }));
 
-    const unlistenSettingsReset = listen("settings-reset", () => {
-      localStorage.clear();
+    register(listen("shell-surface-opening", () => {
+      if (!cancelled) collapseNotch(true);
+    }));
+
+    register(listen("settings-reset", () => {
+      if (cancelled) return;
+      clearSettingsPreservingOnboarding();
       window.location.reload();
-    });
+    }));
 
     return () => {
-      unlistenVisibility.then(f => f());
-      unlistenNotchOverlap.then(f => f());
-      unlistenNotchEdgeHover.then(f => f());
-      unlistenNotchFullscreen.then(f => f());
-      unlistenHotkey.then(f => f());
-      unlistenSettingsReset.then(f => f());
+      cancelled = true;
+      cleanups.forEach((fn) => fn());
       document.removeEventListener('contextmenu', preventContext);
     };
-  }, [windowLabel]);
+  }, [windowLabel, collapseNotch]);
 
   // Settings sync — consolidated dispatch for all settings events
+  const asBool = (v: any, def: boolean) => (v === null || v === undefined ? def : v !== false && v !== "false");
   useSettingsSync(
     {
-      "nectar-weather-enabled": setSettingsWeatherEnabled,
-      "nectar-calendar-enabled": setSettingsCalendarEnabled,
-      "nectar-timer-enabled": setSettingsTimerEnabled,
-      "nectar-timer-sound-enabled": setSettingsTimerSoundEnabled,
-      "nectar-notch-timer-progress": setSettingsTimerProgressEnabled,
-      "nectar-stopwatch-enabled": setSettingsStopwatchEnabled,
-      "nectar-dual-clock-enabled": setSettingsDualClockEnabled,
-      "nectar-dual-clock-zone": (value) => setDualClockZone(String(value)),
-      "nectar-dual-clock-label": (value) => setDualClockLabel(String(value)),
-      "nectar-music-mode-enabled": setSettingsMusicModeEnabled,
-      "nectar-music-compact-notch": setSettingsMusicCompactNotch,
-      "nectar-notch-scroll-volume": setSettingsScrollVolume,
+      "nectar-weather-enabled": (v) => setSettingsWeatherEnabled(asBool(v, true)),
+      "nectar-calendar-enabled": (v) => setSettingsCalendarEnabled(asBool(v, true)),
+      "nectar-timer-enabled": (v) =>
+        setSettingsTimerEnabled(
+          v !== null && v !== undefined
+            ? asBool(v, true)
+            : localStorage.getItem("nectar-calendar-enabled") !== "false"
+        ),
+      "nectar-timer-sound-enabled": (v) => setSettingsTimerSoundEnabled(asBool(v, true)),
+      "nectar-notch-timer-progress": (v) => setSettingsTimerProgressEnabled(asBool(v, true)),
+      "nectar-stopwatch-enabled": (v) =>
+        setSettingsStopwatchEnabled(
+          v !== null && v !== undefined
+            ? asBool(v, true)
+            : localStorage.getItem("nectar-calendar-enabled") !== "false"
+        ),
+      "nectar-dual-clock-enabled": (v) => setSettingsDualClockEnabled(v === true || v === "true"),
+      "nectar-dual-clock-zone": (v) => setDualClockZone(v ? String(v) : DEFAULT_DUAL_CLOCK_ZONE),
+      "nectar-dual-clock-label": (v) => setDualClockLabel(v ? String(v) : DEFAULT_DUAL_CLOCK_ZONE),
+      "nectar-music-mode-enabled": (v) => setSettingsMusicModeEnabled(asBool(v, true)),
+      "nectar-music-compact-notch": (v) => setSettingsMusicCompactNotch(asBool(v, true)),
+      "nectar-notch-scroll-volume": (v) => setSettingsScrollVolume(v === true || v === "true"),
       "nectar-notch-scroll-direction": (v) => setReversePanelScroll(v === "up"),
-      "nectar-shelf-persist": setSettingsShelfPersist,
-      "nectar-notch-remember-mode": setSettingsRememberMode,
-      "nectar-panel-control-center-enabled": (v) => setPanelControlCenter(v !== false && v !== "false"),
-      "nectar-panel-shelf-enabled": (v) => setPanelShelf(v !== false && v !== "false"),
-      "nectar-panel-status-enabled": (v) => setPanelStatus(v !== false && v !== "false"),
+      "nectar-shelf-persist": (v) => setSettingsShelfPersist(v === true || v === "true"),
+      "nectar-notch-remember-mode": (v) => setSettingsRememberMode(v === true || v === "true"),
+      "nectar-panel-control-center-enabled": (v) => setPanelControlCenter(asBool(v, true)),
+      "nectar-panel-shelf-enabled": (v) => setPanelShelf(asBool(v, true)),
+      "nectar-panel-status-enabled": (v) => setPanelStatus(asBool(v, true)),
       "nectar-panel-order": (v) => setPanelOrder(parsePanelOrder(v === null ? null : String(v))),
       "nectar-cc-layout": (v) => setCcLayout(parseCcLayout(v === null ? null : String(v))),
-      "nectar-media-visualizer-enabled": setSettingsVisualizerEnabled,
-      "nectar-visualizer-enabled": setSettingsVisualizerEnabled,
-      "nectar-media-album-art-enabled": setSettingsAlbumArtEnabled,
-      "nectar-media-ambience-enabled": setSettingsAmbienceEnabled,
-      "nectar-media-compact-glow-enabled": setSettingsCompactGlowEnabled,
-      "nectar-media-artwork-theme": setSettingsArtworkTheme,
-      "nectar-media-layout": setMediaLayout,
-      "nectar-corners-enabled": setSettingsCornersEnabled,
-      "nectar-scale": setScale,
-      "nectar-low-battery-threshold": setLowBatteryThreshold,
-      "nectar-dock-enabled": setDockEnabled,
+      "nectar-media-visualizer-enabled": (v) => setSettingsVisualizerEnabled(asBool(v, true)),
+      "nectar-visualizer-enabled": (v) => setSettingsVisualizerEnabled(asBool(v, true)),
+      "nectar-media-album-art-enabled": (v) => setSettingsAlbumArtEnabled(asBool(v, true)),
+      "nectar-media-ambience-enabled": (v) => setSettingsAmbienceEnabled(asBool(v, true)),
+      "nectar-media-compact-glow-enabled": (v) => setSettingsCompactGlowEnabled(asBool(v, true)),
+      "nectar-media-artwork-theme": (v) => setSettingsArtworkTheme(v === true || v === "true"),
+      "nectar-theme-accent": (v) => setThemeAccentMode(v ? String(v) : "mono"),
+      "nectar-notch-clock-font": (v) => {
+        const s = String(v || "default");
+        setNotchClockFont(s === "mono" || s === "rounded" || s === "bold" ? s : "default");
+      },
+      "nectar-notch-idle-opacity": (v) => {
+        const parsed = parseFloat(String(v ?? "1"));
+        setNotchIdleOpacity(Number.isFinite(parsed) ? Math.max(0.4, Math.min(1, parsed)) : 1);
+      },
+      "nectar-media-layout": (v) => setMediaLayout(v === "compact" ? "compact" : "classic"),
+      "nectar-corners-enabled": (v) => setSettingsCornersEnabled(v === true || v === "true"),
+      "nectar-scale": (v) => setScale(typeof v === "number" && !Number.isNaN(v) ? v : 1.0),
+      "nectar-low-battery-threshold": (v) => setLowBatteryThreshold(typeof v === "number" && !Number.isNaN(v) ? v : 20),
+      "nectar-dock-enabled": (v) => setDockEnabled(asBool(v, true)),
       "nectar-dock-mode": refreshDockMode,
       "nectar-dock-mode-by-monitor": refreshDockMode,
       "nectar-dock-monitor-mode": refreshDockMode,
@@ -981,55 +1268,72 @@ function App() {
       "nectar-notch-mode-by-monitor": refreshNotchMode,
       "nectar-notch-monitor-mode": refreshNotchMode,
       "nectar-notch-monitor-id": refreshNotchMode,
-      "nectar-net-widget-mode": (value) => setNetWidgetMode(value === "status" ? "status" : "speed"),
+      "nectar-net-widget-mode": (v) => setNetWidgetMode(v === "status" ? "status" : "speed"),
       "nectar-status-widgets": (value) => {
+        if (value === null || value === undefined) {
+          setStatusWidgets({ left: ["weather"], right: ["battery"] });
+          return;
+        }
         try {
-          const parsed = JSON.parse(value);
+          const parsed = typeof value === "string" ? JSON.parse(value) : value;
           if (parsed && Array.isArray(parsed.left) && Array.isArray(parsed.right)) {
             setStatusWidgets({ ...parsed, left: parsed.left.slice(0, 2), right: parsed.right.slice(0, 2) });
           }
         } catch {}
       },
-      "nectar-show-update-indicator": (value) => setShowUpdateIndicator(String(value) === "true"),
-      "nectar-time-format-24h": setTimeFormat24h,
-      "nectar-legacy-mode": setSettingsLegacyMode,
+      "nectar-show-update-indicator": (v) => setShowUpdateIndicator(asBool(v, true)),
+      "nectar-time-format-24h": (v) => setTimeFormat24h(v === true || v === "true"),
+      "nectar-legacy-mode": (v) => setSettingsLegacyMode(v === true || v === "true"),
+      "nectar-dnd-enabled": (v) => setDndActive(v === true || v === "true"),
     },
     [windowLabel]
   );
 
-  // Side effects: dock-enabled (skip first render — startup code handles initial state)
+  // Side effects: dock-enabled (skip initial hydration — startup code handles initial state)
   useEffect(() => {
-    if (windowLabel !== 'main') return;
+    if (windowLabel !== 'main' || !settingsLoaded) return;
     if (dockEnabledInitial.current) { dockEnabledInitial.current = false; return; }
     if (dockEnabled) {
-      invoke("init_dock", { mode: localStorage.getItem("nectar-dock-mode") || "smart" });
+      invoke("init_dock", { mode: localStorage.getItem("nectar-dock-mode") || "smart" }).catch(() => {});
     } else {
-      invoke("toggle_dock", { enable: false });
+      invoke("toggle_dock", { enable: false }).catch(() => {});
     }
-    setTimeout(() => invoke("sync_appbar"), 200);
-  }, [dockEnabled, windowLabel]);
+    const timer = setTimeout(() => { invoke("sync_appbar").catch(() => {}); }, 200);
+    return () => clearTimeout(timer);
+  }, [dockEnabled, windowLabel, settingsLoaded]);
 
-  // Side effects: dock-mode (skip first render)
+  // Side effects: dock-mode (skip initial hydration)
   useEffect(() => {
-    if (windowLabel !== 'main') return;
+    if (windowLabel !== 'main' || !settingsLoaded) return;
     if (dockModeInitial.current) { dockModeInitial.current = false; return; }
-    invoke("change_dock_mode", { mode: dockMode });
-    setTimeout(() => invoke("sync_appbar"), 200);
-  }, [dockMode, windowLabel]);
+    invoke("change_dock_mode", { mode: dockMode }).catch(() => {});
+    const timer = setTimeout(() => { invoke("sync_appbar").catch(() => {}); }, 200);
+    return () => clearTimeout(timer);
+  }, [dockMode, windowLabel, settingsLoaded]);
 
-  // Side effects: notch-mode (skip first render)
+  // Side effects: notch-mode (skip initial hydration)
   useEffect(() => {
-    if (windowLabel !== 'main') return;
+    if (windowLabel !== 'main' || !settingsLoaded) return;
     if (notchModeInitial.current) { notchModeInitial.current = false; return; }
     invoke("change_notch_mode", { mode: notchMode });
-  }, [notchMode, windowLabel]);
+  }, [notchMode, windowLabel, settingsLoaded]);
+
+  const hasPerMonitorOverrides = useCallback((monitorModeKey: string, mapKey: string): boolean => {
+    if (localStorage.getItem(monitorModeKey) !== "all") return false;
+    try {
+      const parsed = JSON.parse(localStorage.getItem(mapKey) || "{}");
+      return !!parsed && typeof parsed === "object" && Object.keys(parsed).length > 0;
+    } catch {
+      return false;
+    }
+  }, []);
 
   const [tourStep, setTourStep] = useState(0);
   const tourAutoStartedRef = useRef(false);
 
   const nectarModeRef = useRef(nectarMode);
   nectarModeRef.current = nectarMode;
-  const tourLiveRef = useRef({ volume: 0.5, brightness: 50, wifi: false, bluetooth: true, notchMode: 'smart', dockMode: 'smart' });
+  const tourLiveRef = useRef({ volume: 0.5, brightness: 50, wifi: false, bluetooth: false, notchMode: 'smart', dockMode: 'smart' });
   tourLiveRef.current = { volume, brightness: currentBrightness, wifi: wifiEnabled, bluetooth: bluetoothEnabled, notchMode, dockMode };
   const tourSnapshotRef = useRef<{ mode: 'music' | 'calendar' | 'command-center' | 'status'; volume: number; brightness: number; wifi: boolean; bluetooth: boolean; notchMode: string; dockMode: string } | null>(null);
   const [tourDone, setTourDone] = useState<Set<string>>(() => new Set());
@@ -1086,15 +1390,27 @@ function App() {
       }
       if (live.notchMode !== snap.notchMode) {
         setNotchMode(snap.notchMode);
-        invoke("set_notch_mode_for_window", { mode: snap.notchMode })
-          .then(() => invoke("change_notch_mode", { mode: snap.notchMode }))
-          .catch(() => {});
+        if (hasPerMonitorOverrides("nectar-notch-monitor-mode", "nectar-notch-mode-by-monitor")) {
+          invoke("set_notch_mode_for_window", { mode: snap.notchMode }).catch(() => {});
+        } else {
+          localStorage.setItem("nectar-notch-mode", snap.notchMode);
+          invoke("save_setting", { key: "nectar-notch-mode", value: snap.notchMode }).catch(() => {});
+        }
+        if (windowLabelRef.current !== 'main') {
+          invoke("change_notch_mode", { mode: snap.notchMode }).catch(() => {});
+        }
       }
       if (live.dockMode !== snap.dockMode) {
         setDockMode(snap.dockMode);
-        localStorage.setItem("nectar-dock-mode", snap.dockMode);
-        invoke("save_setting", { key: "nectar-dock-mode", value: snap.dockMode }).catch(() => {});
-        invoke("change_dock_mode", { mode: snap.dockMode }).catch(() => {});
+        if (hasPerMonitorOverrides("nectar-dock-monitor-mode", "nectar-dock-mode-by-monitor")) {
+          invoke("set_dock_mode_for_window", { mode: snap.dockMode }).catch(() => {});
+        } else {
+          localStorage.setItem("nectar-dock-mode", snap.dockMode);
+          invoke("save_setting", { key: "nectar-dock-mode", value: snap.dockMode }).catch(() => {});
+        }
+        if (windowLabelRef.current !== 'main') {
+          invoke("change_dock_mode", { mode: snap.dockMode }).catch(() => {});
+        }
       }
     }
     setNectarMode(snap?.mode ?? 'status');
@@ -1102,48 +1418,84 @@ function App() {
     setTourActive(false);
     localStorage.setItem("nectar-tour-seen", "1");
     invoke("save_setting", { key: "nectar-tour-seen", value: "1" }).catch(console.error);
-  }, []);
+  }, [hasPerMonitorOverrides]);
 
   useEffect(() => {
-    if (windowLabel !== 'main' || settingsLegacyMode || !isReady || !isExpanded || tourAutoStartedRef.current) return;
+    if (windowLabel !== 'main' || settingsLegacyMode || !settingsLoaded || !isReady || !isExpanded || tourAutoStartedRef.current) return;
     tourAutoStartedRef.current = true;
     if (localStorage.getItem("nectar-tour-seen") === "1") return;
     const timer = setTimeout(startTour, 1500);
     return () => clearTimeout(timer);
-  }, [windowLabel, settingsLegacyMode, isReady, isExpanded, startTour]);
+  }, [windowLabel, settingsLegacyMode, settingsLoaded, isReady, isExpanded, startTour]);
 
   useEffect(() => {
     if (ccView !== 'main') tourSignalRef.current('cc');
   }, [ccView]);
 
+  const originalTourHeightRef = useRef<number | null>(null);
+
   useEffect(() => {
-    if (!tourActive || windowLabel !== 'main') return;
+    if (!tourActive || windowLabel !== 'main') {
+      const orig = originalTourHeightRef.current;
+      if (orig !== null) {
+        originalTourHeightRef.current = null;
+        invoke("set_window_height", { height: orig }).catch(() => {});
+      }
+      return;
+    }
     const win = getCurrentWebviewWindow();
-    let original: number | null = null;
     let cancelled = false;
     (async () => {
-      const [size, factor] = await Promise.all([win.innerSize(), win.scaleFactor()]);
-      if (cancelled) return;
-      original = size.height / factor;
-      await invoke("set_window_height", { height: Math.max(original, 720) });
+      if (originalTourHeightRef.current === null) {
+        const [size, factor] = await Promise.all([win.innerSize(), win.scaleFactor()]);
+        if (cancelled) return;
+        originalTourHeightRef.current = size.height / factor;
+      }
+      const original = originalTourHeightRef.current;
+      await invoke("set_window_height", { height: Math.max(original, Math.ceil(560 * scale)) });
     })().catch(() => {});
     return () => {
       cancelled = true;
-      if (original !== null) invoke("set_window_height", { height: original }).catch(() => {});
     };
-  }, [tourActive, windowLabel]);
+  }, [tourActive, windowLabel, scale]);
+
+  useEffect(() => () => {
+    const orig = originalTourHeightRef.current;
+    if (orig !== null) {
+      originalTourHeightRef.current = null;
+      invoke("set_window_height", { height: orig }).catch(() => {});
+    }
+  }, []);
 
   useEffect(() => {
     if (windowLabel !== 'main') return;
-    const unlisten = listen("shelf-drag-enter", () => tourSignalRef.current('shelf'));
-    const unlistenDock = listen("tour-dock-action", () => tourSignalRef.current('dock'));
-    return () => { unlisten.then(f => f()); unlistenDock.then(f => f()); };
+    let cancelled = false;
+    let stopShelf: (() => void) | undefined;
+    let stopDock: (() => void) | undefined;
+    listen("shelf-drag-enter", () => { if (!cancelled) tourSignalRef.current('shelf'); })
+      .then((f) => { if (cancelled) f(); else stopShelf = f; })
+      .catch(() => {});
+    listen("tour-dock-action", () => { if (!cancelled) tourSignalRef.current('dock'); })
+      .then((f) => { if (cancelled) f(); else stopDock = f; })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      stopShelf?.();
+      stopDock?.();
+    };
   }, [windowLabel]);
 
   useEffect(() => {
     if (windowLabel !== 'main') return;
-    const unlisten = listen("start-tour", startTour);
-    return () => { unlisten.then(f => f()); };
+    let cancelled = false;
+    let stopTour: (() => void) | undefined;
+    listen("start-tour", () => { if (!cancelled) startTour(); })
+      .then((f) => { if (cancelled) f(); else stopTour = f; })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      stopTour?.();
+    };
   }, [windowLabel, startTour]);
 
   useEffect(() => {
@@ -1157,6 +1509,13 @@ function App() {
   const wheelIdleTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const WHEEL_STEP_THRESHOLD = 60;
   const WHEEL_IDLE_RESET_MS = 180;
+
+  useEffect(() => () => {
+    if (wheelIdleTimeoutRef.current) {
+      clearTimeout(wheelIdleTimeoutRef.current);
+      wheelIdleTimeoutRef.current = null;
+    }
+  }, []);
 
   // Music shifts position based on playing state:
   // Playing: command-center → music → status → calendar (active, near command-center)
@@ -1238,8 +1597,9 @@ function App() {
 
   const toggleTimer = () => {
     if (!isTimerRunning) {
+      if (timerSeconds <= 0) return;
       getTimerChimeCtx();
-      if (timerTotalSeconds === 0 && timerSeconds > 0) {
+      if (timerTotalSeconds === 0) {
         setTimerTotalSeconds(timerSeconds);
       }
     }
@@ -1355,12 +1715,6 @@ function App() {
     }
   }, [settingsMusicCompactNotch, nectarMode, isHovered]);
 
-  useEffect(() => {
-    if (settingsMusicModeEnabled && settingsMusicCompactNotch && mediaInfo.has_media && isPlaying && nectarMode === 'status' && !isHovered) {
-      setNectarMode('music');
-    }
-  }, [settingsMusicModeEnabled, settingsMusicCompactNotch, mediaInfo.has_media, isPlaying, nectarMode, isHovered]);
-
   // Update time
   useEffect(() => {
     const updateTime = () => {
@@ -1378,8 +1732,19 @@ function App() {
       }
     };
 
-    updateTime();
-    const interval = setVisibleInterval(updateTime, 1000);
+    let minuteTimer: number | undefined;
+    const scheduleMinute = () => {
+      updateTime();
+      if (!settingsDualClockEnabled || document.hidden) return;
+      const delay = 60_000 - (Date.now() % 60_000) + 25;
+      minuteTimer = window.setTimeout(scheduleMinute, delay);
+    };
+    const onVisibility = () => {
+      if (minuteTimer !== undefined) clearTimeout(minuteTimer);
+      if (!document.hidden) scheduleMinute();
+    };
+    scheduleMinute();
+    document.addEventListener("visibilitychange", onVisibility);
 
     // Toggle compact timer view every 5 seconds if running
     let timerToggleInterval: any;
@@ -1392,19 +1757,22 @@ function App() {
     }
 
     return () => {
-      clearInterval(interval);
+      if (minuteTimer !== undefined) clearTimeout(minuteTimer);
+      document.removeEventListener("visibilitychange", onVisibility);
       if (timerToggleInterval) clearInterval(timerToggleInterval);
     };
   }, [isTimerRunning, stopwatch.running, nectarMode, timeFormat24h, settingsDualClockEnabled, dualClockZone]);
 
   // Battery API
   useEffect(() => {
-    let battery: any = null;
+    let disposed = false;
+    let cleanup: (() => void) | undefined;
 
     const initBattery = async () => {
       try {
         if (import.meta.env.DEV) {
           const saved = (await invoke("load_settings").catch(() => ({}))) as Record<string, unknown>;
+          if (disposed) return;
           const fake = String(saved["nectar-debug-battery"] ?? "");
           if (fake) {
             const [level, charging] = fake.split(",");
@@ -1415,7 +1783,8 @@ function App() {
             return;
           }
         }
-        battery = await (navigator as any).getBattery();
+        const battery = await (navigator as any).getBattery();
+        if (disposed || !battery) return;
 
         const updateBattery = () => {
           setBatteryLevel(Math.round(battery.level * 100));
@@ -1431,7 +1800,7 @@ function App() {
         battery.addEventListener("chargingtimechange", updateBattery);
         battery.addEventListener("dischargingtimechange", updateBattery);
 
-        return () => {
+        cleanup = () => {
           battery.removeEventListener("levelchange", updateBattery);
           battery.removeEventListener("chargingchange", updateBattery);
           battery.removeEventListener("chargingtimechange", updateBattery);
@@ -1442,16 +1811,28 @@ function App() {
       }
     };
 
-    initBattery();
+    void initBattery();
+    return () => {
+      disposed = true;
+      cleanup?.();
+    };
   }, []);
 
   // Listen for Volume Changes
   useEffect(() => {
-    const unlisten = listen<{ volume: number; is_muted: boolean }>("volume-change", (event) => {
+    let cancelled = false;
+    let stopVol: (() => void) | undefined;
+    listen<{ volume: number; is_muted: boolean }>("volume-change", (event) => {
+      if (cancelled) return;
       setVolume(event.payload.volume);
       setIsMuted(event.payload.is_muted);
-    });
-    return () => { unlisten.then(fn => fn()); };
+    })
+      .then((fn) => { if (cancelled) fn(); else stopVol = fn; })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      stopVol?.();
+    };
   }, []);
 
   // Wi-Fi has three states (off, on, connected) and the radio state can't tell them apart.
@@ -1483,35 +1864,92 @@ function App() {
     };
   }, [refreshWifiStatus]);
 
-  // Keep Wi-Fi fresh while the command center is open (keyboard toggle, Windows quick settings).
+  const refreshBluetoothState = useCallback(async () => {
+    try {
+      const enabled = await invoke<boolean>("get_bluetooth_state");
+      setBluetoothEnabled(enabled);
+      setBluetoothAvailable((prev) => (prev === false && !enabled ? false : true));
+    } catch {
+      setBluetoothEnabled(false);
+      setBluetoothAvailable(false);
+    }
+  }, []);
+
+  // Keep Wi-Fi and Bluetooth fresh while the command center is open (keyboard toggle, Windows quick settings).
   useEffect(() => {
     if (nectarMode !== 'command-center') return;
     void refreshWifiStatus();
-    const interval = setVisibleInterval(() => void refreshWifiStatus(), 5000);
-    return () => clearInterval(interval);
-  }, [nectarMode, refreshWifiStatus]);
-
-  // Load bluetooth/volume/brightness state on mount
-  useEffect(() => {
-    invoke<boolean>("get_bluetooth_state").then(setBluetoothEnabled).catch(() => { });
-    invoke<boolean>("get_battery_saver_state").then(setBatterySaverEnabled).catch(() => { });
-    invoke<boolean>("has_battery").then((present) => {
-      if ((window as any).__nectarFakeBattery) return;
-      setHasBattery(present);
-      localStorage.setItem("nectar-has-battery", String(present));
-    }).catch(() => { });
-    invoke<{ volume: number; is_muted: boolean }>("get_volume_state")
-      .then((state) => { setVolume(state.volume); setIsMuted(state.is_muted); })
-      .catch(() => { });
-    invoke<number>("get_brightness").then(setCurrentBrightness).catch(() => { });
-
+    void refreshBluetoothState();
     const interval = setVisibleInterval(() => {
-      invoke<boolean>("get_battery_saver_state").then(setBatterySaverEnabled).catch(() => { });
-    }, 15000);
+      void refreshWifiStatus();
+      void refreshBluetoothState();
+    }, 5000);
     return () => clearInterval(interval);
-  }, []);
+  }, [nectarMode, refreshWifiStatus, refreshBluetoothState]);
+
+  // Load bluetooth/volume/brightness state once on mount (do not re-run when Game Mode toggles)
+  useEffect(() => {
+    let cancelled = false;
+    void refreshBluetoothState();
+    invoke<boolean>("get_battery_saver_state")
+      .then((val) => { if (!cancelled) setBatterySaverEnabled(val); })
+      .catch(() => { });
+    invoke<boolean>("has_battery")
+      .then((present) => {
+        if (cancelled || (window as any).__nectarFakeBattery) return;
+        setHasBattery(present);
+        localStorage.setItem("nectar-has-battery", String(present));
+      })
+      .catch(() => { });
+    invoke<{ volume: number; is_muted: boolean }>("get_volume_state")
+      .then((state) => {
+        if (cancelled) return;
+        setVolume(state.volume);
+        setIsMuted(state.is_muted);
+      })
+      .catch(() => { });
+    invoke<number>("get_brightness")
+      .then((val) => { if (!cancelled) setCurrentBrightness(val); })
+      .catch(() => { });
+    return () => {
+      cancelled = true;
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
+    if (shouldPausePolls) return;
+    let cancelled = false;
+    const interval = setVisibleInterval(() => {
+      invoke<boolean>("get_battery_saver_state")
+        .then((val) => { if (!cancelled) setBatterySaverEnabled(val); })
+        .catch(() => { });
+    }, 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [shouldPausePolls]);
+
+  const hasSystemMetricWidget = useMemo(
+    () =>
+      [...statusWidgets.left, ...statusWidgets.right].some(
+        (id) => id === "cpu" || id === "ram" || id === "disk" || id === "net"
+      ),
+    [statusWidgets]
+  );
+  const inMusicMode = mediaInfo.has_media && nectarMode === "music" && settingsMusicModeEnabled;
+  const shouldPollSystemMetrics =
+    !shouldPausePolls &&
+    isVisible &&
+    isExpanded &&
+    !isHidden &&
+    isHovered &&
+    !inMusicMode &&
+    hasSystemMetricWidget;
+
+  useEffect(() => {
+    if (!shouldPollSystemMetrics) return;
+    let cancelled = false;
     interface SystemMetrics {
       cpu: number;
       ram: number;
@@ -1521,37 +1959,62 @@ function App() {
     }
 
     const fetchMetrics = () => {
-      invoke<SystemMetrics>("get_system_metrics").then((m) => {
-        setCpuUsage(m.cpu);
-        setRamUsage(m.ram);
-        setDiskSpace(m.disk_free_gb);
-        setNetUpSpeed(m.net_up);
-        setNetDownSpeed(m.net_down);
-      }).catch((e) => console.warn("metrics:", e));
+      invoke<SystemMetrics>("get_system_metrics")
+        .then((m) => {
+          if (cancelled) return;
+          setCpuUsage(m.cpu);
+          setRamUsage(m.ram);
+          setDiskSpace(m.disk_free_gb);
+          setNetUpSpeed(m.net_up);
+          setNetDownSpeed(m.net_down);
+        })
+        .catch((e) => console.warn("metrics:", e));
     };
     fetchMetrics();
-    const interval = setVisibleInterval(fetchMetrics, 3000);
-    return () => clearInterval(interval);
-  }, []);
+    const interval = setVisibleInterval(fetchMetrics, metricsIntervalMs);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [shouldPollSystemMetrics, metricsIntervalMs]);
 
   // Listen for brightness changes
   useEffect(() => {
-    const unlisten = listen<{ brightness: number }>("brightness-change", (event) => {
-      setCurrentBrightness(event.payload.brightness);
-    });
-    return () => { unlisten.then(fn => fn()); };
+    let cancelled = false;
+    let stopBright: (() => void) | undefined;
+    listen<{ brightness: number }>("brightness-change", (event) => {
+      if (!cancelled) setCurrentBrightness(event.payload.brightness);
+    })
+      .then((fn) => { if (cancelled) fn(); else stopBright = fn; })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      stopBright?.();
+    };
   }, []);
 
   const [mediaSessions, setMediaSessions] = useState<MediaSession[]>([]);
   useEffect(() => {
-    const unlisten = listen<typeof mediaSessions>("media-sessions", (event) => setMediaSessions(event.payload ?? []));
-    return () => { unlisten.then(fn => fn()); };
+    let cancelled = false;
+    let stopSessions: (() => void) | undefined;
+    listen<typeof mediaSessions>("media-sessions", (event) => {
+      if (!cancelled) setMediaSessions(event.payload ?? []);
+    })
+      .then((fn) => { if (cancelled) fn(); else stopSessions = fn; })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      stopSessions?.();
+    };
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
     let clear: ReturnType<typeof setTimeout> | undefined;
-    const unlisten = listen<AgentActivity | null>("agent-activity", (event) => {
-      clearTimeout(clear);
+    let stopAgent: (() => void) | undefined;
+    listen<AgentActivity | null>("agent-activity", (event) => {
+      if (cancelled) return;
+      if (clear) clearTimeout(clear);
       const next = event.payload;
       const key = next ? `${next.state}:${next.ask?.id ?? ""}` : "";
       if (windowLabelRef.current === 'main' && next && key !== lastAgentKey.current && (next.state === 'needs_input' || next.state === 'done' || next.state === 'error')) {
@@ -1559,72 +2022,97 @@ function App() {
       }
       lastAgentKey.current = key;
       setAgentActivity((prev) => (next && prev?.ask && !next.ask && next.cancelled !== prev.ask.id && (next.state === 'working' || next.state === 'tool') ? prev : next));
-      if (next && next.state === "done") clear = setTimeout(() => setAgentActivity(null), 8000);
-    });
+      if (next && next.state === "done") clear = setTimeout(() => { if (!cancelled) setAgentActivity(null); }, 8000);
+    })
+      .then((fn) => { if (cancelled) fn(); else stopAgent = fn; })
+      .catch(() => {});
     return () => {
-      clearTimeout(clear);
-      unlisten.then((fn) => fn());
+      cancelled = true;
+      if (clear) clearTimeout(clear);
+      stopAgent?.();
     };
   }, []);
 
+  const mediaInfoRef = useRef<MediaInfo>(mediaInfo);
+  mediaInfoRef.current = mediaInfo;
+
   // Native Windows Media Controls - Listen for updates from background worker
   useEffect(() => {
+    let cancelled = false;
+    let stopMedia: (() => void) | undefined;
     const applyMedia = (info: MediaInfo | null | undefined) => {
-      if (!info) return;
+      if (cancelled || !info) return;
+      const prev = mediaInfoRef.current;
+      const prevArt = prev.artwork?.[0];
+      const nextArt = info.artwork?.[0];
+      const artChanged = prevArt !== nextArt;
+      const sameTrack = prev.has_media && info.has_media && prev.title === info.title && prev.artist === info.artist;
 
-      setMediaInfo(prev => {
-        // Find if artwork changed by checking the first element
-        const prevArt = prev.artwork?.[0];
-        const nextArt = info.artwork?.[0];
-        const artChanged = prevArt !== nextArt;
+      if (
+        prev.title === info.title &&
+        prev.artist === info.artist &&
+        prev.is_playing === info.is_playing &&
+        prev.has_media === info.has_media &&
+        !artChanged &&
+        prev.position_ms === info.position_ms &&
+        prev.duration_ms === info.duration_ms
+      ) {
+        return;
+      }
 
-        if (prev.title === info.title &&
-          prev.artist === info.artist &&
-          prev.is_playing === info.is_playing &&
-          prev.has_media === info.has_media &&
-          !artChanged &&
-          prev.position_ms === info.position_ms &&
-          prev.duration_ms === info.duration_ms) {
-          return prev;
-        }
+      setIsPlaying(info.is_playing);
 
-        // Update playing state separately for the hook triggers
-        setIsPlaying(info.is_playing);
+      let resolvedMedia: MediaInfo;
+      if (!info.has_media) {
+        setAlbumArtUrl(null);
+        resolvedMedia = { ...info, artwork: undefined };
+      } else if (info.artwork && info.artwork.length > 0) {
+        const newArt = info.artwork[0];
+        setAlbumArtUrl((cur) => {
+          if (cur !== newArt) {
+            setAlbumArtKey((k) => k + 1);
+            return newArt;
+          }
+          return cur;
+        });
+        resolvedMedia = info;
+      } else if (!sameTrack) {
+        setAlbumArtUrl(null);
+        resolvedMedia = { ...info, artwork: undefined };
+      } else {
+        resolvedMedia = { ...info, artwork: prev.artwork };
+      }
 
-        if (info.artwork && info.artwork.length > 0) {
-          const newArt = info.artwork[0];
-          setAlbumArtUrl(prev => {
-            if (prev !== newArt) {
-              setAlbumArtKey(k => k + 1);
-              return newArt;
-            }
-            return prev;
-          });
-        } else if (prev.title !== info.title || prev.artist !== info.artist) {
-          setAlbumArtUrl(null);
-        }
-
-        return info.artwork && info.artwork.length > 0 ? info : { ...info, artwork: prev.artwork };
-      });
+      mediaInfoRef.current = resolvedMedia;
+      setMediaInfo(resolvedMedia);
     };
-    const unlisten = listen<MediaInfo>("media-update", (event) => applyMedia(event.payload));
+    listen<MediaInfo>("media-update", (event) => applyMedia(event.payload))
+      .then((fn) => { if (cancelled) fn(); else stopMedia = fn; })
+      .catch(() => {});
     invoke<MediaInfo | null>("get_media_info").then(applyMedia).catch(() => { });
 
     return () => {
-      unlisten.then(fn => fn());
+      cancelled = true;
+      stopMedia?.();
     };
   }, []);
 
   // Media controls via Tauri commands
-  /* Unused saveAndBroadcast removed to fix TS build error */
+  const compactArtClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (compactArtClickTimerRef.current) clearTimeout(compactArtClickTimerRef.current);
+  }, []);
+
   const togglePlayPause = useCallback(async () => {
     try {
       await invoke("media_play_pause");
-      setIsPlaying(!isPlaying);
+      setIsPlaying((prev) => !prev);
     } catch (e) {
       console.error("Failed to toggle play/pause:", e);
     }
-  }, [isPlaying]);
+  }, []);
+  const togglePlayPauseRef = useRef(togglePlayPause);
+  togglePlayPauseRef.current = togglePlayPause;
 
 
   const skipNext = useCallback(async () => {
@@ -1688,6 +2176,14 @@ function App() {
   }, []);
 
   // WiFi toggle
+  const wifiRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (wifiRefreshTimerRef.current) {
+      clearTimeout(wifiRefreshTimerRef.current);
+      wifiRefreshTimerRef.current = null;
+    }
+  }, []);
+
   const toggleWifi = useCallback(async () => {
     const previous = wifiStatus;
     const newState = !(previous?.enabled ?? false);
@@ -1695,7 +2191,11 @@ function App() {
     try {
       await invoke("set_wifi_state", { enabled: newState });
       // The radio and association take a moment to settle.
-      setTimeout(() => void refreshWifiStatus(), 800);
+      if (wifiRefreshTimerRef.current) clearTimeout(wifiRefreshTimerRef.current);
+      wifiRefreshTimerRef.current = setTimeout(() => {
+        wifiRefreshTimerRef.current = null;
+        void refreshWifiStatus();
+      }, 800);
     } catch (e) {
       setWifiStatus(previous);
       console.error("Failed to toggle WiFi:", e);
@@ -1704,15 +2204,28 @@ function App() {
 
   // Bluetooth toggle
   const toggleBluetooth = useCallback(async () => {
+    if (bluetoothAvailable === false) {
+      if (settingsLegacyMode) invoke("open_bluetooth_settings").catch(() => {});
+      else setCcView('bluetooth');
+      return;
+    }
     const newState = !bluetoothEnabled;
     setBluetoothEnabled(newState);
     try {
       await invoke("set_bluetooth_state", { enabled: newState });
+      const actual = await invoke<boolean>("get_bluetooth_state");
+      setBluetoothEnabled(actual);
+      if (newState && !actual) {
+        setBluetoothAvailable(false);
+      } else {
+        setBluetoothAvailable(true);
+      }
     } catch (e) {
-      setBluetoothEnabled(!newState);
+      setBluetoothEnabled(false);
+      setBluetoothAvailable(false);
       console.error("Failed to toggle Bluetooth:", e);
     }
-  }, [bluetoothEnabled]);
+  }, [bluetoothAvailable, bluetoothEnabled, settingsLegacyMode]);
 
   // Battery Saver - opens settings (no public API to toggle without admin)
   const openBatterySaverSettings = useCallback(async () => {
@@ -1755,14 +2268,20 @@ function App() {
     const nextMode = dockMode === "fixed" ? "smart" : dockMode === "smart" ? "peek" : "fixed";
     setDockMode(nextMode);
     tourSignalRef.current('mode');
-    localStorage.setItem("nectar-dock-mode", nextMode);
-    invoke("save_setting", { key: "nectar-dock-mode", value: nextMode }).catch(console.error);
     try {
-      await invoke("change_dock_mode", { mode: nextMode });
+      if (hasPerMonitorOverrides("nectar-dock-monitor-mode", "nectar-dock-mode-by-monitor")) {
+        await invoke("set_dock_mode_for_window", { mode: nextMode });
+      } else {
+        localStorage.setItem("nectar-dock-mode", nextMode);
+        invoke("save_setting", { key: "nectar-dock-mode", value: nextMode }).catch(console.error);
+      }
+      if (windowLabelRef.current !== 'main') {
+        await invoke("change_dock_mode", { mode: nextMode });
+      }
     } catch (err) {
       console.error("Failed to change dock mode:", err);
     }
-  }, [dockMode]);
+  }, [dockMode, hasPerMonitorOverrides]);
 
   const toggleNotchModeSetting = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -1770,12 +2289,19 @@ function App() {
     setNotchMode(nextMode);
     tourSignalRef.current('mode');
     try {
-      await invoke("set_notch_mode_for_window", { mode: nextMode });
-      await invoke("change_notch_mode", { mode: nextMode });
+      if (hasPerMonitorOverrides("nectar-notch-monitor-mode", "nectar-notch-mode-by-monitor")) {
+        await invoke("set_notch_mode_for_window", { mode: nextMode });
+      } else {
+        localStorage.setItem("nectar-notch-mode", nextMode);
+        invoke("save_setting", { key: "nectar-notch-mode", value: nextMode }).catch(console.error);
+      }
+      if (windowLabelRef.current !== 'main') {
+        await invoke("change_notch_mode", { mode: nextMode });
+      }
     } catch (err) {
       console.error("Failed to change notch mode:", err);
     }
-  }, [notchMode]);
+  }, [notchMode, hasPerMonitorOverrides]);
 
   const handleBluetoothRightClick = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -1918,6 +2444,9 @@ function App() {
   };
   const shelfDrag = useRef({ active: false, until: 0 });
   const shelfCollapseTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => {
+    clearTimeout(shelfCollapseTimer.current);
+  }, []);
   const shelfHoldsOpen = () => shelfDrag.current.active || Date.now() < shelfDrag.current.until;
   const deferShelfCollapse = () => {
     clearTimeout(shelfCollapseTimer.current);
@@ -1936,7 +2465,20 @@ function App() {
     },
     onDragLeave: collapseAfterShelfDrag,
     onDrop: () => setNectarMode('shelf'),
-  });
+  }, settingsLoaded);
+
+  const prevConnectionsInputRef = useRef(false);
+  useEffect(() => {
+    const wasOpen = prevConnectionsInputRef.current;
+    prevConnectionsInputRef.current = connectionsInputOpen;
+    if (wasOpen && !connectionsInputOpen && isHovered && !isNotchHovered && !tourActive) {
+      invoke<boolean>("pointer_over_notch")
+        .then((over) => {
+          if (!over) collapseNotch();
+        })
+        .catch(() => {});
+    }
+  }, [connectionsInputOpen, isHovered, isNotchHovered, tourActive, collapseNotch]);
 
   useEffect(() => {
     if ((nectarMode === 'command-center' && !panelControlCenter) || (nectarMode === 'shelf' && !panelShelf)) {
@@ -2051,6 +2593,7 @@ function App() {
       ? ({
           "--nectar-bg": withAlpha(musicTheme.background, "var(--nectar-opacity, 0.8)"),
           "--nectar-bg-expanded": withAlpha(musicTheme.background, "var(--nectar-opacity-expanded, 0.92)"),
+          "--nectar-bg-panel": withAlpha(musicTheme.background, "var(--nectar-opacity-panel, 0.94)"),
           "--nectar-text": musicTheme.text,
           "--nectar-text-muted": withAlpha(musicTheme.text, 0.65),
           "--nectar-border": withAlpha(musicTheme.text, 0.12),
@@ -2093,22 +2636,22 @@ function App() {
       <div style={{ zoom: scale, width: '100%', display: 'flex', justifyContent: 'center' }}>
         <motion.div
           ref={nectarRef}
-          className={`nectar ${isHovered ? 'expanded' : ''} ${isImpacted ? 'is-impacted' : ''} ${isPanelOpen ? 'panel-open' : ''}`}
+          className={`nectar clock-font-${notchClockFont} ${isHovered ? 'expanded' : ''} ${isImpacted ? 'is-impacted' : ''} ${isPanelOpen ? 'panel-open' : ''} ${shouldPausePolls ? 'game-mode-paused' : ''}`}
           onMouseEnter={() => setIsNotchHovered(true)}
         onMouseLeave={() => setIsNotchHovered(false)}
         onWheel={handleWheel}
         initial={{ y: 250, width: 30.6, height: 44.2, borderTopLeftRadius: 18, borderTopRightRadius: 18, borderBottomLeftRadius: 18, borderBottomRightRadius: 18, scaleX: 1, scaleY: 1, opacity: 0 }}
         animate={{
-          y: !isReady ? 250 : (isHidden ? -100 : 0),
+          y: !isReady ? 250 : (isHidden ? -520 : 0),
           width: !isReady ? 34 : (isExpanded && !isHidden ? getDynamicWidth() : (isImpacted ? 39.1 : 30.6)),
           height: !isReady ? 34 : getDynamicHeight(),
-          opacity: isReady ? 1 : 0,
+          opacity: !isReady ? 0 : (isExpanded && !isHovered && !isPanelOpen && !agentNeedsYou && !showPowerPulse && !showLowBatteryPulse && !showUpdatePulse ? notchIdleOpacity : 1),
           scaleX: 1,
           scaleY: 1,
-          borderTopLeftRadius: isImpacted ? 0 : 18,
-          borderTopRightRadius: isImpacted ? 0 : 18,
-          borderBottomLeftRadius: isCalendarMode ? 28 : 18,
-          borderBottomRightRadius: isCalendarMode ? 28 : 18,
+          borderTopLeftRadius: isImpacted ? 0 : scaledRadius(18, 12, 36),
+          borderTopRightRadius: isImpacted ? 0 : scaledRadius(18, 12, 36),
+          borderBottomLeftRadius: scaledRadius(isCalendarMode ? 28 : 18, 12, 36),
+          borderBottomRightRadius: scaledRadius(isCalendarMode ? 28 : 18, 12, 36),
         }}
         onClick={(e) => {
           e.stopPropagation();
@@ -2124,7 +2667,7 @@ function App() {
           }
         }}
         onHoverEnd={() => {
-          if (tourActive) return;
+          if (tourActive || connectionsInputOpen) return;
           if (nectarMode === 'shelf' && shelfHoldsOpen()) {
             deferShelfCollapse();
             return;
@@ -2138,17 +2681,18 @@ function App() {
             setNectarMode(targetMode);
           }
         }}
+        onAnimationComplete={() => updateNotchRectRef.current()}
         style={{ originY: 0, ...musicTint }}
         transition={{
-          width: SHELL_SPRING,
-          height: SHELL_SPRING,
-          y: { type: "spring", stiffness: 550, damping: 45, mass: 0.8, restDelta: 0.001 },
-          opacity: { duration: 0.2 },
-          borderTopLeftRadius: SHELL_SPRING,
-          borderTopRightRadius: SHELL_SPRING,
-          borderBottomLeftRadius: SHELL_SPRING,
-          borderBottomRightRadius: SHELL_SPRING,
-          default: { type: "spring", stiffness: 500, damping: 30, mass: 1 }
+          width: scaledShellSpring,
+          height: scaledShellSpring,
+          y: scaleSpring({ type: "spring", stiffness: 550, damping: 45, mass: 0.8, restDelta: 0.001 }),
+          opacity: { duration: scaleDuration(0.2) },
+          borderTopLeftRadius: scaledShellSpring,
+          borderTopRightRadius: scaledShellSpring,
+          borderBottomLeftRadius: scaledShellSpring,
+          borderBottomRightRadius: scaledShellSpring,
+          default: scaleSpring({ type: "spring", stiffness: 500, damping: 30, mass: 1 })
         }}
       >
         {widgetTip && isHovered && <div className="widget-tip">{widgetTip}</div>}
@@ -2160,7 +2704,7 @@ function App() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              transition={{ duration: 0.1 }}
+              transition={{ duration: scaleDuration(0.1) }}
               style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', position: 'relative', borderRadius: 'inherit' }}
             >
               {/* Faster Waiting Transition Area */}
@@ -2171,8 +2715,8 @@ function App() {
                     className="expanded-music-container"
                     initial={{ opacity: 0, scale: 0.98 }}
                     animate={{ opacity: 1, scale: 1 }}
-                    exit={{ opacity: 0, scale: 0.98, transition: { duration: 0.1 } }}
-                    transition={{ type: "spring", stiffness: 500, damping: 30 }}
+                    exit={{ opacity: 0, scale: 0.98, transition: { duration: scaleDuration(0.1) } }}
+                    transition={scaleSpring({ type: "spring", stiffness: 500, damping: 30 })}
                   >
                     {mediaLayout === 'compact' ? (
                       <CompactMediaPlayer
@@ -2196,7 +2740,7 @@ function App() {
                         onLayoutChange={(layout) => {
                           setMediaLayout(layout);
                           localStorage.setItem("nectar-media-layout", layout);
-                          window.dispatchEvent(new CustomEvent("settings-changed", { detail: { key: "media-layout", value: layout } }));
+                          invoke("save_setting", { key: "nectar-media-layout", value: layout }).catch(() => {});
                         }}
                       />
                     ) : (
@@ -2210,7 +2754,7 @@ function App() {
                             e.stopPropagation();
                             setMediaLayout('compact');
                             localStorage.setItem("nectar-media-layout", "compact");
-                            window.dispatchEvent(new CustomEvent("settings-changed", { detail: { key: "media-layout", value: "compact" } }));
+                            invoke("save_setting", { key: "nectar-media-layout", value: "compact" }).catch(() => {});
                           }}
                           style={{ cursor: 'pointer' }}
                         >
@@ -2514,10 +3058,22 @@ function App() {
                                       className={`album-art${isHovered ? ' album-art-large' : ''}${!isPlaying ? ' paused' : ''}`}
                                       onClick={(e) => {
                                         e.stopPropagation();
-                                        togglePlayPause();
+                                        if (compactArtClickTimerRef.current) {
+                                          clearTimeout(compactArtClickTimerRef.current);
+                                          compactArtClickTimerRef.current = null;
+                                        }
+                                        if (e.detail >= 2) return;
+                                        compactArtClickTimerRef.current = setTimeout(() => {
+                                          compactArtClickTimerRef.current = null;
+                                          void togglePlayPauseRef.current();
+                                        }, 220);
                                       }}
                                       onDoubleClick={(e) => {
                                         e.stopPropagation();
+                                        if (compactArtClickTimerRef.current) {
+                                          clearTimeout(compactArtClickTimerRef.current);
+                                          compactArtClickTimerRef.current = null;
+                                        }
                                         skipNext();
                                       }}
                                       onContextMenu={(e) => {
@@ -2591,8 +3147,8 @@ function App() {
                     onClick={e => e.stopPropagation()}
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
-                    exit={{ opacity: 0, transition: { duration: 0.1 } }}
-                    transition={{ type: "spring", stiffness: 400, damping: 30, delay: 0.12 }}
+                    exit={{ opacity: 0, transition: { duration: scaleDuration(0.1) } }}
+                    transition={scaleSpring({ type: "spring", stiffness: 400, damping: 30, delay: scaleDuration(0.12) })}
                   >
                     {showConnections && (
                       <ConnectionsView
@@ -2600,6 +3156,8 @@ function App() {
                         onBack={() => setCcView('main')}
                         onOpenWindowsSettings={() => { invoke(ccView === 'wifi' ? 'open_wifi_settings' : ccView === 'audio' ? 'open_sound_settings' : 'open_bluetooth_settings'); }}
                         tip={tip}
+                        bluetoothAvailable={bluetoothAvailable}
+                        onPasswordPromptChange={setConnectionsInputOpen}
                       />
                     )}
 
@@ -2655,7 +3213,13 @@ function App() {
                         </div>
                         <div className="cc-pill-info">
                           <span className="cc-pill-title">{t("cc.bluetooth")}</span>
-                          <span className="cc-pill-status">{bluetoothEnabled ? t('common.on') : t('common.off')}</span>
+                          <span className="cc-pill-status">
+                            {bluetoothAvailable === false
+                              ? t("connections.bluetoothUnavailable")
+                              : bluetoothEnabled
+                                ? t('common.on')
+                                : t('common.off')}
+                          </span>
                         </div>
                         {!settingsLegacyMode && (
                           <span className="cc-pill-more" {...tip(t("cc.devices"))} onClick={(e) => { e.stopPropagation(); setCcView('bluetooth'); }}>›</span>
@@ -2685,7 +3249,15 @@ function App() {
                         className={`cc-circular-btn ${dndActive ? 'active' : ''}`}
                         style={ccStyle("buttons", "dnd")}
                         {...tip(t("cc.dnd"))}
-                        onClick={(e) => { e.stopPropagation(); setDndActive(prev => !prev); }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDndActive(prev => {
+                            const next = !prev;
+                            localStorage.setItem("nectar-dnd-enabled", String(next));
+                            invoke("save_setting", { key: "nectar-dnd-enabled", value: String(next) }).catch(() => {});
+                            return next;
+                          });
+                        }}
                       >
                         <MoonIcon />
                       </button>
@@ -2795,8 +3367,8 @@ function App() {
                     key="shelf"
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
-                    exit={{ opacity: 0, transition: { duration: 0.1 } }}
-                    transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                    exit={{ opacity: 0, transition: { duration: scaleDuration(0.1) } }}
+                    transition={scaleSpring({ type: "spring", stiffness: 400, damping: 30 })}
                   >
                     <NotchShelf
                       items={shelf.items}
@@ -2818,13 +3390,13 @@ function App() {
               </AnimatePresence>
 
               <AnimatePresence>
-                {tourActive && (
+                {tourActive && !isHidden && (
                   <motion.div
                     key="tour"
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
-                    exit={{ opacity: 0, transition: { duration: 0.1 } }}
-                    transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                    exit={{ opacity: 0, transition: { duration: scaleDuration(0.1) } }}
+                    transition={scaleSpring({ type: "spring", stiffness: 400, damping: 30 })}
                   >
                     <NotchTour
                       step={tourStep}
@@ -2833,9 +3405,12 @@ function App() {
                       onStep={setTourStep}
                       onClose={closeTour}
                       onAction={(id) => {
+                        if (id === 'control-center') {
+                          setNectarMode('command-center');
+                          return;
+                        }
                         closeTour();
-                        if (id === 'control-center') setNectarMode('command-center');
-                        else openSettingsWindow();
+                        openSettingsWindow();
                       }}
                     />
                   </motion.div>
@@ -2850,8 +3425,8 @@ function App() {
                     onClick={e => e.stopPropagation()}
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
-                    exit={{ opacity: 0, transition: { duration: 0.1 } }}
-                    transition={{ duration: 0.18, delay: 0.22 }}
+                    exit={{ opacity: 0, transition: { duration: scaleDuration(0.1) } }}
+                    transition={{ duration: scaleDuration(0.18), delay: scaleDuration(0.22) }}
                   >
                     <AgentPanel
                       activity={agentActivity}
@@ -2877,8 +3452,8 @@ function App() {
                     onClick={e => e.stopPropagation()} /* Block mode switches when clicking inside */
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
-                    exit={{ opacity: 0, transition: { duration: 0.1 } }}
-                    transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                    exit={{ opacity: 0, transition: { duration: scaleDuration(0.1) } }}
+                    transition={scaleSpring({ type: "spring", stiffness: 400, damping: 30 })}
                   >
                     {settingsCalendarEnabled && (
                       <div className="calendar-column">

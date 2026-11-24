@@ -4,6 +4,7 @@ export function SettingRow({
   icon: Icon,
   label,
   desc,
+  settingKey,
   action,
   danger,
   divider = true,
@@ -22,7 +23,7 @@ export function SettingRow({
 
   return (
     <>
-      <div className={className} onClick={onClick}>
+      <div className={className} data-setting-key={settingKey} onClick={onClick}>
         <div className="setting-icon-bg">
           <Icon size={14} strokeWidth={1.5} />
         </div>

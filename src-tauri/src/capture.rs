@@ -15,9 +15,21 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 
+struct ComUninitGuard(bool);
+
+impl Drop for ComUninitGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe {
+                windows::Win32::System::Com::CoUninitialize();
+            }
+        }
+    }
+}
+
 pub fn capture_window_bgra(hwnd: HWND) -> Option<(Vec<u8>, u32, u32)> {
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _com = ComUninitGuard(CoInitializeEx(None, COINIT_MULTITHREADED).is_ok());
         if !GraphicsCaptureSession::IsSupported().ok()? {
             return None;
         }

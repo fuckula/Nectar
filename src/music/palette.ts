@@ -194,3 +194,43 @@ export async function artTheme(art: string): Promise<ArtTheme> {
       .map((b) => b.color),
   );
 }
+
+/**
+ * Parses `"rgb(r, g, b)"`, `"rgb(r g b)"`, `"rgba(r, g, b, a)"`, or hex `"#rgb"` / `"#rrggbb"`
+ * into a normalized lowercase `"#rrggbb"` string, clamping RGB channels to `0..255`.
+ */
+export function rgbStringToHex(input: string): string | null {
+  if (typeof input !== "string") return null;
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  const hex6 = /^#([0-9a-f]{6})$/i.exec(trimmed);
+  if (hex6) {
+    return `#${hex6[1].toLowerCase()}`;
+  }
+
+  const hex3 = /^#([0-9a-f])([0-9a-f])([0-9a-f])$/i.exec(trimmed);
+  if (hex3) {
+    return `#${hex3[1]}${hex3[1]}${hex3[2]}${hex3[2]}${hex3[3]}${hex3[3]}`.toLowerCase();
+  }
+
+  const rgbMatch =
+    /^rgba?\(\s*([+-]?(?:\d+\.?\d*|\.\d+))(?:\s*,\s*|\s+)([+-]?(?:\d+\.?\d*|\.\d+))(?:\s*,\s*|\s+)([+-]?(?:\d+\.?\d*|\.\d+))(?:\s*(?:,|\/)\s*([+-]?(?:\d+\.?\d*|\.\d+)%?))?\s*\)$/i.exec(
+      trimmed
+    );
+  if (!rgbMatch) return null;
+
+  const toChannel = (raw: string): number | null => {
+    const num = Number(raw);
+    if (!Number.isFinite(num)) return null;
+    return Math.round(Math.max(0, Math.min(255, num)));
+  };
+
+  const r = toChannel(rgbMatch[1]);
+  const g = toChannel(rgbMatch[2]);
+  const b = toChannel(rgbMatch[3]);
+  if (r === null || g === null || b === null) return null;
+
+  const toHex = (n: number) => n.toString(16).padStart(2, "0");
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}

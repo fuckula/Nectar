@@ -10,7 +10,7 @@ const BASE_ARGS: &str = concat!(
     "--disable-background-networking --disable-component-update ",
     "--disable-domain-reliability --disable-breakpad ",
     "--disk-cache-size=16777216 --media-cache-size=8388608 ",
-    "--enable-low-end-device-mode ",
+    "--disable-rgba-4444-textures ",
     "--js-flags=--max-semi-space-size=1 ",
     "--renderer-process-limit=1 ",
     "--num-raster-threads=2"
@@ -73,5 +73,11 @@ mod tests {
     #[test]
     fn feature_list_is_a_single_flag() {
         assert_eq!(BASE_ARGS.matches("--disable-features=").count(), 1);
+    }
+
+    #[test]
+    fn true_color_tiles_avoid_rgba_4444_quantization() {
+        assert!(!BASE_ARGS.contains("--enable-low-end-device-mode"));
+        assert!(BASE_ARGS.contains("--disable-rgba-4444-textures"));
     }
 }

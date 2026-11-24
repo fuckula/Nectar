@@ -1,18 +1,16 @@
-import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { Image } from "lucide-react";
 import { SettingRow } from "./SettingRow";
 import { useT } from "../i18n";
+import { useSyncedSetting } from "./useSyncedSetting";
+
+const parseGlassWallpaper = (raw: unknown): boolean => raw === true || raw === "true";
 
 export function GlassWallpaper() {
   const t = useT();
-  const [on, setOn] = useState(() => localStorage.getItem("nectar-glass-wallpaper") === "true");
+  const [on, saveOn] = useSyncedSetting("nectar-glass-wallpaper", parseGlassWallpaper, String);
 
   const toggle = () => {
-    const next = !on;
-    setOn(next);
-    localStorage.setItem("nectar-glass-wallpaper", String(next));
-    invoke("save_setting", { key: "nectar-glass-wallpaper", value: String(next) }).catch(() => { });
+    saveOn(!on);
   };
 
   return (

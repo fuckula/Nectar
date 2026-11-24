@@ -1,39 +1,39 @@
 import { useEffect, useState } from "react";
-import type { ChangeEvent, CSSProperties } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { Monitor, Eye, EyeOff, BellDot, Square, Search, Shuffle, MonitorCheck, CalendarDays, Maximize2, Keyboard, Sparkles, RotateCcw, LayoutGrid, Trash2, HardDrive, ChevronUp, TextSearch, SquareTerminal, PanelBottom, Settings as SettingsIcon, Activity, Eraser, Power } from "lucide-react";
+import type { ChangeEvent } from "react";
+import { Monitor, Eye, EyeOff, BellDot, Square, Search, Shuffle, MonitorCheck, CalendarDays, Maximize2, Keyboard, Sparkles, RotateCcw, History, LayoutGrid, Trash2, HardDrive, ChevronUp, TextSearch, SquareTerminal, PanelBottom, Settings as SettingsIcon, Activity, Eraser, Power, Columns3, AlertTriangle, Info, Scaling, MoveHorizontal, MousePointerClick, Zap, LogOut, Waves, ArrowUpFromLine } from "lucide-react";
 import { SettingRow } from "./SettingRow";
 import { SettingSection } from "./SettingSection";
 import { Dropdown } from "./Dropdown";
-import type { MonitorInfo, MonitorMode } from "./types";
+import type { MonitorInfo, MonitorMode, TrayHostStatus } from "./types";
 import { usePerMonitor } from "./usePerMonitor";
+import { useSyncedSetting } from "./useSyncedSetting";
 import { useT } from "../i18n";
+import { useSettingsSync } from "../hooks/useSettingsSync";
 import { HideDelay } from "./HideDelay";
 import { PreviewDelay } from "./PreviewDelay";
 import { EdgeArea } from "./EdgeArea";
 import { ShortcutField } from "./ShortcutField";
+import { ShortcutRecorder } from "./ShortcutRecorder";
+import { bridgeInvoke } from "../utils/tauriBridge";
+import { isHotkeyConflicted, useHotkeyStatus } from "./useHotkeyStatus";
 
-const SEARCH_PROVIDERS = ["windows", "cmdpal", "ptrun", "raycast", "shortcut"];
+const SEARCH_PROVIDERS = ["nectar", "windows", "cmdpal", "ptrun", "raycast", "shortcut"];
 
 const START_ICON_PRESETS = [
   { key: "default", src: "/nectar.png", label: "Nectar" },
   { key: "windows", src: "/windows.svg", label: "Windows" },
 ];
 
-const startIconTileStyle = (active: boolean): CSSProperties => ({
-  width: "48px",
-  height: "48px",
-  borderRadius: "12px",
-  border: active ? "2px solid var(--nectar-accent, #007aff)" : "2px solid rgba(255,255,255,0.1)",
-  background: active ? "color-mix(in srgb, var(--nectar-accent, #007aff) 16%, transparent)" : "rgba(255,255,255,0.05)",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  cursor: "pointer",
-  transition: "all 0.15s ease",
-  padding: "6px",
-  color: "rgba(255,255,255,0.5)",
-});
+const parseClampedNumber = (min: number, max: number, fallback: number, decimals = 0) => (v: unknown): number => {
+  const n = typeof v === "number" ? v : parseFloat(String(v ?? fallback));
+  if (!Number.isFinite(n)) return fallback;
+  const clamped = Math.min(max, Math.max(min, n));
+  if (decimals <= 0) return Math.round(clamped);
+  const factor = Math.pow(10, decimals);
+  return Math.round(clamped * factor) / factor;
+};
+const parseBoolFalse = (v: unknown): boolean => v === true || v === "true";
+const parseBoolTrue = (v: unknown): boolean => v !== false && v !== "false";
 
 interface DriveInfo {
   letter: string;
@@ -46,6 +46,8 @@ interface DockTabProps {
   toggleDock: () => void;
   dockMode: string;
   setDockModeValue: (mode: string) => void;
+  dockReserveSpace: boolean;
+  toggleDockReserveSpace: () => void;
   dockPreviewEnabled: boolean;
   toggleDockPreview: () => void;
   dockAttentionEnabled: boolean;
@@ -102,6 +104,8 @@ export function DockTab({
   toggleDock,
   dockMode,
   setDockModeValue,
+  dockReserveSpace,
+  toggleDockReserveSpace,
   dockPreviewEnabled,
   toggleDockPreview,
   dockAttentionEnabled,
@@ -153,14 +157,95 @@ export function DockTab({
   replaceDockModes,
 }: DockTabProps) {
   const t = useT();
+  const [dockIconSize, setDockIconSize] = useSyncedSetting("nectar-dock-icon-size", parseClampedNumber(28, 48, 36), (v) => String(v), { debounceMs: 120 });
+  const [dockIconGap, setDockIconGap] = useSyncedSetting("nectar-dock-icon-gap", parseClampedNumber(6, 18, 12), (v) => String(v), { debounceMs: 120 });
+  const [dockHoverScale, setDockHoverScale] = useSyncedSetting("nectar-dock-hover-scale", parseClampedNumber(1.0, 1.35, 1.1, 2), (v) => String(v), { debounceMs: 120 });
+  const [dockClassicAnimations, setDockClassicAnimations] = useSyncedSetting("nectar-dock-classic-animations", parseBoolFalse, (v) => String(v));
+  const [dockWaveEnabled, setDockWaveEnabled] = useSyncedSetting("nectar-dock-wave-enabled", parseBoolTrue, (v) => String(v));
+  const [dockLaunchBounce, setDockLaunchBounce] = useSyncedSetting("nectar-dock-launch-bounce", parseBoolTrue, (v) => String(v));
+  const [previewPrecapture, setPreviewPrecapture] = useSyncedSetting("nectar-preview-precapture", parseBoolFalse, (v) => String(v));
+  const [trayBarAutoClose, setTrayBarAutoClose] = useSyncedSetting("nectar-traybar-autoclose", parseBoolTrue, (v) => String(v));
   const perMonitor = usePerMonitor(dockMode, dockModeByMonitor, replaceDockModes, monitors);
   const multiMonitor = dockMonitorMode === "all" && monitors.length > 1;
   const showPerMonitor = multiMonitor && perMonitor.enabled;
   const [drives, setDrives] = useState<DriveInfo[]>([]);
+  const [trayBarEnabled, setTrayBarEnabled] = useState(
+    () => localStorage.getItem("nectar-tray-bar-enabled") !== "false"
+  );
+  const [trayBarLayout, setTrayBarLayout] = useState(
+    () => localStorage.getItem("nectar-tray-bar-layout") || "grid"
+  );
+  const [trayBarHotkey, setTrayBarHotkey] = useState(
+    () => localStorage.getItem("nectar-traybar-hotkey") ?? "Alt+Shift+T"
+  );
+  const [trayHostStatus, setTrayHostStatus] = useState<TrayHostStatus>("active");
+  const [hotkeyStatus, refreshHotkeyStatus] = useHotkeyStatus(
+    `${trayBarHotkey}|${dockEnabled}|${dockTray}|${trayBarEnabled}|${legacyMode}`
+  );
+  const trayHotkeyConflict =
+    !legacyMode &&
+    dockEnabled &&
+    dockTray &&
+    trayBarEnabled &&
+    isHotkeyConflicted(
+      trayBarHotkey,
+      hotkeyStatus?.traybar_ok,
+      hotkeyStatus?.traybar_shortcut
+    );
+
+  const saveTraySetting = (key: string, value: string) => {
+    localStorage.setItem(key, value);
+    return bridgeInvoke("save_setting", { key, value }).catch(() => {});
+  };
 
   useEffect(() => {
-    invoke<DriveInfo[]>("get_drives").then(setDrives).catch(() => {});
+    let cancelled = false;
+    bridgeInvoke<DriveInfo[]>("get_drives").then((d) => !cancelled && setDrives(d)).catch(() => {});
+    bridgeInvoke<Record<string, unknown>>("load_settings")
+      .then((s) => {
+        if (cancelled || !s) return;
+        if (s["nectar-tray-bar-enabled"] !== undefined) {
+          setTrayBarEnabled(String(s["nectar-tray-bar-enabled"]) !== "false");
+        }
+        if (s["nectar-tray-bar-layout"] != null) {
+          setTrayBarLayout(String(s["nectar-tray-bar-layout"]) || "grid");
+        }
+        if (s["nectar-traybar-hotkey"] !== undefined && s["nectar-traybar-hotkey"] !== null) {
+          setTrayBarHotkey(String(s["nectar-traybar-hotkey"]));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  useEffect(() => {
+    if (legacyMode || !dockEnabled || !dockTray) return;
+    let cancelled = false;
+    const queryStatus = () => {
+      bridgeInvoke<TrayHostStatus | null>("get_tray_host_status")
+        .then((res) => {
+          if (!cancelled && (res === "active" || res === "blocked_by_zbid" || res === "stopped")) {
+            setTrayHostStatus(res);
+          }
+        })
+        .catch(() => {});
+    };
+    queryStatus();
+    const timer = window.setTimeout(queryStatus, 220);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [legacyMode, dockEnabled, dockTray, trayBarEnabled]);
+
+  useSettingsSync({
+    "nectar-tray-bar-enabled": (v) => setTrayBarEnabled(v !== false && v !== "false"),
+    "nectar-tray-bar-layout": (v) => setTrayBarLayout(v === "bar" ? "bar" : "grid"),
+    "nectar-traybar-hotkey": (v) =>
+      setTrayBarHotkey(v === null || v === undefined ? "Alt+Shift+T" : String(v)),
+  });
 
   const handleStartIconUpload = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -200,6 +285,19 @@ export function DockTab({
                     { value: "peek", label: t("common.peek") },
                   ]}
                 />
+              </SettingRow>
+            )}
+
+            {dockMode === "fixed" && (
+              <SettingRow
+                icon={PanelBottom}
+                label={t("dock.reserveSpace")}
+                desc={t("dock.reserveSpace.desc")}
+              >
+                <label className="toggle-switch">
+                  <input type="checkbox" checked={dockReserveSpace} onChange={toggleDockReserveSpace} />
+                  <span className="slider"></span>
+                </label>
               </SettingRow>
             )}
 
@@ -262,7 +360,7 @@ export function DockTab({
       {dockEnabled && (
         <>
           <SettingSection id="dock-shortcuts" title={t("dock.section.shortcuts")}>
-            <SettingRow icon={Eye} label={t("dock.previews")} desc={t("dock.previews.desc")}>
+            <SettingRow icon={Eye} label={t("dock.previews")} desc={t("dock.previews.desc")} settingKey="dock.previews">
               <label className="toggle-switch">
                 <input type="checkbox" checked={dockPreviewEnabled} onChange={toggleDockPreview} />
                 <span className="slider"></span>
@@ -270,6 +368,19 @@ export function DockTab({
             </SettingRow>
 
             {dockPreviewEnabled && <PreviewDelay />}
+
+            {dockPreviewEnabled && (
+              <SettingRow icon={Zap} label={t("dock.previewPrecapture")} desc={t("dock.previewPrecapture.desc")} settingKey="dock.previewPrecapture">
+                <label className="toggle-switch">
+                  <input
+                    type="checkbox"
+                    checked={previewPrecapture}
+                    onChange={() => void setPreviewPrecapture(!previewPrecapture)}
+                  />
+                  <span className="slider"></span>
+                </label>
+              </SettingRow>
+            )}
 
             {!legacyMode && (
               <SettingRow icon={BellDot} label={t("dock.attention")} desc={t("dock.attention.desc")}>
@@ -337,6 +448,94 @@ export function DockTab({
                     <span className="slider"></span>
                   </label>
                 </SettingRow>
+
+                {dockTray && (
+                  <>
+                    <SettingRow
+                      icon={PanelBottom}
+                      label={t("dock.trayBar")}
+                      desc={t("dock.trayBar.desc")}
+                      divider={trayHostStatus !== "blocked_by_zbid"}
+                    >
+                      <label className="toggle-switch">
+                        <input
+                          type="checkbox"
+                          checked={trayBarEnabled}
+                          onChange={() => {
+                            const next = !trayBarEnabled;
+                            setTrayBarEnabled(next);
+                            saveTraySetting("nectar-tray-bar-enabled", String(next));
+                          }}
+                        />
+                        <span className="slider"></span>
+                      </label>
+                    </SettingRow>
+                    {trayHostStatus === "blocked_by_zbid" && (
+                      <>
+                        <div className="settings-inline-hint" role="note">
+                          <Info size={13} />
+                          <span>{t("dock.trayZbidHint")}</span>
+                        </div>
+                        <div className="setting-divider" />
+                      </>
+                    )}
+
+                    {trayBarEnabled && (
+                      <>
+                        <SettingRow icon={Columns3} label={t("dock.trayBarLayout")} desc={t("dock.trayBarLayout.desc")}>
+                          <Dropdown
+                            value={trayBarLayout}
+                            onChange={(val) => {
+                              setTrayBarLayout(val);
+                              saveTraySetting("nectar-tray-bar-layout", val);
+                            }}
+                            options={[
+                              { value: "grid", label: t("dock.trayBarLayout.grid") },
+                              { value: "bar", label: t("dock.trayBarLayout.bar") },
+                            ]}
+                          />
+                        </SettingRow>
+
+                        <SettingRow
+                          icon={Keyboard}
+                          label={t("dock.trayBarHotkey")}
+                          desc={t("dock.trayBarHotkey.desc")}
+                          divider={!trayHotkeyConflict}
+                        >
+                          <ShortcutRecorder
+                            value={trayBarHotkey}
+                            onCommit={(next) => {
+                              setTrayBarHotkey(next);
+                              saveTraySetting("nectar-traybar-hotkey", next).then(
+                                refreshHotkeyStatus
+                              );
+                            }}
+                          />
+                        </SettingRow>
+                        {trayHotkeyConflict && (
+                          <>
+                            <div className="settings-inline-warning" role="alert">
+                              <AlertTriangle size={13} />
+                              <span>{t("settings.hotkeyConflict")}</span>
+                            </div>
+                            <div className="setting-divider" />
+                          </>
+                        )}
+
+                        <SettingRow icon={LogOut} label={t("dock.trayBarAutoClose")} desc={t("dock.trayBarAutoClose.desc")} settingKey="dock.trayBarAutoClose">
+                          <label className="toggle-switch">
+                            <input
+                              type="checkbox"
+                              checked={trayBarAutoClose}
+                              onChange={() => void setTrayBarAutoClose(!trayBarAutoClose)}
+                            />
+                            <span className="slider"></span>
+                          </label>
+                        </SettingRow>
+                      </>
+                    )}
+                  </>
+                )}
 
                 <SettingRow icon={LayoutGrid} label={t("dock.taskView")} desc={t("dock.taskView.desc")}>
                   <label className="toggle-switch">
@@ -406,20 +605,103 @@ export function DockTab({
           </SettingSection>
 
           <SettingSection id="dock-style" title={t("dock.section.style")}>
-            <SettingRow icon={Square} label={t("dock.iconOnly")} desc={t("dock.iconOnly.desc")}>
+            <SettingRow icon={Scaling} label={t("dock.iconSize")} desc={t("dock.iconSize.desc", { size: dockIconSize })} settingKey="dock.iconSize">
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <input
+                  type="range"
+                  min="28"
+                  max="48"
+                  step="2"
+                  value={dockIconSize}
+                  onChange={(e) => void setDockIconSize(parseInt(e.target.value, 10))}
+                  className="settings-slider"
+                />
+                <span className="setting-value-badge">{dockIconSize}px</span>
+              </div>
+            </SettingRow>
+
+            <SettingRow icon={MoveHorizontal} label={t("dock.iconGap")} desc={t("dock.iconGap.desc", { gap: dockIconGap })} settingKey="dock.iconGap">
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <input
+                  type="range"
+                  min="6"
+                  max="18"
+                  step="2"
+                  value={dockIconGap}
+                  onChange={(e) => void setDockIconGap(parseInt(e.target.value, 10))}
+                  className="settings-slider"
+                />
+                <span className="setting-value-badge">{dockIconGap}px</span>
+              </div>
+            </SettingRow>
+
+            <SettingRow icon={MousePointerClick} label={t("dock.hoverScale")} desc={t("dock.hoverScale.desc", { percent: Math.round(dockHoverScale * 100) })} settingKey="dock.hoverScale">
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <input
+                  type="range"
+                  min="1.0"
+                  max="1.35"
+                  step="0.05"
+                  value={dockHoverScale}
+                  onChange={(e) => void setDockHoverScale(parseFloat(e.target.value))}
+                  className="settings-slider"
+                />
+                <span className="setting-value-badge">{Math.round(dockHoverScale * 100)}%</span>
+              </div>
+            </SettingRow>
+
+            <SettingRow icon={History} label={t("dock.classicAnimations")} desc={t("dock.classicAnimations.desc")} settingKey="dock.classicAnimations">
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={dockClassicAnimations}
+                  onChange={() => void setDockClassicAnimations(!dockClassicAnimations)}
+                />
+                <span className="slider"></span>
+              </label>
+            </SettingRow>
+
+            <SettingRow icon={Waves} label={t("dock.wave")} desc={t("dock.wave.desc")} settingKey="dock.wave">
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={!dockClassicAnimations && dockWaveEnabled}
+                  disabled={dockClassicAnimations}
+                  onChange={() => void setDockWaveEnabled(!dockWaveEnabled)}
+                />
+                <span className="slider"></span>
+              </label>
+            </SettingRow>
+
+            <SettingRow icon={ArrowUpFromLine} label={t("dock.bounce")} desc={t("dock.bounce.desc")} settingKey="dock.bounce">
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={!dockClassicAnimations && dockLaunchBounce}
+                  disabled={dockClassicAnimations}
+                  onChange={() => void setDockLaunchBounce(!dockLaunchBounce)}
+                />
+                <span className="slider"></span>
+              </label>
+            </SettingRow>
+
+            <SettingRow icon={Square} label={t("dock.iconOnly")} desc={t("dock.iconOnly.desc")} settingKey="dock.iconOnly">
               <label className="toggle-switch">
                 <input type="checkbox" checked={dockIconOnly} onChange={toggleDockIconOnly} />
                 <span className="slider"></span>
               </label>
             </SettingRow>
 
-            <SettingRow icon={PanelBottom} label={t("dock.indicator")} desc={t("dock.indicator.desc")}>
+            <SettingRow icon={PanelBottom} label={t("dock.indicator")} desc={t("dock.indicator.desc")} settingKey="dock.indicator">
               <Dropdown
                 value={dockIndicator}
                 options={[
-                  { value: "bar", label: t("dock.indicator.bar") },
-                  { value: "fixed", label: t("dock.indicator.fixed") },
                   { value: "dots", label: t("dock.indicator.dots") },
+                  { value: "pill", label: t("dock.indicator.pill") },
+                  { value: "bar", label: t("dock.indicator.bar") },
+                  { value: "glow", label: t("dock.indicator.glow") },
+                  { value: "fixed", label: t("dock.indicator.fixed") },
+                  { value: "none", label: t("dock.indicator.none") },
                 ]}
                 onChange={changeDockIndicator}
               />
@@ -464,19 +746,23 @@ export function DockTab({
               </div>
               <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", paddingLeft: "34px" }}>
                 {START_ICON_PRESETS.map((icon) => (
-                  <div
+                  <button
                     key={icon.key}
+                    type="button"
                     onClick={() => handleStartIconChange(icon.key)}
-                    style={startIconTileStyle(startIcon === icon.key)}
+                    className={`start-icon-tile${startIcon === icon.key ? " active" : ""}`}
                     title={icon.label}
+                    aria-label={icon.label}
                   >
                     <img src={icon.src} alt={icon.label} style={{ width: "100%", height: "100%", objectFit: "contain" }} draggable={false} />
-                  </div>
+                  </button>
                 ))}
-                <div
+                <button
+                  type="button"
                   onClick={() => document.getElementById("start-icon-file-input")?.click()}
-                  style={startIconTileStyle(startIcon.startsWith("custom:"))}
+                  className={`start-icon-tile${startIcon.startsWith("custom:") ? " active" : ""}`}
                   title={t("dock.startIcon.custom")}
+                  aria-label={t("dock.startIcon.custom")}
                 >
                   {startIcon.startsWith("custom:") ? (
                     <img
@@ -488,11 +774,17 @@ export function DockTab({
                   ) : (
                     <span style={{ fontSize: "20px" }}>+</span>
                   )}
-                </div>
+                </button>
                 {startIcon !== "default" && (
-                  <div onClick={() => handleStartIconChange("default")} style={startIconTileStyle(false)} title={t("dock.startIcon.reset")}>
+                  <button
+                    type="button"
+                    onClick={() => handleStartIconChange("default")}
+                    className="start-icon-tile"
+                    title={t("dock.startIcon.reset")}
+                    aria-label={t("dock.startIcon.reset")}
+                  >
                     <RotateCcw size={18} strokeWidth={1.5} />
-                  </div>
+                  </button>
                 )}
               </div>
               <input

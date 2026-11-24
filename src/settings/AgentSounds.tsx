@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { useCallback, useEffect, useState } from "react";
 import { Bell, CircleCheck, CircleAlert, Volume2, Play, FolderOpen, RotateCcw } from "lucide-react";
 import { SettingRow } from "./SettingRow";
-import { playAgentSound, soundKey, stateSoundOn, type SoundState } from "../agentSounds";
+import { playAgentSound, soundKey, type SoundState } from "../agentSounds";
 import { useT } from "../i18n";
+import { bridgeInvoke, bridgeListen } from "../utils/tauriBridge";
+import { useSyncedSetting } from "./useSyncedSetting";
 
 const ROWS: { state: SoundState; icon: typeof Bell }[] = [
   { state: "needs_input", icon: Bell },
@@ -12,30 +12,57 @@ const ROWS: { state: SoundState; icon: typeof Bell }[] = [
   { state: "error", icon: CircleAlert },
 ];
 
+const parseEnabled = (raw: unknown): boolean => raw !== false && raw !== "false";
+const parseDefaultOn = (raw: unknown): boolean =>
+  raw === null || raw === undefined ? true : raw === true || raw === "true";
+const parseDefaultOff = (raw: unknown): boolean => raw === true || raw === "true";
+
 export function AgentSounds() {
   const t = useT();
-  const [enabled, setEnabled] = useState(() => localStorage.getItem("nectar-agent-sounds") !== "false");
+  const [enabled, saveEnabled] = useSyncedSetting("nectar-agent-sounds", parseEnabled, String);
+  const [needsInputOn, saveNeedsInput] = useSyncedSetting(soundKey("needs_input"), parseDefaultOn, String);
+  const [doneOn, saveDone] = useSyncedSetting(soundKey("done"), parseDefaultOff, String);
+  const [errorOn, saveError] = useSyncedSetting(soundKey("error"), parseDefaultOn, String);
   const [custom, setCustom] = useState<string[]>([]);
-  const [stateOn, setStateOn] = useState<Record<SoundState, boolean>>(() => ({ needs_input: stateSoundOn("needs_input"), done: stateSoundOn("done"), error: stateSoundOn("error") }));
-  const toggleState = (state: SoundState) => {
-    const next = !stateOn[state];
-    setStateOn({ ...stateOn, [state]: next });
-    localStorage.setItem(soundKey(state), String(next));
-    invoke("save_setting", { key: soundKey(state), value: String(next) }).catch(() => { });
-  };
-  const refresh = () => invoke<string[]>("agent_sound_custom").then(setCustom).catch(() => { });
 
-  useEffect(() => {
-    refresh();
-    const unlisten = listen("agent-sound-changed", refresh);
-    return () => { unlisten.then((fn) => fn()); };
+  const stateOn: Record<SoundState, boolean> = {
+    needs_input: needsInputOn,
+    done: doneOn,
+    error: errorOn,
+  };
+
+  const toggleState = (state: SoundState) => {
+    if (state === "needs_input") saveNeedsInput(!needsInputOn);
+    else if (state === "done") saveDone(!doneOn);
+    else saveError(!errorOn);
+  };
+
+  const refresh = useCallback(() => {
+    bridgeInvoke<string[] | null>("agent_sound_custom")
+      .then((res) => {
+        if (Array.isArray(res)) setCustom(res);
+      })
+      .catch(() => {});
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    let stop: (() => void) | undefined;
+    refresh();
+    bridgeListen("agent-sound-changed", () => {
+      if (!cancelled) refresh();
+    }).then((fn) => {
+      if (cancelled) fn();
+      else stop = fn;
+    });
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+  }, [refresh]);
+
   const toggle = () => {
-    const next = !enabled;
-    setEnabled(next);
-    localStorage.setItem("nectar-agent-sounds", String(next));
-    invoke("save_setting", { key: "nectar-agent-sounds", value: String(next) }).catch(() => { });
+    saveEnabled(!enabled);
   };
 
   return (
@@ -54,8 +81,8 @@ export function AgentSounds() {
               <span className="slider"></span>
             </label>
             <button className="agent-sound-btn" onClick={() => playAgentSound(state, true)}><Play size={12} />{t("notch.agentSound.play")}</button>
-            <button className="agent-sound-btn" onClick={() => invoke("pick_agent_sound", { state }).catch(() => { })}><FolderOpen size={12} />{t("notch.agentSound.choose")}</button>
-            {custom.includes(state) && <button className="agent-sound-btn" onClick={() => invoke("reset_agent_sound", { state })} title={t("notch.agentSound.reset")}><RotateCcw size={12} /></button>}
+            <button className="agent-sound-btn" onClick={() => bridgeInvoke("pick_agent_sound", { state }).catch(() => {})}><FolderOpen size={12} />{t("notch.agentSound.choose")}</button>
+            {custom.includes(state) && <button className="agent-sound-btn" onClick={() => bridgeInvoke("reset_agent_sound", { state }).catch(() => {})} title={t("notch.agentSound.reset")}><RotateCcw size={12} /></button>}
           </div>
         </SettingRow>
       ))}

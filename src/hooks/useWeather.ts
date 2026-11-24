@@ -20,6 +20,7 @@ import {
   type LucideProps,
 } from "lucide-react";
 import { setVisibleInterval } from "./visibleInterval";
+import { isGameModePausePollsActive } from "./useGameMode";
 
 // WMO weather interpretation codes
 // https://open-meteo.com/en/docs#weathervariables
@@ -265,19 +266,28 @@ export function useWeather(enabled: boolean) {
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
 
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   // Core fetch + refresh logic
   const doFetch = useCallback(
     async (showStaleOnError = true, coords?: { lat: number; lon: number }, city?: string) => {
-      if (!enabledRef.current) return;
+      if (!enabledRef.current || !mountedRef.current) return;
 
       try {
         const location = coords ? { ...coords, city: city } : await resolveLocation();
-        if (!location) return;
+        if (!location || !enabledRef.current || !mountedRef.current) return;
         const result = await fetchWeatherForCoords(
           location.lat,
           location.lon,
           tempUnitRef.current,
         );
+        if (!mountedRef.current) return;
 
         setTemperature(result.temperature);
         setWeatherCondition(result.weatherCondition);
@@ -287,10 +297,13 @@ export function useWeather(enabled: boolean) {
         // Update city name if resolved from IP geolocation
         if (location.city) {
           setCityName(location.city);
-          localStorage.setItem("nectar-weather-city", location.city);
+          try {
+            localStorage.setItem("nectar-weather-city", location.city);
+          } catch {}
         }
       } catch (e) {
         console.warn("Weather fetch failed:", e);
+        if (!mountedRef.current) return;
         if (!showStaleOnError && import.meta.env.DEV) {
           const mockTemp = tempUnitRef.current === "fahrenheit" ? 72 : 22;
           setTemperature(mockTemp);
@@ -304,8 +317,10 @@ export function useWeather(enabled: boolean) {
 
   // Load cached values from Tauri settings on mount
   useEffect(() => {
+    let cancelled = false;
     invoke("load_settings")
       .then((settings: any) => {
+        if (cancelled || !settings) return;
         const cachedTemp =
           settings["nectar-weather-cached-temp"] ??
           localStorage.getItem("nectar-weather-cached-temp");
@@ -332,41 +347,76 @@ export function useWeather(enabled: boolean) {
         }
       })
       .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Listen for temp unit changes
   useEffect(() => {
-    const unlisten = listen<{ key: string; value: any }>(
-      "settings-changed",
-      (event) => {
-        const { key, value } = event.payload;
-        if (key === "nectar-temp-unit") {
-          setTempUnit(String(value));
-        }
-      },
-    );
-    const unlistenExternal = listen<{ key: string; value: any }>(
-      "settings-external-changed",
-      (event) => {
-        const { key, value } = event.payload;
-        if (key === "nectar-temp-unit") {
-          setTempUnit(String(value));
-        }
-      },
-    );
+    let cancelled = false;
+    let stopChanged: (() => void) | undefined;
+    let stopExternal: (() => void) | undefined;
+    let stopBatch: (() => void) | undefined;
+
+    listen<{ key: string; value: any }>("settings-changed", (event) => {
+      if (cancelled) return;
+      const { key, value } = event.payload;
+      if (key === "nectar-temp-unit" && value != null) {
+        setTempUnit(String(value));
+      }
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else stopChanged = fn;
+      })
+      .catch(() => {});
+
+    listen<{ key: string; value: any }>("settings-external-changed", (event) => {
+      if (cancelled) return;
+      const { key, value } = event.payload;
+      if (key === "nectar-temp-unit" && value != null) {
+        setTempUnit(String(value));
+      }
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else stopExternal = fn;
+      })
+      .catch(() => {});
+
+    listen<{ entries?: Record<string, any> }>("settings-batch-changed", (event) => {
+      if (cancelled) return;
+      const entries = event.payload?.entries;
+      if (!entries) return;
+      if (entries["nectar-temp-unit"] != null) {
+        setTempUnit(String(entries["nectar-temp-unit"]));
+      }
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else stopBatch = fn;
+      })
+      .catch(() => {});
+
     return () => {
-      unlisten.then((fn) => fn());
-      unlistenExternal.then((fn) => fn());
+      cancelled = true;
+      stopChanged?.();
+      stopExternal?.();
+      stopBatch?.();
     };
   }, []);
 
   // Listen for instant refresh from Settings (direct Tauri event with coords)
   useEffect(() => {
     if (!enabled) return;
+    let cancelled = false;
+    let stopRefresh: (() => void) | undefined;
 
-    const unlisten = listen<{ lat: number; lon: number; city?: string } | true>(
+    listen<{ lat: number; lon: number; city?: string } | true>(
       "weather-refresh",
       (event) => {
+        if (cancelled) return;
         const payload = event.payload;
         if (
           payload &&
@@ -374,53 +424,77 @@ export function useWeather(enabled: boolean) {
           "lat" in payload &&
           "lon" in payload
         ) {
-          doFetch(false, { lat: (payload as any).lat, lon: (payload as any).lon }, (payload as any).city);
+          void doFetch(false, { lat: (payload as any).lat, lon: (payload as any).lon }, (payload as any).city);
         } else {
-          doFetch(false);
+          void doFetch(false);
         }
       },
-    );
+    )
+      .then((fn) => {
+        if (cancelled) fn();
+        else stopRefresh = fn;
+      })
+      .catch(() => {});
+
     return () => {
-      unlisten.then((fn) => fn());
+      cancelled = true;
+      stopRefresh?.();
     };
   }, [enabled, doFetch]);
 
   // Listen for city changes from Settings. The saved coordinates are read again on every refresh.
   useEffect(() => {
+    let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const unlisten = listen<{ key: string; value: any }>(
-      "settings-changed",
-      (event) => {
-        const { key, value } = event.payload;
-        if (key === "nectar-weather-city") {
-          setCityName(String(value || ""));
-        }
-        if (key === "nectar-weather-city" || key === "nectar-weather-lat" || key === "nectar-weather-lon") {
-          clearTimeout(timer);
-          timer = setTimeout(() => doFetch(false), 250);
-        }
-      },
-    );
+    let stopCity: (() => void) | undefined;
+
+    listen<{ key: string; value: any }>("settings-changed", (event) => {
+      if (cancelled) return;
+      const { key, value } = event.payload;
+      if (key === "nectar-weather-city") {
+        setCityName(String(value || ""));
+      }
+      if (key === "nectar-weather-city" || key === "nectar-weather-lat" || key === "nectar-weather-lon") {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          if (!cancelled) void doFetch(false);
+        }, 250);
+      }
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else stopCity = fn;
+      })
+      .catch(() => {});
+
     return () => {
-      clearTimeout(timer);
-      unlisten.then((fn) => fn());
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      stopCity?.();
     };
   }, [doFetch]);
 
-  // Initial fetch + 30-min interval
+  // Single clean mount fetch + 30-min Game-Mode-gated interval
   useEffect(() => {
     if (!enabled) return;
 
-    doFetch(false);
+    void doFetch(false);
 
-    const interval = setVisibleInterval(() => doFetch(false), REFRESH_INTERVAL_MS);
+    const interval = setVisibleInterval(() => {
+      if (!isGameModePausePollsActive()) {
+        void doFetch(false);
+      }
+    }, REFRESH_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [enabled, doFetch]);
 
-  // Re-fetch when temperature unit changes (without resetting interval)
+  // Re-fetch only when temperature unit actually changes after mount (without resetting interval)
+  const prevTempUnitRef = useRef(tempUnit);
   useEffect(() => {
+    if (prevTempUnitRef.current === tempUnit) return;
+    prevTempUnitRef.current = tempUnit;
     if (!enabled) return;
-    doFetch(true);
+    void doFetch(true);
   }, [tempUnit, enabled, doFetch]);
 
   return {

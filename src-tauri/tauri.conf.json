@@ -103,13 +103,11 @@
   },
   "plugins": {
     "updater": {
-      "active": true,
+      "active": false,
       "windows": {
         "installMode": "quiet"
       },
-      "endpoints": [
-        "https://github.com/kua8/Nectar/releases/latest/download/latest.json"
-      ],
+      "endpoints": [],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY2QTJCRjEzRjIxNkI5NkEKUldScXVSYnlFNytpWm0ycmxwTVVUeDdxMjVPdHBzNGJHcm1LT2RFVWVNOC9zd3Y1bHpLM1BwWFIK"
     }
   }

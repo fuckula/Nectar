@@ -22,7 +22,7 @@ pub async fn set_menu_open(open: bool, rect: Option<IntRect>) {
 #[tauri::command]
 pub fn set_window_keyboard_focus(window: Window, enabled: bool) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetForegroundWindow, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
     };
     if let Ok(mut label) = crate::state::KEYBOARD_FOCUS_LABEL.lock() {
         if enabled {
@@ -32,13 +32,21 @@ pub fn set_window_keyboard_focus(window: Window, enabled: bool) {
         }
     }
     let Ok(hwnd) = window.hwnd() else { return };
+    let raw = hwnd.0 as isize;
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as usize;
         let noactivate = WS_EX_NOACTIVATE.0 as usize;
         if enabled {
+            crate::state::KEYBOARD_FOCUS_HWND.store(raw, Ordering::SeqCst);
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex & !noactivate) as isize);
-            let _ = SetForegroundWindow(hwnd);
+            let _ = crate::utils::force_foreground(hwnd);
         } else {
+            let _ = crate::state::KEYBOARD_FOCUS_HWND.compare_exchange(
+                raw,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex | noactivate) as isize);
         }
     }
@@ -62,6 +70,11 @@ pub async fn set_notch_hidden(window: Window, hidden: bool) {
 }
 
 #[tauri::command]
+pub async fn set_dock_hidden(window: Window, hidden: bool) {
+    crate::state::set_flag(crate::state::dock_hidden(), window.label(), hidden);
+}
+
+#[tauri::command]
 pub async fn set_dock_dragging(dragging: bool) {
     crate::state::DOCK_IS_DRAGGING.store(dragging, Ordering::Relaxed);
 }
@@ -74,6 +87,13 @@ pub async fn update_dock_rect(window: Window, rect: IntRect) {
 }
 
 #[tauri::command]
+pub async fn update_dock_pill_rect(window: Window, rect: IntRect) {
+    if let Ok(mut m) = crate::state::dock_pill_rects().lock() {
+        m.insert(window.label().to_string(), rect);
+    }
+}
+
+#[tauri::command]
 pub async fn update_notch_rect(window: Window, rect: IntRect) {
     if let Ok(mut m) = crate::state::notch_rects().lock() {
         m.insert(window.label().to_string(), rect);
@@ -81,7 +101,14 @@ pub async fn update_notch_rect(window: Window, rect: IntRect) {
 }
 
 #[tauri::command]
-pub fn set_window_height(window: Window, height: f64) {
+pub fn set_window_height(app: AppHandle, window: Window, height: f64) {
+    let label = window.label().to_string();
+    if crate::state::is_notch_label(&label) {
+        let nectar_scale = crate::utils::get_nectar_scale(&app).clamp(0.75, 1.75);
+        let unscaled = (height / nectar_scale).ceil() as i32;
+        let min_h = if unscaled > 420 { unscaled } else { 0 };
+        crate::state::set_i32(crate::state::notch_min_heights(), &label, min_h);
+    }
     if let Ok(scale_factor) = window.scale_factor() {
         if let Ok(physical_size) = window.inner_size() {
             let logical_width = physical_size.width as f64 / scale_factor;
@@ -147,6 +174,10 @@ pub async fn init_dock_window(app: &AppHandle, dock_win: tauri::WebviewWindow, m
         // register_dock_appbar calls show() internally too, and handles retries
         register_dock_appbar(dock_win.clone());
     } else {
+        if let Ok(hwnd) = dock_win.hwnd() {
+            unregister_appbar_native(hwnd);
+        }
+        crate::state::set_flag(crate::state::dock_appbar_registered(), &label, false);
         let dock_clone = dock_win.clone();
         tauri::async_runtime::spawn(async move {
             for attempt in 0..20 {
@@ -198,7 +229,6 @@ pub async fn init_dock_window(app: &AppHandle, dock_win: tauri::WebviewWindow, m
     // 3. Hide taskbar after showing dock (not before, so user always has something)
     set_taskbar_visibility(false, false);
     NATIVE_TASKBAR_HIDDEN.store(true, Ordering::Relaxed);
-    crate::tray_icons::schedule_taskbar_layout_refresh();
 
     // 4. Reset overlap state so the overlap thread re-syncs cleanly
     crate::state::set_overlap(crate::state::dock_overlap(), &label, 0);
@@ -215,15 +245,15 @@ pub async fn toggle_dock(app: AppHandle, enable: bool) {
         if enable {
             // Saved dock mode, smart on a fresh install.
             let saved_mode = crate::utils::get_setting_str(&app, "nectar-dock-mode")
-                .unwrap_or_else(|| "smart".to_string());
+                .unwrap_or_else(|| {
+                    crate::monitors::default_mode_for_kind(crate::types::WindowKind::Dock)
+                        .to_string()
+                });
             init_dock(app.clone(), saved_mode).await;
         } else {
             let _ = dock_win.hide();
             if let Ok(hwnd) = dock_win.hwnd() {
-                let hwnd_val = hwnd.0 as isize;
-                tauri::async_runtime::spawn_blocking(move || {
-                    unregister_appbar_native(HWND(hwnd_val as *mut _));
-                });
+                unregister_appbar_native(hwnd);
             }
             crate::state::set_flag(crate::state::dock_appbar_registered(), "dock", false);
             set_taskbar_visibility(true, true);
@@ -251,7 +281,9 @@ pub async fn sync_appbar(app: AppHandle) {
                 re_assert_topmost(hwnd);
             }
         } else if crate::state::is_dock_label(&label) {
-            if dock_enabled == "true" && crate::state::get_flag(crate::state::dock_appbar_registered(), &label) {
+            if dock_enabled == "true"
+                && crate::monitors::resolve_mode_for_label(&app, crate::types::WindowKind::Dock, &label) == "fixed"
+            {
                 register_dock_appbar(win);
             } else if let Ok(hwnd) = win.hwnd() {
                 re_assert_topmost(hwnd);
@@ -288,10 +320,7 @@ async fn change_dock_mode_for_window(app: &AppHandle, dock_win: tauri::WebviewWi
     } else {
         let _ = dock_win.show();
         if let Ok(hwnd) = dock_win.hwnd() {
-            let hwnd_val = hwnd.0 as isize;
-            tauri::async_runtime::spawn_blocking(move || {
-                unregister_appbar_native(HWND(hwnd_val as *mut _));
-            });
+            unregister_appbar_native(hwnd);
             crate::state::set_flag(crate::state::dock_appbar_registered(), &label, false);
 
             let dock_clone = dock_win.clone();
@@ -352,7 +381,12 @@ async fn change_dock_mode_for_window(app: &AppHandle, dock_win: tauri::WebviewWi
     let label_clone = label.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        if crate::state::get_flag(crate::state::dock_appbar_registered(), &label_clone) {
+        if crate::monitors::resolve_mode_for_label(
+            &dock_clone.app_handle(),
+            crate::types::WindowKind::Dock,
+            &label_clone,
+        ) == "fixed"
+        {
             register_dock_appbar(dock_clone);
         }
     });
@@ -379,10 +413,7 @@ pub async fn init_notch_window(app: &AppHandle, main_win: tauri::WebviewWindow, 
     } else {
         let _ = main_win.show();
         if let Ok(hwnd) = main_win.hwnd() {
-            let hwnd_val = hwnd.0 as isize;
-            tauri::async_runtime::spawn_blocking(move || {
-                unregister_appbar_native(HWND(hwnd_val as *mut _));
-            });
+            unregister_appbar_native(hwnd);
             crate::state::set_flag(crate::state::main_appbar_registered(), &label, false);
 
             let main_clone = main_win.clone();
@@ -400,7 +431,8 @@ pub async fn init_notch_window(app: &AppHandle, main_win: tauri::WebviewWindow, 
         let m_size = monitor.size();
         let scale = monitor.scale_factor();
         let nectar_scale = crate::utils::get_nectar_scale(app);
-        let target_height = (420.0 * nectar_scale * scale) as u32;
+        let base_h = crate::state::get_i32(crate::state::notch_min_heights(), &label, 0).max(420) as f64;
+        let target_height = (base_h * nectar_scale * scale) as u32;
         let _ = main_win.set_position(tauri::PhysicalPosition::new(m_pos.x, m_pos.y));
         let _ = main_win.set_size(tauri::PhysicalSize::new(m_size.width, target_height));
     }
@@ -443,23 +475,43 @@ fn get_uwp_launch_cmd(exe_path: &str) -> Option<String> {
     None
 }
 
-/// Coalesces duplicate events, has to stay below the double-click interval.
-const START_TOGGLE_DEBOUNCE_MS: i64 = 80;
+/// Coalesces blur-close and duplicate toggles within 300ms.
+const START_TOGGLE_DEBOUNCE_MS: i64 = 300;
 /// How long Win is held so the shell registers the tap.
 const START_WIN_KEY_HOLD_MS: u64 = 40;
 
 fn send_key_tap(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY, hold_ms: u64) {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, KEYBDINPUT, KEYEVENTF_KEYUP};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VK_LWIN, VK_RWIN,
+    };
+    let ext = if vk == VK_LWIN || vk == VK_RWIN {
+        KEYEVENTF_EXTENDEDKEY
+    } else {
+        KEYBD_EVENT_FLAGS(0)
+    };
     let down = [INPUT {
-        r#type: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_KEYBOARD,
+        r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
-            ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: Default::default(), time: 0, dwExtraInfo: 0 },
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: 0,
+                dwFlags: ext,
+                time: 0,
+                dwExtraInfo: crate::utils::NECTAR_INJECTED_EXTRA_INFO,
+            },
         },
     }];
     let up = [INPUT {
-        r#type: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_KEYBOARD,
+        r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
-            ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: KEYEVENTF_KEYUP, time: 0, dwExtraInfo: 0 },
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: 0,
+                dwFlags: ext | KEYEVENTF_KEYUP,
+                time: 0,
+                dwExtraInfo: crate::utils::NECTAR_INJECTED_EXTRA_INFO,
+            },
         },
     }];
     unsafe {
@@ -509,6 +561,9 @@ fn toggle_start_menu() {
     if now - LAST_START_TOGGLE_MS.load(Ordering::Relaxed) < START_TOGGLE_DEBOUNCE_MS {
         return;
     }
+    if crate::shell_windows::was_surface_blur_hidden_recently(crate::shell_windows::START_LABEL) {
+        return;
+    }
     LAST_START_TOGGLE_MS.store(now, Ordering::Relaxed);
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -522,12 +577,31 @@ fn toggle_start_menu() {
 }
 
 pub fn send_win_chord(key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LWIN};
-    let input = |vk: VIRTUAL_KEY, up: bool| INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() }, time: 0, dwExtraInfo: 0 },
-        },
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LWIN, VK_RWIN,
+    };
+    let input = |vk: VIRTUAL_KEY, up: bool| {
+        let mut flags = if up {
+            KEYEVENTF_KEYUP
+        } else {
+            KEYBD_EVENT_FLAGS(0)
+        };
+        if vk == VK_LWIN || vk == VK_RWIN {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: crate::utils::NECTAR_INJECTED_EXTRA_INFO,
+                },
+            },
+        }
     };
     let inputs = [input(VK_LWIN, false), input(key, false), input(key, true), input(VK_LWIN, true)];
     unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
@@ -541,32 +615,36 @@ pub struct DockDrive {
 }
 
 #[tauri::command]
-pub fn get_drives() -> Vec<DockDrive> {
-    use windows::core::PCWSTR;
-    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
-    const DRIVE_REMOVABLE: u32 = 2;
-    const DRIVE_FIXED: u32 = 3;
-    let mask = unsafe { GetLogicalDrives() };
-    let mut drives = Vec::new();
-    for i in 0..26u32 {
-        if mask & (1 << i) == 0 { continue; }
-        let letter = (b'A' + i as u8) as char;
-        let root: Vec<u16> = format!("{letter}:\\").encode_utf16().chain(std::iter::once(0)).collect();
-        let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
-        if kind != DRIVE_FIXED && kind != DRIVE_REMOVABLE { continue; }
-        let mut name = [0u16; 64];
-        let label = unsafe {
-            GetVolumeInformationW(PCWSTR(root.as_ptr()), Some(&mut name), None, None, None, None)
-                .map(|_| String::from_utf16_lossy(&name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())]))
-                .unwrap_or_default()
-        };
-        drives.push(DockDrive { letter: letter.to_string(), label, removable: kind == DRIVE_REMOVABLE });
-    }
-    drives
+pub async fn get_drives() -> Vec<DockDrive> {
+    tauri::async_runtime::spawn_blocking(|| {
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
+        const DRIVE_REMOVABLE: u32 = 2;
+        const DRIVE_FIXED: u32 = 3;
+        let mask = unsafe { GetLogicalDrives() };
+        let mut drives = Vec::new();
+        for i in 0..26u32 {
+            if mask & (1 << i) == 0 { continue; }
+            let letter = (b'A' + i as u8) as char;
+            let root: Vec<u16> = format!("{letter}:\\").encode_utf16().chain(std::iter::once(0)).collect();
+            let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+            if kind != DRIVE_FIXED && kind != DRIVE_REMOVABLE { continue; }
+            let mut name = [0u16; 64];
+            let label = unsafe {
+                GetVolumeInformationW(PCWSTR(root.as_ptr()), Some(&mut name), None, None, None, None)
+                    .map(|_| String::from_utf16_lossy(&name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())]))
+                    .unwrap_or_default()
+            };
+            drives.push(DockDrive { letter: letter.to_string(), label, removable: kind == DRIVE_REMOVABLE });
+        }
+        drives
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[tauri::command]
-pub fn open_dock_extra(target: String) -> Result<(), String> {
+pub async fn open_dock_extra(target: String) -> Result<(), String> {
     let path = if target == "recycle" {
         "shell:RecycleBinFolder".to_string()
     } else if target.len() == 1 && target.as_bytes()[0].is_ascii_uppercase() {
@@ -574,19 +652,46 @@ pub fn open_dock_extra(target: String) -> Result<(), String> {
     } else {
         return Err(format!("unknown dock extra: {target}"));
     };
-    std::process::Command::new("explorer.exe").arg(path).spawn().map(|_| ()).map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new("explorer.exe")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn open_app(app: AppHandle, window: Window, app_name: String, args: Option<String>) {
     if app_name == "start" {
-        toggle_start_menu();
+        let legacy = get_setting_str(&app, "nectar-legacy-mode").is_some_and(|v| v == "true");
+        let custom_start = !legacy
+            && get_setting_str(&app, "nectar-start-custom-enabled").is_none_or(|v| v != "false");
+        if custom_start {
+            crate::shell_windows::toggle_start_async(app);
+        } else {
+            toggle_start_menu();
+        }
         return;
     }
 
     if app_name == "search" {
         let legacy = get_setting_str(&app, "nectar-legacy-mode").is_some_and(|v| v == "true");
-        let provider = if legacy { String::new() } else { get_setting_str(&app, "nectar-dock-search-provider").unwrap_or_default() };
+        let provider = if legacy {
+            String::new()
+        } else {
+            get_setting_str(&app, "nectar-dock-search-provider")
+                .unwrap_or_else(|| "nectar".to_string())
+        };
+        if provider == "nectar"
+            && !legacy
+            && get_setting_str(&app, "nectar-launcher-enabled").is_none_or(|v| v != "false")
+        {
+            crate::shell_windows::toggle_launcher_async(app, None);
+            return;
+        }
         let shortcut = get_setting_str(&app, "nectar-dock-search-shortcut");
         let label = window.label().to_string();
         tauri::async_runtime::spawn_blocking(move || {
@@ -664,6 +769,38 @@ fn is_pwa_shortcut_for(app: &AppInfo, name: &str, host_exe: &str) -> bool {
         && app.executable.as_deref().is_some_and(|exe| exe.eq_ignore_ascii_case(host_exe))
 }
 
+fn resolve_moved_squirrel_exe(path: &str) -> String {
+    use std::path::Path;
+    if Path::new(path).exists() {
+        return path.to_string();
+    }
+    if let Some(exe_name) = Path::new(path).file_name() {
+        if let Some(parent) = Path::new(path).parent().and_then(|p| p.parent()) {
+            if parent.exists() {
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    let mut app_dirs = Vec::new();
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if (name.starts_with("app-") || name.starts_with("current"))
+                            && entry.path().is_dir()
+                        {
+                            app_dirs.push(entry.path());
+                        }
+                    }
+                    app_dirs.sort();
+                    if let Some(latest) = app_dirs.last() {
+                        let exe = latest.join(exe_name);
+                        if exe.exists() {
+                            return exe.to_string_lossy().to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    path.to_string()
+}
+
 fn pe_subsystem(path: &str) -> Option<u16> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
@@ -691,7 +828,7 @@ fn gui_launcher_for(path: &str) -> Option<String> {
 }
 
 /// Opens a path, shortcut or shell app id through the shell.
-fn launch_path(path: &str, args: Option<&str>) {
+pub(crate) fn launch_path(path: &str, args: Option<&str>) {
     unsafe {
         use windows::Win32::UI::Shell::ShellExecuteW;
         use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -742,32 +879,7 @@ fn launch_path(path: &str, args: Option<&str>) {
         }
 
         use std::path::Path;
-        let mut final_path = path.to_string();
-        
-        if !Path::new(&final_path).exists() {
-            if let Some(exe_name) = Path::new(&final_path).file_name() {
-                if let Some(parent) = Path::new(&final_path).parent().and_then(|p| p.parent()) {
-                    if parent.exists() {
-                        if let Ok(entries) = std::fs::read_dir(parent) {
-                            let mut app_dirs = Vec::new();
-                            for entry in entries.flatten() {
-                                let name = entry.file_name().to_string_lossy().to_string();
-                                if (name.starts_with("app-") || name.starts_with("current")) && entry.path().is_dir() {
-                                    app_dirs.push(entry.path());
-                                }
-                            }
-                            app_dirs.sort();
-                            if let Some(latest) = app_dirs.last() {
-                                let exe = latest.join(exe_name);
-                                if exe.exists() {
-                                    final_path = exe.to_string_lossy().to_string();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let mut final_path = resolve_moved_squirrel_exe(path);
 
         if let Some(twin) = gui_launcher_for(&final_path) {
             final_path = twin;
@@ -801,9 +913,7 @@ fn launch_path(path: &str, args: Option<&str>) {
 #[tauri::command]
 pub async fn get_active_windows() -> Vec<AppInfo> {
     tauri::async_runtime::spawn_blocking(move || {
-        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
-        // COM is needed here, each window's AppUserModelID comes from the shell property store.
-        let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
+        let _com = crate::utils::ComApartmentGuard::init_mta();
 
         let mut apps: Vec<AppInfo> = Vec::new();
         unsafe {
@@ -826,18 +936,24 @@ pub async fn get_active_windows() -> Vec<AppInfo> {
                 path.clone()
             };
 
+            let win_entry = app
+                .all_hwnds
+                .as_ref()
+                .and_then(|v| v.first().cloned())
+                .unwrap_or_else(|| (app.hwnd.unwrap_or(0), app.name.clone()));
+
             if let Some(existing) = grouped.get_mut(&key) {
                 if let Some(ref mut hwnds) = existing.all_hwnds {
-                    hwnds.push((app.hwnd.unwrap_or(0), app.name.clone()));
+                    hwnds.push(win_entry);
                 } else {
                     existing.all_hwnds = Some(vec![
                         (existing.hwnd.unwrap_or(0), existing.name.clone()),
-                        (app.hwnd.unwrap_or(0), app.name.clone())
+                        win_entry,
                     ]);
                 }
             } else {
-                let mut new_app = app.clone();
-                new_app.all_hwnds = Some(vec![(app.hwnd.unwrap_or(0), app.name.clone())]);
+                let mut new_app = app;
+                new_app.all_hwnds = Some(vec![win_entry]);
                 grouped.insert(key, new_app);
             }
         }
@@ -864,10 +980,6 @@ pub async fn get_active_windows() -> Vec<AppInfo> {
                     ts_b.cmp(&ts_a)
                 });
             }
-        }
-
-        if com_initialized {
-            unsafe { CoUninitialize(); }
         }
 
         result_apps
@@ -954,7 +1066,12 @@ pub async fn bring_window_forward(hwnd: isize) {
         }
 
         let mine = GetCurrentThreadId();
-        let front = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        let fg = GetForegroundWindow();
+        let front = if crate::utils::is_hwnd_responsive_for_attach(fg) {
+            GetWindowThreadProcessId(fg, None)
+        } else {
+            0
+        };
         let attached = front != 0 && front != mine && AttachThreadInput(mine, front, true).as_bool();
 
         force_set_foreground(hwnd);
@@ -1091,6 +1208,9 @@ pub async fn focus_app_windows(hwnds: Vec<isize>) {
 
 fn get_cache_key(path: &str, name: Option<&str>) -> String {
     let path_lc = path.to_lowercase();
+    if path_lc.starts_with("tray-icon:") {
+        return path.to_string();
+    }
     let name_lc = name.map(|n| n.to_lowercase()).unwrap_or_default();
     if path_lc.contains("msedge.exe") || path_lc.contains("chrome.exe") || path_lc.contains("brave.exe") || path_lc.contains("applicationframehost.exe") {
         format!("{}:{}", path, name_lc)
@@ -1126,9 +1246,18 @@ fn extract_arg(args: &str, key: &str) -> Option<String> {
 pub fn is_aumid_path(path: &str) -> bool {
     let p = path.trim().trim_matches('"');
     if p.is_empty() || p.len() < 3 { return false; }
-    if p.to_lowercase().starts_with("shell:appsfolder\\") { return true; }
+    let lower = p.to_ascii_lowercase();
+    if lower.starts_with("shell:appsfolder\\") { return true; }
     if p.contains('\\') || p.contains('/') || p.contains(':') { return false; }
-    if p.to_lowercase().ends_with(".exe") { return false; }
+    if [
+        ".exe", ".msc", ".cpl", ".bat", ".cmd", ".ps1", ".vbs", ".lnk", ".url", ".msi", ".com",
+        ".scr",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+    {
+        return false;
+    }
     if std::path::Path::new(p).exists() { return false; }
     true
 }
@@ -1139,7 +1268,7 @@ fn is_browser_host_process(path: &str) -> bool {
 }
 
 /// Icon for a shell app id via shell:AppsFolder (SHGetFileInfoW can't do these).
-fn icon_from_aumid(aumid: &str) -> Option<String> {
+pub(crate) fn icon_from_aumid(aumid: &str) -> Option<String> {
     unsafe {
         use windows::Win32::Foundation::SIZE;
         use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY};
@@ -1413,29 +1542,35 @@ fn image_size_score(path: &std::path::Path) -> u64 {
     score
 }
 
-static LAST_ICON_SAVE_REQUEST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static LAST_ICON_SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn schedule_icon_cache_save(app: AppHandle) {
-    let now = crate::utils::get_now_ms();
-    LAST_ICON_SAVE_REQUEST.store(now, Ordering::Relaxed);
+    let seq = LAST_ICON_SAVE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
 
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-        let last = LAST_ICON_SAVE_REQUEST.load(Ordering::Relaxed);
-        if now == last || crate::utils::get_now_ms() - last >= 950 {
-            if let Ok(dir) = app.path().app_config_dir() {
-                let cache_path = dir.join("icons_cache.json");
-                if let Some(c) = crate::state::ICON_CACHE.get() {
-                    let snapshot = if let Ok(lock) = c.lock() {
-                        serde_json::to_string(&*lock).unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    if !snapshot.is_empty() {
-                        let _ = tauri::async_runtime::spawn_blocking(move || {
-                            let _ = std::fs::write(&cache_path, snapshot);
-                        }).await;
-                    }
+        if LAST_ICON_SAVE_SEQ.load(Ordering::Relaxed) != seq {
+            return;
+        }
+        if let Ok(dir) = app.path().app_config_dir() {
+            let cache_path = dir.join("icons_cache.json");
+            if let Some(c) = crate::state::ICON_CACHE.get() {
+                let snapshot = if let Ok(lock) = c.lock() {
+                    lock.clone()
+                } else {
+                    return;
+                };
+                if !snapshot.is_empty() {
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        if let Some(parent) = cache_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if let Ok(file) = std::fs::File::create(&cache_path) {
+                            let mut writer = std::io::BufWriter::new(file);
+                            let _ = serde_json::to_writer(&mut writer, &snapshot);
+                        }
+                    })
+                    .await;
                 }
             }
         }
@@ -1477,6 +1612,22 @@ fn generic_exe_icon() -> Option<&'static str> {
 
 fn is_generic_icon(icon: &str) -> bool {
     generic_exe_icon().is_some_and(|g| g == icon)
+}
+
+fn cache_icon_if_valid(
+    cache: &std::sync::Mutex<HashMap<String, String>>,
+    key: String,
+    icon: &str,
+) -> bool {
+    if is_generic_icon(icon) {
+        return false;
+    }
+    if let Ok(mut lock) = cache.lock() {
+        lock.insert(key, icon.to_string());
+        true
+    } else {
+        false
+    }
 }
 
 fn icon_from_exe_neighbourhood(exe: &str) -> Option<String> {
@@ -1530,14 +1681,18 @@ pub async fn get_app_icon(app: AppHandle, path: String, name: Option<String>, hw
     }
 
     // Strategy 0: Check for custom icon first
-    let custom_icons_dir = cache_dir.join("custom_icons");
-    let custom_file = custom_icons_dir.join(format!("{}.png", sanitize_filename(&cache_key)));
-    if custom_file.exists() {
-        if let Ok(data) = std::fs::read(&custom_file) {
+    let custom_file = cache_dir.join("custom_icons").join(format!("{}.png", sanitize_filename(&cache_key)));
+    if let Ok(Some(encoded)) = tauri::async_runtime::spawn_blocking(move || {
+        if !custom_file.exists() {
+            return None;
+        }
+        std::fs::read(&custom_file).ok().map(|data| {
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-            return Ok(Some(format!("data:image/png;base64,{}", b64)));
-        }
+            format!("data:image/png;base64,{}", b64)
+        })
+    }).await {
+        return Ok(Some(encoded));
     }
 
     // Java programs share one javaw.exe, so the exe icon is the same for all of them. Use the window's own icon.
@@ -1546,6 +1701,7 @@ pub async fn get_app_icon(app: AppHandle, path: String, name: Option<String>, hw
         if path_lc.ends_with("\\javaw.exe") || path_lc.ends_with("\\java.exe") {
             let icon = tauri::async_runtime::spawn_blocking(move || unsafe {
                 use windows::Win32::UI::WindowsAndMessaging::{GetClassLongPtrW, GCLP_HICON, WM_GETICON, ICON_BIG, SendMessageTimeoutW, SMTO_ABORTIFHUNG};
+                let _com = crate::utils::ComApartmentGuard::init_mta();
                 let h_hwnd = HWND(h as *mut _);
                 let mut res = 0usize;
                 let _ = SendMessageTimeoutW(h_hwnd, WM_GETICON, windows::Win32::Foundation::WPARAM(ICON_BIG as usize), windows::Win32::Foundation::LPARAM(0), SMTO_ABORTIFHUNG, 250, Some(&mut res));
@@ -1561,21 +1717,30 @@ pub async fn get_app_icon(app: AppHandle, path: String, name: Option<String>, hw
         }
     }
 
-    let cache = ICON_CACHE.get_or_init(|| {
-        let version_marker = cache_dir.join("icons_cache_v2");
-        if !version_marker.exists() {
-            let _ = std::fs::remove_file(&cache_path);
-            let _ = std::fs::create_dir_all(&cache_dir);
-            let _ = std::fs::write(&version_marker, b"1");
+    let cache = match ICON_CACHE.get() {
+        Some(c) => c,
+        None => {
+            let cache_dir_init = cache_dir.clone();
+            let cache_path_init = cache_path.clone();
+            let loaded = tauri::async_runtime::spawn_blocking(move || {
+                let version_marker = cache_dir_init.join("icons_cache_v2");
+                if !version_marker.exists() {
+                    let _ = std::fs::remove_file(&cache_path_init);
+                    let _ = std::fs::create_dir_all(&cache_dir_init);
+                    let _ = std::fs::write(&version_marker, b"1");
+                }
+                let mut map = std::collections::HashMap::new();
+                if let Ok(content) = std::fs::read_to_string(&cache_path_init) {
+                    if let Ok(existing) = serde_json::from_str::<std::collections::HashMap<String, String>>(&content) {
+                        map = existing;
+                        map.retain(|_, v| !is_generic_icon(v));
+                    }
+                }
+                map
+            }).await.unwrap_or_default();
+            ICON_CACHE.get_or_init(|| std::sync::Mutex::new(loaded))
         }
-        let mut map = std::collections::HashMap::new();
-        if let Ok(content) = std::fs::read_to_string(&cache_path) {
-            if let Ok(existing) = serde_json::from_str::<std::collections::HashMap<String, String>>(&content) {
-                map = existing;
-            }
-        }
-        std::sync::Mutex::new(map)
-    });
+    };
 
     let is_uwp_host = path.to_lowercase().contains("applicationframehost.exe");
     let stale_store_path = path.to_lowercase().contains("\\windowsapps\\") && !std::path::Path::new(&path).exists();
@@ -1598,6 +1763,25 @@ pub async fn get_app_icon(app: AppHandle, path: String, name: Option<String>, hw
         }
     }
 
+    if let Some(icon) = cache.lock().ok().and_then(|c| c.get(&cache_key).cloned()) {
+        return Ok(Some(icon));
+    }
+
+    if path.eq_ignore_ascii_case("ms-settings:") {
+        let icon = tauri::async_runtime::spawn_blocking(|| {
+            let _com = crate::utils::ComApartmentGuard::init_mta();
+            icon_from_aumid("windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel")
+        })
+        .await
+        .unwrap_or(None);
+        if let Some(base64) = icon {
+            if cache_icon_if_valid(cache, cache_key.clone(), &base64) {
+                schedule_icon_cache_save(app.clone());
+            }
+            return Ok(Some(base64));
+        }
+    }
+
     if let Some(apps_cache) = INSTALLED_APPS_CACHE.get() {
         if let Ok(apps) = apps_cache.lock() {
             let scanned = apps.iter().find(|a| {
@@ -1605,12 +1789,10 @@ pub async fn get_app_icon(app: AppHandle, path: String, name: Option<String>, hw
                     && (a.path == path
                         || (match_by_name && lookup_name.as_deref().is_some_and(|n| a.name.eq_ignore_ascii_case(n))))
             });
-            if let Some(scanned) = scanned {
-                let icon = scanned.icon.clone().unwrap();
-                if let Ok(mut c) = cache.lock() {
-                    c.insert(cache_key.clone(), icon.clone());
+            if let Some(icon) = scanned.and_then(|s| s.icon.clone()) {
+                if cache_icon_if_valid(cache, cache_key.clone(), &icon) {
+                    schedule_icon_cache_save(app.clone());
                 }
-                schedule_icon_cache_save(app.clone());
                 return Ok(Some(icon));
             }
         }
@@ -1618,33 +1800,17 @@ pub async fn get_app_icon(app: AppHandle, path: String, name: Option<String>, hw
 
     {
         let path_for_pin = path.clone();
-        let pin_icon = tauri::async_runtime::spawn_blocking(move || unsafe {
-            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED, CoUninitialize};
-            let com = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-            let icon = crate::taskbar_pins::icon_for_target(&path_for_pin);
-            if com { CoUninitialize(); }
-            icon
+        let pin_icon = tauri::async_runtime::spawn_blocking(move || {
+            let _com = crate::utils::ComApartmentGuard::init_mta();
+            crate::taskbar_pins::icon_for_target(&path_for_pin)
         }).await.unwrap_or(None);
 
         if let Some(icon) = pin_icon {
-            if let Ok(mut c) = cache.lock() { c.insert(cache_key.clone(), icon.clone()); }
-            schedule_icon_cache_save(app.clone());
+            if cache_icon_if_valid(cache, cache_key.clone(), &icon) {
+                schedule_icon_cache_save(app.clone());
+            }
             return Ok(Some(icon));
         }
-    }
-
-    let cached = cache.lock().ok().and_then(|c| c.get(&cache_key).cloned());
-    if let Some(icon) = cached {
-        let stale = tauri::async_runtime::spawn_blocking({
-            let icon = icon.clone();
-            move || is_generic_icon(&icon)
-        })
-        .await
-        .unwrap_or(false);
-        if !stale {
-            return Ok(Some(icon));
-        }
-        if let Ok(mut c) = cache.lock() { c.remove(&cache_key); }
     }
 
     // Resolve bare names (notepad.exe) first so Store packages get their own logo, not the System32 stub.
@@ -1665,18 +1831,17 @@ pub async fn get_app_icon(app: AppHandle, path: String, name: Option<String>, hw
     if aumid_opt.is_some() || packaged_exe {
         let path_owned = path.clone();
         let result = tauri::async_runtime::spawn_blocking(move || {
-            let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
-            let icon = match aumid_opt {
+            let _com = crate::utils::ComApartmentGuard::init_mta();
+            match aumid_opt {
                 Some(aumid) => icon_from_aumid(&aumid),
                 None => packaged_exe_icon(&path_owned),
-            };
-            unsafe { windows::Win32::System::Com::CoUninitialize(); }
-            icon
+            }
         }).await.unwrap_or(None);
 
         if let Some(base64) = result {
-            if let Ok(mut c) = cache.lock() { c.insert(cache_key.clone(), base64.clone()); }
-            schedule_icon_cache_save(app);
+            if cache_icon_if_valid(cache, cache_key.clone(), &base64) {
+                schedule_icon_cache_save(app);
+            }
             return Ok(Some(base64));
         }
     }
@@ -1685,16 +1850,13 @@ pub async fn get_app_icon(app: AppHandle, path: String, name: Option<String>, hw
     if let Some(h) = hwnd {
         let path_owned = path.clone();
         let result = tauri::async_runtime::spawn_blocking(move || unsafe {
-            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED, CoUninitialize};
             use windows::Win32::UI::WindowsAndMessaging::{GetClassLongPtrW, GCLP_HICON, WM_GETICON, ICON_BIG, SendMessageTimeoutW, SMTO_ABORTIFHUNG};
-            
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let _com = crate::utils::ComApartmentGuard::init_mta();
 
             // Browser-hosted PWAs only show the browser icon on the window, so go by the
             // window's AUMID (command line as fallback).
             if is_browser_host_process(&path_owned) {
                 if let Some(icon) = pwa_icon_for_window(HWND(h as *mut _), &path_owned) {
-                    CoUninitialize();
                     return Some(icon);
                 }
             }
@@ -1712,17 +1874,13 @@ pub async fn get_app_icon(app: AppHandle, path: String, name: Option<String>, hw
                 if res != 0 { h_icon = windows::Win32::UI::WindowsAndMessaging::HICON(res as *mut _); }
             }
             
-            let res = if !h_icon.is_invalid() { icon_to_base64(h_icon) } else { None };
-            
-            CoUninitialize();
-            res
+            if !h_icon.is_invalid() { icon_to_base64(h_icon) } else { None }
         }).await.unwrap_or(None);
 
         if let Some(base64) = result {
-            if let Ok(mut c) = cache.lock() {
-                c.insert(cache_key.clone(), base64.clone());
+            if cache_icon_if_valid(cache, cache_key.clone(), &base64) {
+                schedule_icon_cache_save(app);
             }
-            schedule_icon_cache_save(app);
             return Ok(Some(base64));
         }
     }
@@ -1731,102 +1889,100 @@ pub async fn get_app_icon(app: AppHandle, path: String, name: Option<String>, hw
     let path_clone = path.clone();
     let ck_clone = cache_key.clone();
     let file_icon = tauri::async_runtime::spawn_blocking(move || unsafe {
-        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED, CoUninitialize};
         use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
         use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
-        
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let result = {
-            let (mut actual_path, args) = if path_clone.to_lowercase().ends_with(".lnk") {
-                resolve_shortcut(&path_clone).unwrap_or((path_clone.clone(), String::new()))
-            } else {
-                (path_clone.clone(), String::new())
-            };
+        let _com = crate::utils::ComApartmentGuard::init_mta();
+        let (mut actual_path, args) = if path_clone.to_lowercase().ends_with(".lnk") {
+            resolve_shortcut(&path_clone).unwrap_or((path_clone.clone(), String::new()))
+        } else {
+            (path_clone.clone(), String::new())
+        };
 
-            // Shortcuts can have their own icon file (Firefox web apps).
-            let mut icon_data = if path_clone.to_lowercase().ends_with(".lnk") {
-                get_shortcut_icon_location(&path_clone).and_then(|p| image_file_to_base64(&p))
-            } else {
-                None
-            };
+        // Shortcuts can have their own icon file (Firefox web apps).
+        let mut icon_data = if path_clone.to_lowercase().ends_with(".lnk") {
+            get_shortcut_icon_location(&path_clone).and_then(|p| image_file_to_base64(&p))
+        } else {
+            None
+        };
 
-            // Web apps keep their icon in the browser profile.
-            if icon_data.is_none() {
-                if let Some(pwa_icon_path) = find_browser_pwa_icon(&actual_path, &args) {
-                    icon_data = image_file_to_base64(&pwa_icon_path);
-                }
+        // Web apps keep their icon in the browser profile.
+        if icon_data.is_none() {
+            if let Some(pwa_icon_path) = find_browser_pwa_icon(&actual_path, &args) {
+                icon_data = image_file_to_base64(&pwa_icon_path);
             }
+        }
 
-            // UWP shortcuts launch `explorer.exe shell:AppsFolder\<AUMID>`.
-            if icon_data.is_none() {
-                if let Some(aumid) = extract_arg(&args, "shell:AppsFolder\\") {
-                    icon_data = icon_from_aumid(&aumid);
-                }
+        // UWP shortcuts launch `explorer.exe shell:AppsFolder\<AUMID>`.
+        if icon_data.is_none() {
+            if let Some(aumid) = extract_arg(&args, "shell:AppsFolder\\") {
+                icon_data = icon_from_aumid(&aumid);
             }
+        }
 
-            if let Some(icon) = icon_data {
-                if let Ok(mut lock) = ICON_CACHE.get().unwrap().lock() { lock.insert(ck_clone, icon.clone()); }
-                CoUninitialize();
+        if let Some(icon) = icon_data {
+            if let Some(cache) = ICON_CACHE.get() {
+                cache_icon_if_valid(cache, ck_clone, &icon);
+            }
+            return Some(icon);
+        }
+
+        // Robust path resolution for common apps
+        if !std::path::Path::new(&actual_path).is_absolute() {
+            let lower = actual_path.to_lowercase();
+            if lower == "code" || lower == "code.exe" {
+                if let Ok(home) = std::env::var("USERPROFILE") {
+                    let p = format!("{}\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe", home);
+                    if std::path::Path::new(&p).exists() { actual_path = p; }
+                }
+            } else if lower == "msedge" || lower == "msedge.exe" {
+                let candidates = [
+                    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                ];
+                for c in &candidates {
+                    if std::path::Path::new(c).exists() { actual_path = c.to_string(); break; }
+                }
+            } else if lower == "notepad" || lower == "notepad.exe" {
+                let candidates = [
+                    r"C:\Windows\System32\notepad.exe",
+                    r"C:\Windows\notepad.exe",
+                ];
+                for c in &candidates {
+                    if std::path::Path::new(c).exists() { actual_path = c.to_string(); break; }
+                }
+            } else if lower == "explorer" || lower == "explorer.exe" {
+                let p = r"C:\Windows\explorer.exe";
+                if std::path::Path::new(p).exists() { actual_path = p.to_string(); }
+            }
+        }
+
+        if actual_path.to_lowercase().starts_with("shell:") {
+            if let Some(icon) = crate::utils::icon_from_parsing_name(&actual_path) {
+                if let Some(cache) = ICON_CACHE.get() {
+                    cache_icon_if_valid(cache, ck_clone, &icon);
+                }
                 return Some(icon);
             }
+        }
 
-            // Robust path resolution for common apps
-            if !std::path::Path::new(&actual_path).is_absolute() {
-                let lower = actual_path.to_lowercase();
-                if lower == "code" || lower == "code.exe" {
-                    if let Ok(home) = std::env::var("USERPROFILE") {
-                        let p = format!("{}\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe", home);
-                        if std::path::Path::new(&p).exists() { actual_path = p; }
-                    }
-                } else if lower == "msedge" || lower == "msedge.exe" {
-                    let candidates = [
-                        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-                        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-                    ];
-                    for c in &candidates {
-                        if std::path::Path::new(c).exists() { actual_path = c.to_string(); break; }
-                    }
-                } else if lower == "notepad" || lower == "notepad.exe" {
-                    let candidates = [
-                        r"C:\Windows\System32\notepad.exe",
-                        r"C:\Windows\notepad.exe",
-                    ];
-                    for c in &candidates {
-                        if std::path::Path::new(c).exists() { actual_path = c.to_string(); break; }
-                    }
-                } else if lower == "explorer" || lower == "explorer.exe" {
-                    let p = r"C:\Windows\explorer.exe";
-                    if std::path::Path::new(p).exists() { actual_path = p.to_string(); }
+        let mut shfi: SHFILEINFOW = std::mem::zeroed();
+        let icon_path = &actual_path;
+        let path_u16: Vec<u16> = icon_path.encode_utf16().chain(std::iter::once(0)).collect();
+        let res = SHGetFileInfoW(windows::core::PCWSTR(path_u16.as_ptr()), Default::default(), Some(&mut shfi), std::mem::size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON);
+
+        if res != 0 && !shfi.hIcon.is_invalid() {
+            let mut base64_icon = icon_to_base64(shfi.hIcon);
+            let _ = DestroyIcon(shfi.hIcon);
+            if base64_icon.as_deref().is_some_and(is_generic_icon) {
+                base64_icon = icon_from_exe_neighbourhood(&actual_path);
+            }
+            if let Some(ref base64) = base64_icon {
+                if let Some(cache) = ICON_CACHE.get() {
+                    cache_icon_if_valid(cache, ck_clone, base64);
                 }
             }
-
-            if actual_path.to_lowercase().starts_with("shell:") {
-                if let Some(icon) = crate::utils::icon_from_parsing_name(&actual_path) {
-                    if let Ok(mut lock) = ICON_CACHE.get().unwrap().lock() { lock.insert(ck_clone, icon.clone()); }
-                    CoUninitialize();
-                    return Some(icon);
-                }
-            }
-
-            let mut shfi: SHFILEINFOW = std::mem::zeroed();
-            let icon_path = &actual_path;
-            let path_u16: Vec<u16> = icon_path.encode_utf16().chain(std::iter::once(0)).collect();
-            let res = SHGetFileInfoW(windows::core::PCWSTR(path_u16.as_ptr()), Default::default(), Some(&mut shfi), std::mem::size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON);
-
-            if res != 0 && !shfi.hIcon.is_invalid() {
-                let mut base64_icon = icon_to_base64(shfi.hIcon);
-                let _ = DestroyIcon(shfi.hIcon);
-                if base64_icon.as_deref().is_some_and(is_generic_icon) {
-                    base64_icon = icon_from_exe_neighbourhood(&actual_path);
-                }
-                if let Some(ref base64) = base64_icon {
-                    if let Ok(mut lock) = ICON_CACHE.get().unwrap().lock() { lock.insert(ck_clone, base64.clone()); }
-                }
-                Some(base64_icon)
-            } else { None }
-        };
-        CoUninitialize();
-        result.flatten()
+            base64_icon
+        } else { None }
     }).await.map_err(|e| e.to_string())?;
 
     if file_icon.is_some() {
@@ -1835,52 +1991,56 @@ pub async fn get_app_icon(app: AppHandle, path: String, name: Option<String>, hw
     Ok(file_icon)
 }
 
-#[tauri::command]
-pub fn save_pinned_apps(app: AppHandle, apps: Vec<AppInfo>) -> Result<(), String> {
+pub(crate) fn save_pinned_apps_sync(app: &AppHandle, apps: &[AppInfo]) -> Result<(), String> {
     let path = app.path().app_config_dir().map_err(|e| e.to_string())?.join("pinned_apps.json");
-    if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
-    let content = serde_json::to_string(&apps).map_err(|e| e.to_string())?;
-    std::fs::write(path, content).map_err(|e| e.to_string())?;
-    Ok(())
+    let content = serde_json::to_string(apps).map_err(|e| e.to_string())?;
+    crate::utils::write_atomic_bytes(&path, content.as_bytes())
+}
+
+#[tauri::command]
+pub async fn save_pinned_apps(app: AppHandle, apps: Vec<AppInfo>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_pinned_apps_sync(&app, &apps))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn load_pinned_apps(app: AppHandle) -> Vec<AppInfo> {
-    let cfg_dir = app.path().app_config_dir().unwrap_or_default();
-    let path = cfg_dir.join("pinned_apps.json");
-    let synced_marker = cfg_dir.join("taskbar_pins_synced");
+    tauri::async_runtime::spawn_blocking(move || {
+        let cfg_dir = app.path().app_config_dir().unwrap_or_default();
+        let path = cfg_dir.join("pinned_apps.json");
+        let synced_marker = cfg_dir.join("taskbar_pins_synced");
 
-    if !synced_marker.exists() {
-        let imported = tauri::async_runtime::spawn_blocking(import_taskbar_pins).await.ok().flatten();
-        if let Some(imported) = imported {
-            if !imported.is_empty() {
-                let _ = save_pinned_apps(app.clone(), imported.clone());
-                let _ = std::fs::write(&synced_marker, b"1");
-                return imported;
+        if !synced_marker.exists() {
+            if let Some(imported) = import_taskbar_pins() {
+                if !imported.is_empty() {
+                    let _ = save_pinned_apps_sync(&app, &imported);
+                    let _ = std::fs::write(&synced_marker, b"1");
+                    return imported;
+                }
             }
         }
-    }
 
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        if let Ok(apps) = serde_json::from_str(&content) { return apps; }
-    }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(apps) = serde_json::from_str(&content) {
+                return apps;
+            }
+        }
 
-    vec![
-        AppInfo { name: "File Explorer".into(), path: "C:\\Windows\\explorer.exe".into(), icon: None, is_running: false, hwnd: None, executable: Some("explorer.exe".into()), all_hwnds: None, args: None },
-        AppInfo { name: "Microsoft Edge".into(), path: "msedge".into(), icon: None, is_running: false, hwnd: None, executable: Some("msedge.exe".into()), all_hwnds: None, args: None },
-        AppInfo { name: "Notepad".into(), path: "notepad.exe".into(), icon: None, is_running: false, hwnd: None, executable: Some("notepad.exe".into()), all_hwnds: None, args: None },
-        AppInfo { name: "Settings".into(), path: "nectar-settings".into(), icon: None, is_running: false, hwnd: None, executable: None, all_hwnds: None, args: None },
-    ]
+        vec![
+            AppInfo { name: "File Explorer".into(), path: "C:\\Windows\\explorer.exe".into(), icon: None, is_running: false, hwnd: None, executable: Some("explorer.exe".into()), all_hwnds: None, args: None },
+            AppInfo { name: "Microsoft Edge".into(), path: "msedge".into(), icon: None, is_running: false, hwnd: None, executable: Some("msedge.exe".into()), all_hwnds: None, args: None },
+            AppInfo { name: "Notepad".into(), path: "notepad.exe".into(), icon: None, is_running: false, hwnd: None, executable: Some("notepad.exe".into()), all_hwnds: None, args: None },
+            AppInfo { name: "Settings".into(), path: "nectar-settings".into(), icon: None, is_running: false, hwnd: None, executable: None, all_hwnds: None, args: None },
+        ]
+    })
+    .await
+    .unwrap_or_default()
 }
 
 fn import_taskbar_pins() -> Option<Vec<AppInfo>> {
-    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
-    unsafe {
-        let com = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-        let pins = crate::taskbar_pins::read_pins();
-        if com { CoUninitialize(); }
-        pins
-    }
+    let _com = crate::utils::ComApartmentGuard::init_mta();
+    crate::taskbar_pins::read_pins()
 }
 
 #[tauri::command]
@@ -1899,124 +2059,131 @@ pub async fn clear_icon_cache(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn set_custom_icon(app: AppHandle, cache_key: String, icon_data: String) -> Result<String, String> {
-    use base64::Engine;
-    use image::GenericImageView;
+    let app_for_emit = app.clone();
+    let result: String = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        use base64::Engine;
+        use image::GenericImageView;
 
-    // Validate and decode the base64 data URI
-    let b64_str = if icon_data.starts_with("data:") {
-        icon_data.split(',').nth(1).ok_or("Invalid data URI")?
-    } else {
-        &icon_data
-    };
+        let b64_str = if icon_data.starts_with("data:") {
+            icon_data.split(',').nth(1).ok_or("Invalid data URI")?
+        } else {
+            &icon_data
+        };
 
-    let raw_bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64_str)
-        .map_err(|e| format!("Invalid base64: {}", e))?;
+        let raw_bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64_str)
+            .map_err(|e| format!("Invalid base64: {}", e))?;
 
-    // Decode image to validate and get dimensions
-    let img = image::load_from_memory(&raw_bytes)
-        .map_err(|e| format!("Invalid image: {}", e))?;
+        let img = image::load_from_memory(&raw_bytes)
+            .map_err(|e| format!("Invalid image: {}", e))?;
 
-    let (w, h) = img.dimensions();
-    if w < 16 || h < 16 {
-        return Err("Icon must be at least 16x16 pixels".into());
-    }
+        let (w, h) = img.dimensions();
+        if w < 16 || h < 16 {
+            return Err("Icon must be at least 16x16 pixels".into());
+        }
 
-    // Resize to fit within 256x256 preserving aspect ratio, then center on transparent canvas
-    let target = 256u32;
-    let final_img = if w > target || h > target {
-        let scaled = img.resize(target, target, image::imageops::FilterType::Lanczos3);
-        let (sw, sh) = scaled.dimensions();
-        let mut canvas = image::RgbaImage::new(target, target);
-        let ox = (target - sw) / 2;
-        let oy = (target - sh) / 2;
-        image::imageops::overlay(&mut canvas, &scaled, ox as i64, oy as i64);
-        image::DynamicImage::ImageRgba8(canvas)
-    } else {
-        img
-    };
+        let target = 256u32;
+        let final_img = if w > target || h > target {
+            let scaled = img.resize(target, target, image::imageops::FilterType::Lanczos3);
+            let (sw, sh) = scaled.dimensions();
+            let mut canvas = image::RgbaImage::new(target, target);
+            let ox = (target - sw) / 2;
+            let oy = (target - sh) / 2;
+            image::imageops::overlay(&mut canvas, &scaled, ox as i64, oy as i64);
+            image::DynamicImage::ImageRgba8(canvas)
+        } else {
+            img
+        };
 
-    // Encode to PNG bytes
-    let mut png_bytes: Vec<u8> = Vec::new();
-    final_img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
-        .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+        let mut png_bytes: Vec<u8> = Vec::new();
+        final_img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .map_err(|e| format!("Failed to encode PNG: {}", e))?;
 
-    // Save to custom_icons directory
-    let icons_dir = get_custom_icons_dir(&app)?;
-    let filename = format!("{}.png", sanitize_filename(&cache_key));
-    let file_path = icons_dir.join(&filename);
-    std::fs::write(&file_path, &png_bytes).map_err(|e| e.to_string())?;
+        let icons_dir = get_custom_icons_dir(&app)?;
+        let sanitized = sanitize_filename(&cache_key);
+        let file_path = icons_dir.join(format!("{}.png", sanitized));
+        std::fs::write(&file_path, &png_bytes).map_err(|e| e.to_string())?;
 
-    // Update manifest mapping sanitized filename -> original cache key
-    let manifest_path = icons_dir.join("custom_icons.json");
-    let mut manifest: std::collections::HashMap<String, String> = if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        std::collections::HashMap::new()
-    };
-    manifest.insert(sanitize_filename(&cache_key), cache_key);
-    let _ = std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap_or_default());
+        let manifest_path = icons_dir.join("custom_icons.json");
+        let mut manifest: std::collections::HashMap<String, String> = if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
+        manifest.insert(sanitized, cache_key);
+        let _ = std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap_or_default());
 
-    // Return the data URI for immediate use
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-    Ok(format!("data:image/png;base64,{}", b64))
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+        Ok(format!("data:image/png;base64,{}", b64))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let _ = app_for_emit.emit("custom-icons-updated", ());
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn remove_custom_icon(app: AppHandle, path: String, name: Option<String>) -> Result<(), String> {
-    let cache_key = get_cache_key(&path, name.as_deref());
-    let icons_dir = get_custom_icons_dir(&app)?;
-    let sanitized = sanitize_filename(&cache_key);
-    let filename = format!("{}.png", sanitized);
-    let file_path = icons_dir.join(&filename);
-    if file_path.exists() {
-        std::fs::remove_file(&file_path).map_err(|e| e.to_string())?;
-    }
-    // Remove from manifest
-    let manifest_path = icons_dir.join("custom_icons.json");
-    if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-        if let Ok(mut manifest) = serde_json::from_str::<std::collections::HashMap<String, String>>(&content) {
-            manifest.remove(&sanitized);
-            let _ = std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap_or_default());
+    let app_for_save = app.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let cache_key = get_cache_key(&path, name.as_deref());
+        let icons_dir = get_custom_icons_dir(&app)?;
+        let sanitized = sanitize_filename(&cache_key);
+        let file_path = icons_dir.join(format!("{}.png", sanitized));
+        if file_path.exists() {
+            std::fs::remove_file(&file_path).map_err(|e| e.to_string())?;
         }
-    }
-    // Also remove from persistent cache so the original icon is re-fetched
-    if let Some(c) = ICON_CACHE.get() {
-        if let Ok(mut lock) = c.lock() {
-            lock.remove(&cache_key);
+        let manifest_path = icons_dir.join("custom_icons.json");
+        if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(mut manifest) = serde_json::from_str::<std::collections::HashMap<String, String>>(&content) {
+                manifest.remove(&sanitized);
+                let _ = std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap_or_default());
+            }
         }
-    }
-    schedule_icon_cache_save(app);
+        if let Some(c) = ICON_CACHE.get() {
+            if let Ok(mut lock) = c.lock() {
+                lock.remove(&cache_key);
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let _ = app_for_save.emit("custom-icons-updated", ());
+    schedule_icon_cache_save(app_for_save);
     Ok(())
 }
 
 #[tauri::command]
 pub async fn get_custom_icons(app: AppHandle) -> Result<HashMap<String, String>, String> {
-    let icons_dir = get_custom_icons_dir(&app)?;
-    let manifest_path = icons_dir.join("custom_icons.json");
-    let manifest: std::collections::HashMap<String, String> = if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        std::collections::HashMap::new()
-    };
-    let mut result = HashMap::new();
-    if let Ok(entries) = std::fs::read_dir(&icons_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("png") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    // Use original cache key from manifest, fallback to sanitized stem
-                    let key = manifest.get(stem).cloned().unwrap_or_else(|| stem.to_string());
-                    if let Ok(data) = std::fs::read(&path) {
-                        use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                        result.insert(key, format!("data:image/png;base64,{}", b64));
+    tauri::async_runtime::spawn_blocking(move || {
+        let icons_dir = get_custom_icons_dir(&app)?;
+        let manifest_path = icons_dir.join("custom_icons.json");
+        let manifest: std::collections::HashMap<String, String> = if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
+        let mut result = HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(&icons_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("png") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        let key = manifest.get(stem).cloned().unwrap_or_else(|| stem.to_string());
+                        if let Ok(data) = std::fs::read(&path) {
+                            use base64::Engine;
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                            result.insert(key, format!("data:image/png;base64,{}", b64));
+                        }
                     }
                 }
             }
         }
-    }
-    Ok(result)
+        Ok(result)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2044,16 +2211,91 @@ pub fn open_settings_window(app: AppHandle) {
 }
 
 #[tauri::command]
+pub fn open_settings_window_with_tab(app: AppHandle, tab: Option<String>) {
+    crate::on_demand_windows::open_settings_with_tab(&app, tab);
+}
+
+#[tauri::command]
+pub fn get_tray_host_status() -> crate::tray_host::TrayHostStatus {
+    crate::tray_host::status()
+}
+
+#[tauri::command]
+pub fn get_hotkey_status() -> crate::hotkeys::HotkeyStatus {
+    crate::hotkeys::get_hotkey_status()
+}
+
+#[tauri::command]
+pub fn set_hotkeys_paused(paused: bool) {
+    crate::hotkeys::set_hotkeys_paused(paused);
+}
+
+#[tauri::command]
 pub fn open_calendar_window(app: AppHandle) {
     crate::on_demand_windows::open(&app, crate::on_demand_windows::CALENDAR);
 }
 
-#[tauri::command]
-pub fn open_tray_at_cursor() {
+pub(crate) fn open_native_tray_at_cursor() {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     let mut cursor = POINT::default();
     let anchor = unsafe { GetCursorPos(&mut cursor) }.ok().map(|_| (cursor.x, cursor.y - 4));
+    std::thread::spawn(move || crate::tray_icons::open_native_tray(anchor));
+}
+
+fn use_custom_tray_bar(app: &AppHandle) -> bool {
+    let legacy = get_setting_str(app, "nectar-legacy-mode").is_some_and(|v| v == "true");
+    !legacy
+        && get_setting_str(app, "nectar-tray-bar-enabled").is_none_or(|v| v != "false")
+        && crate::tray_host::is_proxy_active()
+}
+
+fn dock_or_cursor_anchor(app: &AppHandle) -> Option<(i32, i32)> {
+    if let Some(dock_win) = app.get_webview_window("dock").filter(|w| w.is_visible().unwrap_or(false)) {
+        if let Some((pos, size)) = crate::state::dock_window_rects()
+            .lock()
+            .ok()
+            .and_then(|m| m.get("dock").copied())
+        {
+            let scale = dock_win.scale_factor().unwrap_or(1.0);
+            let pill = crate::state::dock_pill_rects()
+                .lock()
+                .ok()
+                .and_then(|m| m.get("dock").copied())
+                .filter(|r| r.width > 0 && r.height > 0);
+            if let Some(r) = pill {
+                let cx = pos.x + ((r.x as f64 + r.width as f64 / 2.0) * scale).round() as i32;
+                let top_y = pos.y + (r.y as f64 * scale).round() as i32;
+                return Some((cx, top_y));
+            }
+            return Some((pos.x + (size.width as i32) / 2, pos.y));
+        }
+    }
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut cursor = POINT::default();
+    unsafe { GetCursorPos(&mut cursor).ok().map(|_| (cursor.x, cursor.y - 4)) }
+}
+
+pub fn open_tray_from_hotkey(app: AppHandle) {
+    let anchor = dock_or_cursor_anchor(&app);
+    if use_custom_tray_bar(&app) {
+        crate::shell_windows::toggle_traybar_async(app, anchor);
+        return;
+    }
+    std::thread::spawn(move || crate::tray_icons::open_native_tray(anchor));
+}
+
+#[tauri::command]
+pub fn open_tray_at_cursor(app: AppHandle) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut cursor = POINT::default();
+    let anchor = unsafe { GetCursorPos(&mut cursor) }.ok().map(|_| (cursor.x, cursor.y - 4));
+    if use_custom_tray_bar(&app) {
+        crate::shell_windows::toggle_traybar_async(app, anchor);
+        return;
+    }
     std::thread::spawn(move || crate::tray_icons::open_native_tray(anchor));
 }
 
@@ -2063,17 +2305,25 @@ pub fn show_desktop() {
 }
 
 #[tauri::command]
-pub fn open_tray_from_button(dx: f64, dy: f64) {
+pub fn open_tray_from_button(app: AppHandle, dx: f64, dy: f64) {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     let mut cursor = POINT::default();
     let anchor = unsafe { GetCursorPos(&mut cursor) }.ok().map(|_| (cursor.x + dx.round() as i32, cursor.y + dy.round() as i32 - 8));
+    if use_custom_tray_bar(&app) {
+        crate::shell_windows::toggle_traybar_async(app, anchor);
+        return;
+    }
     std::thread::spawn(move || crate::tray_icons::open_native_tray(anchor));
 }
 
 #[tauri::command]
 pub fn open_tray_window(app: AppHandle) {
     let anchor = notch_anchor(&app);
+    if use_custom_tray_bar(&app) {
+        crate::shell_windows::toggle_traybar_async(app, anchor);
+        return;
+    }
     std::thread::spawn(move || crate::tray_icons::open_native_tray(anchor));
 }
 
@@ -2101,7 +2351,14 @@ fn notch_anchor(app: &AppHandle) -> Option<(i32, i32)> {
 
 #[tauri::command]
 pub fn hide_overlay(app: AppHandle) {
-    if let Some(win) = app.get_webview_window("overlay") { let _ = win.hide(); }
+    if let Some(win) = app.get_webview_window("overlay") {
+        let _ = win.hide();
+        if crate::state::PERF_PROFILE.load(Ordering::Relaxed) == 1
+            || crate::state::RAM_SAVER_ENABLED.load(Ordering::Relaxed)
+        {
+            crate::webview_memory::set_low_memory(&win, true);
+        }
+    }
     crate::memory_saver::trim_soon();
 }
 
@@ -2120,6 +2377,7 @@ pub fn set_splash_fullscreen(app: AppHandle, fullscreen: bool) {
                 let _ = win.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
                 let _ = win.set_size(tauri::PhysicalSize::new(size.width, size.height));
             }
+            crate::webview_memory::set_low_memory(&win, false);
             let _ = win.show();
         } else {
             let _ = win.hide();
@@ -2136,32 +2394,17 @@ pub fn sync_overlay_position(app: AppHandle) {
 
 #[tauri::command]
 pub fn open_wifi_settings() {
-    unsafe {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-        use windows::Win32::UI::Shell::ShellExecuteA;
-        let _ = ShellExecuteA(Some(HWND(std::ptr::null_mut())), windows::core::PCSTR(c"open".as_ptr() as *const u8), windows::core::PCSTR(c"ms-availablenetworks:".as_ptr() as *const u8), windows::core::PCSTR::null(), windows::core::PCSTR::null(), SW_SHOWNORMAL);
-    }
+    crate::utils::spawn_shell_open("ms-availablenetworks:\0");
 }
 
 #[tauri::command]
 pub fn open_sound_settings() {
-    unsafe {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-        use windows::Win32::UI::Shell::ShellExecuteA;
-        let _ = ShellExecuteA(Some(HWND(std::ptr::null_mut())), windows::core::PCSTR(c"open".as_ptr() as *const u8), windows::core::PCSTR(c"ms-settings:sound".as_ptr() as *const u8), windows::core::PCSTR::null(), windows::core::PCSTR::null(), SW_SHOWNORMAL);
-    }
+    crate::utils::spawn_shell_open("ms-settings:sound\0");
 }
 
 #[tauri::command]
 pub fn open_notification_center() {
-    unsafe {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-        use windows::Win32::UI::Shell::ShellExecuteA;
-        let _ = ShellExecuteA(Some(HWND(std::ptr::null_mut())), windows::core::PCSTR(c"open".as_ptr() as *const u8), windows::core::PCSTR(c"ms-actioncenter:".as_ptr() as *const u8), windows::core::PCSTR::null(), windows::core::PCSTR::null(), SW_SHOWNORMAL);
-    }
+    crate::utils::spawn_shell_open("ms-actioncenter:\0");
 }
 
 #[tauri::command]
@@ -2193,60 +2436,71 @@ pub struct AppMediaSession {
 }
 
 #[tauri::command]
-pub fn get_app_media_sessions() -> Vec<AppMediaSession> {
-    use windows::Media::Control::{GlobalSystemMediaTransportControlsSessionManager, GlobalSystemMediaTransportControlsSessionPlaybackStatus};
+pub async fn get_app_media_sessions() -> Vec<AppMediaSession> {
+    tauri::async_runtime::spawn_blocking(|| {
+        use windows::Media::Control::{GlobalSystemMediaTransportControlsSessionManager, GlobalSystemMediaTransportControlsSessionPlaybackStatus};
+        let _com = crate::utils::ComApartmentGuard::init_mta();
 
-    let Ok(mgr) = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().and_then(|op| op.get()) else { return Vec::new() };
-    let Ok(sessions) = mgr.GetSessions() else { return Vec::new() };
+        let Ok(mgr) = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().and_then(|op| op.get()) else { return Vec::new() };
+        let Ok(sessions) = mgr.GetSessions() else { return Vec::new() };
 
-    sessions
-        .into_iter()
-        .filter_map(|session| {
-            let app_id = session.SourceAppUserModelId().ok()?.to_string();
-            let props = session.TryGetMediaPropertiesAsync().ok()?.get().ok()?;
-            let is_playing = session.GetPlaybackInfo().ok().and_then(|p| p.PlaybackStatus().ok())
-                == Some(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
-            Some(AppMediaSession {
-                app_id,
-                title: props.Title().ok()?.to_string(),
-                artist: props.Artist().map(|a| a.to_string()).unwrap_or_default(),
-                is_playing,
+        sessions
+            .into_iter()
+            .filter_map(|session| {
+                let app_id = session.SourceAppUserModelId().ok()?.to_string();
+                let props = session.TryGetMediaPropertiesAsync().ok()?.get().ok()?;
+                let is_playing = session.GetPlaybackInfo().ok().and_then(|p| p.PlaybackStatus().ok())
+                    == Some(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
+                Some(AppMediaSession {
+                    app_id,
+                    title: props.Title().ok()?.to_string(),
+                    artist: props.Artist().map(|a| a.to_string()).unwrap_or_default(),
+                    is_playing,
+                })
             })
-        })
-        .collect()
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[tauri::command]
-pub fn app_media_control(app_id: String, action: String) -> Result<(), String> {
-    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
+pub async fn app_media_control(app_id: String, action: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
+        let _com = crate::utils::ComApartmentGuard::init_mta();
 
-    let mgr = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
-        .and_then(|op| op.get())
-        .map_err(|e| e.to_string())?;
-    let session = mgr
-        .GetSessions()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|s| s.SourceAppUserModelId().map(|id| id.to_string() == app_id).unwrap_or(false))
-        .ok_or("No media session for that app")?;
+        let mgr = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+            .and_then(|op| op.get())
+            .map_err(|e| e.to_string())?;
+        let session = mgr
+            .GetSessions()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|s| s.SourceAppUserModelId().map(|id| id.to_string() == app_id).unwrap_or(false))
+            .ok_or("No media session for that app")?;
 
-    match action.as_str() {
-        "play_pause" => session.TryTogglePlayPauseAsync(),
-        "next" => session.TrySkipNextAsync(),
-        "previous" => session.TrySkipPreviousAsync(),
-        _ => return Err("Unknown media action".into()),
-    }
-    .map(|_| ())
-    .map_err(|e| e.to_string())
+        match action.as_str() {
+            "play_pause" => session.TryTogglePlayPauseAsync(),
+            "next" => session.TrySkipNextAsync(),
+            "previous" => session.TrySkipPreviousAsync(),
+            _ => return Err("Unknown media action".into()),
+        }
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn open_media_source_app() {
-    unsafe {
+pub async fn open_media_source_app() {
+    let _ = tauri::async_runtime::spawn_blocking(|| unsafe {
         use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
         use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_RESTORE, IsIconic, IsWindowVisible, FindWindowW, EnumWindows, GetWindowThreadProcessId};
         use windows::Win32::Foundation::{HWND, LPARAM};
         use windows::Win32::System::Threading::OpenProcess;
+        let _com = crate::utils::ComApartmentGuard::init_mta();
 
         let mgr = match GlobalSystemMediaTransportControlsSessionManager::RequestAsync().and_then(|op| op.get()) {
             Ok(m) => m,
@@ -2324,7 +2578,7 @@ pub fn open_media_source_app() {
             }
             let _ = SetForegroundWindow(hwnd);
         }
-    }
+    }).await;
 }
 
 #[tauri::command]
@@ -2618,6 +2872,7 @@ pub fn clear_volume_mixer_rect() {
 
 pub fn restore_taskbar_and_exit(handle: &AppHandle) {
     SHUTTING_DOWN.store(true, Ordering::Relaxed);
+    crate::tray_host::stop();
     NATIVE_TASKBAR_HIDDEN.store(false, Ordering::SeqCst);
     for (_, w) in handle.webview_windows() {
         let _ = w.hide();
@@ -2705,13 +2960,17 @@ pub async fn get_diagnostics(app: AppHandle) -> String {
 }
 
 #[tauri::command]
-pub fn open_log_folder() -> Result<(), String> {
+pub async fn open_log_folder() -> Result<(), String> {
     let dir = crate::diagnostics::log_dir().ok_or_else(|| "No log folder yet".to_string())?;
-    std::process::Command::new("explorer")
-        .arg(&dir)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new("explorer")
+            .arg(&dir)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2757,9 +3016,16 @@ pub async fn restart_nectar(handle: AppHandle) {
 /// Relaunches the process. Also used for webview crashes, reloading pages can't fix those.
 pub fn relaunch_nectar(handle: &AppHandle) {
     SHUTTING_DOWN.store(true, Ordering::Relaxed);
-    if let Some(w) = handle.get_webview_window("main") { if let Ok(hwnd) = w.hwnd() { unregister_appbar_native(hwnd); } }
-    if let Some(w) = handle.get_webview_window("dock") { if let Ok(hwnd) = w.hwnd() { unregister_appbar_native(hwnd); } }
+    crate::tray_host::stop();
+    for (label, w) in handle.webview_windows() {
+        if crate::state::is_notch_label(&label) || crate::state::is_dock_label(&label) {
+            if let Ok(hwnd) = w.hwnd() {
+                unregister_appbar_native(hwnd);
+            }
+        }
+    }
     if let Some(w) = handle.get_webview_window("settings") { let _ = w.destroy(); }
+    if let Some(w) = handle.get_webview_window("calendar") { let _ = w.destroy(); }
     std::env::set_var("NECTAR_RESTARTING", "1");
     close_single_instance_handles();
     handle.restart();
@@ -2892,14 +3158,19 @@ pub async fn close_window(hwnd: isize) {
     }).await.unwrap_or_default();
 }
 
-fn re_register_appbars(app: &AppHandle, settings: &HashMap<String, serde_json::Value>) {
-    let notch_fixed = settings.get("nectar-notch-mode").map(|v| v.as_str() == Some("fixed")).unwrap_or(true);
-    let dock_fixed = settings.get("nectar-dock-mode").map(|v| v.as_str() == Some("fixed")).unwrap_or(false);
+fn re_register_appbars(app: &AppHandle) {
+    let dock_enabled = get_setting_str(app, "nectar-dock-enabled")
+        .map(|v| v != "false")
+        .unwrap_or(true);
     for (label, win) in app.webview_windows() {
-        if crate::state::is_notch_label(&label) && notch_fixed {
-            crate::services::register_appbar(win);
-        } else if crate::state::is_dock_label(&label) && dock_fixed {
-            crate::services::register_dock_appbar(win);
+        if crate::state::is_notch_label(&label) {
+            if crate::monitors::resolve_mode_for_label(app, crate::types::WindowKind::Notch, &label) == "fixed" {
+                crate::services::register_appbar(win);
+            }
+        } else if crate::state::is_dock_label(&label) && dock_enabled {
+            if crate::monitors::resolve_mode_for_label(app, crate::types::WindowKind::Dock, &label) == "fixed" {
+                crate::services::register_dock_appbar(win);
+            }
         }
     }
 }
@@ -2912,55 +3183,233 @@ const MONITOR_TARGETING_KEYS: [&str; 5] = [
     "nectar-dock-enabled",
 ];
 
-#[tauri::command]
-pub fn save_setting(app: AppHandle, key: String, value: serde_json::Value) -> Result<(), String> {
-    let path = app.path().app_config_dir().map_err(|e| e.to_string())?.join("settings.json");
-    if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
-    let mut settings = HashMap::new();
-    if let Ok(content) = std::fs::read_to_string(&path) { if let Ok(existing) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&content) { settings = existing; } }
-    settings.insert(key.clone(), value);
-    let content = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(path, content).map_err(|e| e.to_string())?;
+static SETTINGS_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    crate::utils::replace_settings_cache(settings.clone());
+fn merge_settings_entries(
+    settings: &mut HashMap<String, serde_json::Value>,
+    entries: &HashMap<String, serde_json::Value>,
+) {
+    for (key, value) in entries {
+        if value.is_null() {
+            settings.remove(key);
+        } else {
+            settings.insert(key.clone(), value.clone());
+        }
+    }
+}
 
-    let _ = app.emit("settings-changed", serde_json::json!({ "key": &key, "value": &settings[&key] }));
+fn persist_settings_entries(
+    app: &AppHandle,
+    entries: &HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    let path = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| e.to_string())?
+        .join("settings.json");
+    {
+        let _guard = SETTINGS_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut settings = crate::utils::cached_settings_snapshot().unwrap_or_else(|| {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<HashMap<String, serde_json::Value>>(&content).ok())
+                .unwrap_or_default()
+        });
+        merge_settings_entries(&mut settings, entries);
+        let content = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+        crate::state::LAST_SELF_WRITE_MS.store(crate::utils::get_now_ms(), Ordering::Relaxed);
+        crate::utils::write_atomic_bytes(&path, content.as_bytes())?;
+        crate::state::LAST_SELF_WRITE_MS.store(crate::utils::get_now_ms(), Ordering::Relaxed);
+        crate::utils::replace_settings_cache(settings);
+    }
+    crate::utils::sync_hook_atomics(app);
+    Ok(())
+}
 
-    if key == "nectar-scale" {
-        re_register_appbars(&app, &settings);
+/// One-time migration for pre-Wave-6 users stuck with `fixed` + `reserve-space: false` overlapping maximized apps.
+pub fn migrate_dock_overlap_default(app: &AppHandle) {
+    if get_setting_str(app, "nectar-dock-mode-migrated-v2").is_some() {
+        return;
+    }
+    let dock_mode = get_setting_str(app, "nectar-dock-mode");
+    let reserve_space = get_setting_str(app, "nectar-dock-reserve-space");
+    let mut entries = HashMap::new();
+    entries.insert(
+        "nectar-dock-mode-migrated-v2".to_string(),
+        serde_json::Value::String("1".to_string()),
+    );
+    if dock_mode.as_deref() == Some("fixed") && reserve_space.as_deref() != Some("true") {
+        entries.insert(
+            "nectar-dock-mode".to_string(),
+            serde_json::Value::String("smart".to_string()),
+        );
+        crate::diagnostics::log("startup: migrated fixed non-reserving dock to smart auto-hide");
+    }
+    let _ = persist_settings_entries(app, &entries);
+}
+
+fn apply_setting_side_effects(app: &AppHandle, changed: &HashMap<String, serde_json::Value>) {
+    if changed.contains_key("nectar-scale") {
+        re_register_appbars(app);
     }
 
-    if key == "nectar-agent-api" {
-        let on = matches!(settings[&key].as_str(), Some("true")) || settings[&key].as_bool() == Some(true);
+    if changed.contains_key("nectar-dock-reserve-space") || changed.contains_key("nectar-dock-icon-size") {
+        let dock_enabled = get_setting_str(app, "nectar-dock-enabled")
+            .map(|v| v != "false")
+            .unwrap_or(true);
+        if dock_enabled {
+            for (label, win) in app.webview_windows() {
+                if crate::state::is_dock_label(&label)
+                    && crate::monitors::resolve_mode_for_label(app, crate::types::WindowKind::Dock, &label) == "fixed"
+                {
+                    crate::services::register_dock_appbar(win);
+                }
+            }
+        }
+    }
+
+    if changed.contains_key("nectar-overlay-vpos") || changed.contains_key("nectar-overlay-style") {
+        sync_overlays(app);
+    }
+
+    if changed.keys().any(|k| {
+        matches!(
+            k.as_str(),
+            "nectar-media-visualizer-enabled"
+                | "nectar-visualizer-enabled"
+                | "nectar-game-mode"
+                | "nectar-game-mode-pause-polls"
+                | "nectar-perf-profile"
+        )
+    }) {
+        crate::services::wake_audio_visualizer();
+    }
+
+    if let Some(value) = changed.get("nectar-agent-api") {
+        let on = matches!(value.as_str(), Some("true")) || value.as_bool() == Some(true);
         std::thread::spawn(move || crate::agent_api::set_hooks(on));
     }
 
-    if key == "nectar-notch-hotkey" {
+    if changed.keys().any(|k| {
+        matches!(
+            k.as_str(),
+            "nectar-notch-hotkey"
+                | "nectar-launcher-hotkey"
+                | "nectar-launcher-enabled"
+                | "nectar-traybar-hotkey"
+                | "nectar-tray-bar-enabled"
+                | "nectar-legacy-mode"
+        )
+    }) {
         crate::hotkeys::reload();
     }
 
-    if key == "nectar-language" {
-        crate::i18n::refresh_tray_labels(&app);
+    if let Some(value) = changed.get("nectar-launcher-enabled") {
+        let on = if value.is_null() {
+            true
+        } else {
+            !matches!(value.as_str(), Some("false")) && value.as_bool() != Some(false)
+        };
+        if !on {
+            crate::shell_windows::hide_surface(app, crate::shell_windows::LAUNCHER_LABEL);
+        }
     }
 
-    if MONITOR_TARGETING_KEYS.contains(&key.as_str()) {
+    if let Some(value) = changed.get("nectar-tray-bar-enabled") {
+        let on = if value.is_null() {
+            true
+        } else {
+            matches!(value.as_str(), Some("true")) || value.as_bool() == Some(true)
+        };
+        if on {
+            crate::tray_host::start(app.clone());
+        } else {
+            crate::shell_windows::hide_surface(app, crate::shell_windows::TRAYBAR_LABEL);
+            crate::tray_host::stop();
+        }
+    }
+
+    if let Some(value) = changed.get("nectar-legacy-mode") {
+        for surface in [
+            crate::shell_windows::LAUNCHER_LABEL,
+            crate::shell_windows::START_LABEL,
+            crate::shell_windows::TRAYBAR_LABEL,
+        ] {
+            crate::shell_windows::hide_surface(app, surface);
+        }
+        let legacy = matches!(value.as_str(), Some("true")) || value.as_bool() == Some(true);
+        if legacy {
+            crate::tray_host::stop();
+        } else {
+            crate::tray_host::start(app.clone());
+        }
+    }
+
+    if changed.contains_key("nectar-language") {
+        crate::i18n::refresh_tray_labels(app);
+    }
+
+    if MONITOR_TARGETING_KEYS.iter().any(|k| changed.contains_key(*k)) {
         let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
             crate::monitors::sync_monitor_windows(&app_clone);
             let dock_enabled = crate::utils::get_setting_str(&app_clone, "nectar-dock-enabled")
-                .map(|v| v == "true").unwrap_or(true);
+                .map(|v| v != "false").unwrap_or(true);
             if dock_enabled {
                 let dock_mode = crate::utils::get_setting_str(&app_clone, "nectar-dock-mode")
-                    .unwrap_or_else(|| "smart".to_string());
+                    .unwrap_or_else(|| {
+                        crate::monitors::default_mode_for_kind(crate::types::WindowKind::Dock)
+                            .to_string()
+                    });
                 change_dock_mode(app_clone.clone(), dock_mode).await;
             }
             let notch_mode = crate::utils::get_setting_str(&app_clone, "nectar-notch-mode")
-                .unwrap_or_else(|| "fixed".to_string());
+                .unwrap_or_else(|| {
+                    crate::monitors::default_mode_for_kind(crate::types::WindowKind::Notch)
+                        .to_string()
+                });
             change_notch_mode(app_clone.clone(), notch_mode).await;
         });
     }
+}
 
+pub(crate) fn save_setting_sync(
+    app: &AppHandle,
+    key: &str,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let mut entries = HashMap::with_capacity(1);
+    entries.insert(key.to_string(), value.clone());
+    persist_settings_entries(app, &entries)?;
+
+    let _ = app.emit("settings-changed", serde_json::json!({ "key": key, "value": &value }));
+    apply_setting_side_effects(app, &entries);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn save_setting(app: AppHandle, key: String, value: serde_json::Value) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_setting_sync(&app, &key, value))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn save_settings_batch(
+    app: AppHandle,
+    entries: HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        persist_settings_entries(&app, &entries)?;
+        let _ = app.emit("settings-batch-changed", serde_json::json!({ "entries": &entries }));
+        apply_setting_side_effects(&app, &entries);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2979,32 +3428,68 @@ pub fn get_notch_mode_for_window(window: tauri::WebviewWindow, app: AppHandle) -
 }
 
 #[tauri::command]
-pub fn set_dock_mode_for_window(window: tauri::WebviewWindow, app: AppHandle, mode: String) -> Result<(), String> {
-    crate::monitors::set_mode_for_label(&app, crate::types::WindowKind::Dock, window.label(), &mode)
+pub async fn set_dock_mode_for_window(window: tauri::WebviewWindow, app: AppHandle, mode: String) -> Result<(), String> {
+    let label = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::monitors::set_mode_for_label(&app, crate::types::WindowKind::Dock, &label, &mode)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn set_notch_mode_for_window(window: tauri::WebviewWindow, app: AppHandle, mode: String) -> Result<(), String> {
-    crate::monitors::set_mode_for_label(&app, crate::types::WindowKind::Notch, window.label(), &mode)
+pub async fn set_notch_mode_for_window(window: tauri::WebviewWindow, app: AppHandle, mode: String) -> Result<(), String> {
+    let label = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::monitors::set_mode_for_label(&app, crate::types::WindowKind::Notch, &label, &mode)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 
 #[tauri::command]
-pub fn load_settings(app: AppHandle) -> Result<HashMap<String, serde_json::Value>, String> {
-    let path = match app.path().app_config_dir() {
-        Ok(p) => p.join("settings.json"),
-        Err(_) => return Ok(HashMap::new()),
-    };
-    if let Ok(content) = std::fs::read_to_string(path) { if let Ok(settings) = serde_json::from_str(&content) { return Ok(settings); } }
-    Ok(HashMap::new())
+pub async fn load_settings(app: AppHandle) -> Result<HashMap<String, serde_json::Value>, String> {
+    if let Some(snapshot) = crate::utils::cached_settings_snapshot() {
+        return Ok(snapshot);
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = match app.path().app_config_dir() {
+            Ok(p) => p.join("settings.json"),
+            Err(_) => return Ok(HashMap::new()),
+        };
+        let _guard = SETTINGS_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(settings) = serde_json::from_str(&content) {
+                return Ok(settings);
+            }
+        }
+        Ok(HashMap::new())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn reset_settings(app: AppHandle) -> Result<(), String> {
-    let path = app.path().app_config_dir().map_err(|e| e.to_string())?.join("settings.json");
-    std::fs::write(&path, "{}").map_err(|e| e.to_string())?;
-    crate::utils::replace_settings_cache(HashMap::new());
-    Ok(())
+pub async fn reset_settings(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = app.path().app_config_dir().map_err(|e| e.to_string())?.join("settings.json");
+        {
+            let _guard = SETTINGS_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::state::LAST_SELF_WRITE_MS.store(crate::utils::get_now_ms(), Ordering::Relaxed);
+            crate::utils::write_atomic_bytes(&path, b"{}")?;
+            crate::state::LAST_SELF_WRITE_MS.store(crate::utils::get_now_ms(), Ordering::Relaxed);
+            crate::utils::replace_settings_cache(HashMap::new());
+        }
+        crate::utils::sync_hook_atomics(&app);
+        crate::services::wake_audio_visualizer();
+        crate::hotkeys::reload();
+        crate::tray_host::start(app.clone());
+        let _ = app.emit("settings-reset", ());
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -3048,18 +3533,7 @@ pub async fn capture_window_thumbnail(hwnd: isize, max_width: u32, max_height: u
         }
 
         if let Some(ref img) = result {
-            if let Some(cache) = crate::state::THUMBNAIL_CACHE.get() {
-                if let Ok(mut guard) = cache.lock() {
-                    guard.insert(hwnd_key, (img.clone(), crate::utils::get_now_ms()));
-                    // Prune dead windows if cache size exceeds 15
-                    // Minimized windows (IsWindow == true) are kept intact
-                    if guard.len() > 15 {
-                        guard.retain(|&k, _| {
-                            IsWindow(Some(HWND(k as *mut _))).as_bool()
-                        });
-                    }
-                }
-            }
+            crate::utils::store_cached_thumbnail(hwnd_key, img.clone());
         }
 
         result.map(|img| (img, focus_time))
@@ -3072,11 +3546,7 @@ pub async fn capture_window_thumbnail(hwnd: isize, max_width: u32, max_height: u
 
 fn get_radio_state_sync(kind: windows::Devices::Radios::RadioKind) -> Result<bool, String> {
     use windows::Devices::Radios::{Radio, RadioState};
-    unsafe {
-        let _ = windows::Win32::System::Com::CoInitializeEx(
-            None, windows::Win32::System::Com::COINIT_MULTITHREADED,
-        );
-    }
+    let _com = crate::utils::ComApartmentGuard::init_mta();
     let radios = Radio::GetRadiosAsync()
         .and_then(|op| op.get())
         .map_err(|e| e.to_string())?;
@@ -3092,11 +3562,7 @@ fn get_radio_state_sync(kind: windows::Devices::Radios::RadioKind) -> Result<boo
 
 fn set_radio_state_sync(kind: windows::Devices::Radios::RadioKind, enabled: bool) -> Result<(), String> {
     use windows::Devices::Radios::{Radio, RadioState};
-    unsafe {
-        let _ = windows::Win32::System::Com::CoInitializeEx(
-            None, windows::Win32::System::Com::COINIT_MULTITHREADED,
-        );
-    }
+    let _com = crate::utils::ComApartmentGuard::init_mta();
     let radios = Radio::GetRadiosAsync()
         .and_then(|op| op.get())
         .map_err(|e| e.to_string())?;
@@ -3254,31 +3720,44 @@ pub async fn set_bluetooth_state(enabled: bool) -> Result<(), String> {
 
 #[tauri::command]
 pub fn open_bluetooth_settings() {
-    unsafe {
-        use windows::Win32::UI::Shell::ShellExecuteA;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-        let _ = ShellExecuteA(None, windows::core::PCSTR(c"open".as_ptr() as *const u8), windows::core::PCSTR(c"ms-settings:bluetooth".as_ptr() as *const u8), windows::core::PCSTR::null(), windows::core::PCSTR::null(), SW_SHOWNORMAL);
-    }
+    crate::utils::spawn_shell_open("ms-settings:bluetooth\0");
 }
 
 #[tauri::command]
 pub fn open_airplane_mode_settings() {
-    unsafe {
-        use windows::Win32::UI::Shell::ShellExecuteA;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-        let _ = ShellExecuteA(None, windows::core::PCSTR(c"open".as_ptr() as *const u8), windows::core::PCSTR(c"ms-settings:network-airplanemode".as_ptr() as *const u8), windows::core::PCSTR::null(), windows::core::PCSTR::null(), SW_SHOWNORMAL);
-    }
+    crate::utils::spawn_shell_open("ms-settings:network-airplanemode\0");
 }
+
+static LAST_BRIGHTNESS_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[tauri::command]
 pub fn set_brightness(app: AppHandle, brightness: u32) {
     let val = brightness.min(100);
     crate::state::CURRENT_BRIGHTNESS.store(val, Ordering::Relaxed);
     crate::state::LAST_BRIGHTNESS_CHANGE.store(crate::utils::get_now_ms(), Ordering::Relaxed);
-    if let Ok(dir) = app.path().app_config_dir() {
-        let _ = std::fs::write(dir.join("last_brightness.txt"), val.to_string());
+
+    let seq = LAST_BRIGHTNESS_WRITE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let app_write = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+        if LAST_BRIGHTNESS_WRITE_SEQ.load(Ordering::Relaxed) != seq {
+            return;
+        }
+        if let Ok(dir) = app_write.path().app_config_dir() {
+            let text = val.to_string();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(dir.join("last_brightness.txt"), text);
+            })
+            .await;
+        }
+    });
+
+    for (label, _) in app.webview_windows() {
+        if crate::state::is_notch_label(&label) || label == "overlay" {
+            let _ = app.emit_to(label.as_str(), "brightness-change", BrightnessChangeEvent { brightness: val });
+        }
     }
-    let _ = app.emit("brightness-change", BrightnessChangeEvent { brightness: val });
     if let Some(tx) = crate::state::BRIGHTNESS_SENDER.get() {
         let _ = tx.send(val);
     }
@@ -3288,11 +3767,7 @@ pub fn set_brightness(app: AppHandle, brightness: u32) {
 pub async fn get_battery_saver_state() -> Result<bool, String> {
     // Uses Windows Runtime PowerManager — no PowerShell required.
     tauri::async_runtime::spawn_blocking(|| {
-        unsafe {
-            let _ = windows::Win32::System::Com::CoInitializeEx(
-                None, windows::Win32::System::Com::COINIT_MULTITHREADED,
-            );
-        }
+        let _com = crate::utils::ComApartmentGuard::init_mta();
         use windows::System::Power::{EnergySaverStatus, PowerManager};
         match PowerManager::EnergySaverStatus() {
             Ok(status) => Ok(status == EnergySaverStatus::On),
@@ -3304,11 +3779,7 @@ pub async fn get_battery_saver_state() -> Result<bool, String> {
 #[tauri::command]
 pub async fn has_battery() -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(|| {
-        unsafe {
-            let _ = windows::Win32::System::Com::CoInitializeEx(
-                None, windows::Win32::System::Com::COINIT_MULTITHREADED,
-            );
-        }
+        let _com = crate::utils::ComApartmentGuard::init_mta();
         use windows::System::Power::{BatteryStatus, PowerManager};
         use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
         let mut power = SYSTEM_POWER_STATUS::default();
@@ -3332,16 +3803,12 @@ pub async fn has_battery() -> Result<bool, String> {
 
 #[tauri::command]
 pub fn open_battery_saver_settings() {
-    unsafe {
-        use windows::Win32::UI::Shell::ShellExecuteA;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-        let _ = ShellExecuteA(None, windows::core::PCSTR(c"open".as_ptr() as *const u8), windows::core::PCSTR(c"ms-settings:batterysaver".as_ptr() as *const u8), windows::core::PCSTR::null(), windows::core::PCSTR::null(), SW_SHOWNORMAL);
-    }
+    crate::utils::spawn_shell_open("ms-settings:batterysaver\0");
 }
 
 // --- System metrics for status widgets ---
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 pub struct SystemMetrics {
     cpu: u32,
     ram: f32,
@@ -3351,23 +3818,78 @@ pub struct SystemMetrics {
 }
 
 #[tauri::command]
-pub fn get_system_metrics() -> SystemMetrics {
-    let (net_up, net_down) = get_network_speed().unwrap_or((0, 0));
-    SystemMetrics {
-        cpu: get_cpu_usage().unwrap_or(0),
-        ram: get_ram_usage().unwrap_or(0.0),
-        disk_free_gb: get_disk_space().unwrap_or(0),
-        net_up,
-        net_down,
+pub async fn get_system_metrics() -> SystemMetrics {
+    use std::sync::{Mutex, OnceLock};
+    static METRICS_CACHE: OnceLock<Mutex<(i64, SystemMetrics)>> = OnceLock::new();
+    static DISK_CACHE: OnceLock<Mutex<(i64, u64)>> = OnceLock::new();
+
+    let now = crate::utils::get_now_ms();
+    if let Some(cache) = METRICS_CACHE.get() {
+        if let Ok(guard) = cache.lock() {
+            if guard.0 != 0 && now - guard.0 < 800 {
+                return guard.1.clone();
+            }
+        }
     }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let disk_now = crate::utils::get_now_ms();
+        let disk_cell = DISK_CACHE.get_or_init(|| Mutex::new((0, 0)));
+        let disk_free_gb = {
+            let cached = disk_cell
+                .lock()
+                .ok()
+                .and_then(|g| if g.0 != 0 && disk_now - g.0 < 30_000 { Some(g.1) } else { None });
+            match cached {
+                Some(gb) => gb,
+                None => {
+                    let gb = get_disk_space().unwrap_or(0);
+                    if let Ok(mut g) = disk_cell.lock() {
+                        *g = (disk_now, gb);
+                    }
+                    gb
+                }
+            }
+        };
+
+        let (net_up, net_down) = get_network_speed().unwrap_or((0, 0));
+        let metrics = SystemMetrics {
+            cpu: get_cpu_usage().unwrap_or(0),
+            ram: get_ram_usage().unwrap_or(0.0),
+            disk_free_gb,
+            net_up,
+            net_down,
+        };
+        let cell = METRICS_CACHE.get_or_init(|| {
+            Mutex::new((
+                0,
+                SystemMetrics {
+                    cpu: 0,
+                    ram: 0.0,
+                    disk_free_gb: 0,
+                    net_up: 0,
+                    net_down: 0,
+                },
+            ))
+        });
+        if let Ok(mut guard) = cell.lock() {
+            *guard = (crate::utils::get_now_ms(), metrics.clone());
+        }
+        metrics
+    })
+    .await
+    .unwrap_or(SystemMetrics {
+        cpu: 0,
+        ram: 0.0,
+        disk_free_gb: 0,
+        net_up: 0,
+        net_down: 0,
+    })
 }
 
 #[tauri::command]
 pub fn get_cpu_usage() -> Result<u32, String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LAST_IDLE: AtomicU64 = AtomicU64::new(0);
-    static LAST_KERNEL: AtomicU64 = AtomicU64::new(0);
-    static LAST_USER: AtomicU64 = AtomicU64::new(0);
+    static LAST_CPU_TIMES: std::sync::Mutex<(u64, u64, u64)> = std::sync::Mutex::new((0, 0, 0));
 
     unsafe {
         let mut idle = windows::Win32::Foundation::FILETIME::default();
@@ -3380,20 +3902,24 @@ pub fn get_cpu_usage() -> Result<u32, String> {
         let kernel_u64 = (kernel.dwHighDateTime as u64) << 32 | kernel.dwLowDateTime as u64;
         let user_u64 = (user.dwHighDateTime as u64) << 32 | user.dwLowDateTime as u64;
 
-        let prev_idle = LAST_IDLE.swap(idle_u64, Ordering::Relaxed);
-        let prev_kernel = LAST_KERNEL.swap(kernel_u64, Ordering::Relaxed);
-        let prev_user = LAST_USER.swap(user_u64, Ordering::Relaxed);
+        let (prev_idle, prev_kernel, prev_user) = {
+            let mut guard = LAST_CPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = *guard;
+            *guard = (idle_u64, kernel_u64, user_u64);
+            prev
+        };
 
         let idle_delta = idle_u64.saturating_sub(prev_idle);
         let kernel_delta = kernel_u64.saturating_sub(prev_kernel);
         let user_delta = user_u64.saturating_sub(prev_user);
-        let total = kernel_delta + user_delta;
+        let total = kernel_delta.saturating_add(user_delta);
 
-        if total == 0 {
+        if total == 0 || (prev_idle == 0 && prev_kernel == 0 && prev_user == 0) {
             return Ok(0);
         }
-        let usage = ((total - idle_delta) * 100) / total;
-        Ok(usage as u32)
+        let busy = total.saturating_sub(idle_delta);
+        let usage = ((busy as u128 * 100) / total as u128).min(100) as u32;
+        Ok(usage)
     }
 }
 
@@ -3448,8 +3974,8 @@ const PROTECTED_PROCESS_NAMES: &[&str] = &[
 ];
 
 #[tauri::command]
-pub fn get_running_processes() -> Result<Vec<ProcessInfo>, String> {
-    unsafe {
+pub async fn get_running_processes() -> Result<Vec<ProcessInfo>, String> {
+    tauri::async_runtime::spawn_blocking(|| unsafe {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -3497,12 +4023,14 @@ pub fn get_running_processes() -> Result<Vec<ProcessInfo>, String> {
 
         results.sort_by(|a, b| b.memory_kb.cmp(&a.memory_kb));
         Ok(results)
-    }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn kill_process(pid: u32, _name: Option<String>) -> Result<(), String> {
-    unsafe {
+pub async fn kill_process(pid: u32, _name: Option<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || unsafe {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Threading::{
             OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
@@ -3536,23 +4064,15 @@ pub fn kill_process(pid: u32, _name: Option<String>) -> Result<(), String> {
         let result = TerminateProcess(term_handle, 1).map_err(|e| e.to_string());
         let _ = CloseHandle(term_handle);
         result
-    }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub fn get_network_speed() -> Result<(u64, u64), String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LAST_BYTES_SENT: AtomicU64 = AtomicU64::new(0);
-    static LAST_BYTES_RECV: AtomicU64 = AtomicU64::new(0);
-    static LAST_CHECK: AtomicU64 = AtomicU64::new(0);
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    let last_check = LAST_CHECK.load(Ordering::Relaxed);
-    let elapsed = if last_check > 0 { (now - last_check).max(1) } else { 1000 };
+    static LAST_NET_STATE: std::sync::Mutex<(u64, u64, Option<std::time::Instant>)> =
+        std::sync::Mutex::new((0, 0, None));
 
     let (mut total_in, mut total_out) = (0u64, 0u64);
     unsafe {
@@ -3564,23 +4084,27 @@ pub fn get_network_speed() -> Result<(u64, u64), String> {
             let rows = table.Table.as_ptr();
             for i in 0..num_entries as usize {
                 let row = &*rows.add(i);
-                total_in += row.InOctets;
-                total_out += row.OutOctets;
+                total_in = total_in.saturating_add(row.InOctets);
+                total_out = total_out.saturating_add(row.OutOctets);
             }
             windows::Win32::NetworkManagement::IpHelper::FreeMibTable(table_ptr as *const _);
         }
     }
 
-    let prev_sent = LAST_BYTES_SENT.swap(total_out, Ordering::Relaxed);
-    let prev_recv = LAST_BYTES_RECV.swap(total_in, Ordering::Relaxed);
-    LAST_CHECK.store(now, Ordering::Relaxed);
+    let now = std::time::Instant::now();
+    let (prev_out, prev_in, prev_instant) = {
+        let mut guard = LAST_NET_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = *guard;
+        *guard = (total_out, total_in, Some(now));
+        prev
+    };
 
-    if last_check == 0 {
+    let Some(last) = prev_instant else {
         return Ok((0, 0));
-    }
-
-    let sent_per_sec = if total_out > prev_sent { ((total_out - prev_sent) * 1000) / elapsed } else { 0 };
-    let recv_per_sec = if total_in > prev_recv { ((total_in - prev_recv) * 1000) / elapsed } else { 0 };
+    };
+    let elapsed_ms = now.saturating_duration_since(last).as_millis().max(1) as u128;
+    let sent_per_sec = ((total_out.saturating_sub(prev_out) as u128 * 1000) / elapsed_ms) as u64;
+    let recv_per_sec = ((total_in.saturating_sub(prev_in) as u128 * 1000) / elapsed_ms) as u64;
 
     Ok((sent_per_sec, recv_per_sec))
 }
@@ -3691,7 +4215,39 @@ pub fn windows_accent_backup_exists(app: AppHandle) -> bool {
 }
 
 #[tauri::command]
-pub fn export_settings(app: AppHandle) -> Result<String, String> {
+pub fn get_windows_selection_color() -> Option<String> {
+    crate::windows_accent::get_selection_color()
+}
+
+#[tauri::command]
+pub async fn sync_windows_selection_color(app: AppHandle, hex: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::windows_accent::sync_selection(&app, &hex))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn restore_windows_selection_color(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::windows_accent::restore_selection(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn windows_selection_backup_exists(app: AppHandle) -> bool {
+    crate::windows_accent::has_selection_backup(&app)
+}
+
+#[tauri::command]
+pub async fn restart_explorer_for_theme(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::windows_accent::restart_explorer_for_theme(&app)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn export_settings_sync(app: &AppHandle) -> Result<String, String> {
     let path = app.path().app_config_dir().map_err(|e| e.to_string())?.join("settings.json");
     if let Ok(content) = std::fs::read_to_string(&path) {
         // Validate it's valid JSON before returning
@@ -3703,81 +4259,134 @@ pub fn export_settings(app: AppHandle) -> Result<String, String> {
     }
 }
 
+#[tauri::command]
+pub async fn export_settings(app: AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || export_settings_sync(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Opens native save dialog in Rust and exports settings directly to the chosen path
 #[tauri::command]
 pub async fn export_settings_dialog(app: AppHandle) -> Result<bool, String> {
-    let settings_json = export_settings(app.clone())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings_json = export_settings_sync(&app)?;
+        let file_path = app
+            .dialog()
+            .file()
+            .set_title("Export Nectar Settings")
+            .set_file_name("nectar-settings.json")
+            .add_filter("JSON", &["json"])
+            .blocking_save_file();
 
-    let file_path = app
-        .dialog()
-        .file()
-        .set_title("Export Nectar Settings")
-        .set_file_name("nectar-settings.json")
-        .add_filter("JSON", &["json"])
-        .blocking_save_file();
-
-    if let Some(path) = file_path {
-        let path_buf = path.into_path().map_err(|e| e.to_string())?;
-        std::fs::write(&path_buf, settings_json).map_err(|e| format!("Failed to write settings: {}", e))?;
-        Ok(true)
-    } else {
-        Ok(false) // User cancelled dialog
-    }
+        if let Some(path) = file_path {
+            let path_buf = path.into_path().map_err(|e| e.to_string())?;
+            std::fs::write(&path_buf, settings_json).map_err(|e| format!("Failed to write settings: {}", e))?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Opens native file picker in Rust, validates content, and imports settings
 #[tauri::command]
 pub async fn import_settings_dialog(app: AppHandle) -> Result<bool, String> {
     const MAX_SETTINGS_SIZE_BYTES: u64 = 2 * 1024 * 1024; // 2 MB limit
+    tauri::async_runtime::spawn_blocking(move || {
+        let file_path = app
+            .dialog()
+            .file()
+            .set_title("Import Nectar Settings")
+            .add_filter("JSON", &["json"])
+            .blocking_pick_file();
 
-    let file_path = app
-        .dialog()
-        .file()
-        .set_title("Import Nectar Settings")
-        .add_filter("JSON", &["json"])
-        .blocking_pick_file();
+        if let Some(path) = file_path {
+            let path_buf = path.into_path().map_err(|e| e.to_string())?;
 
-    if let Some(path) = file_path {
-        let path_buf = path.into_path().map_err(|e| e.to_string())?;
+            let metadata = std::fs::metadata(&path_buf).map_err(|e| e.to_string())?;
+            if metadata.len() > MAX_SETTINGS_SIZE_BYTES {
+                return Err("Settings file is too large (maximum 2MB allowed)".into());
+            }
 
-        let metadata = std::fs::metadata(&path_buf).map_err(|e| e.to_string())?;
-        if metadata.len() > MAX_SETTINGS_SIZE_BYTES {
-            return Err("Settings file is too large (maximum 2MB allowed)".into());
+            let content = std::fs::read_to_string(&path_buf).map_err(|e| format!("Failed to read file: {}", e))?;
+            import_settings_sync(&app, &content)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn import_settings_sync(app: &AppHandle, settings: &str) -> Result<(), String> {
+    let imported: HashMap<String, serde_json::Value> =
+        serde_json::from_str(settings).map_err(|e| format!("Invalid JSON: {}", e))?;
+
+    let path = app.path().app_config_dir().map_err(|e| e.to_string())?.join("settings.json");
+    let mut batch_diff: HashMap<String, serde_json::Value> = HashMap::new();
+    {
+        let _guard = SETTINGS_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_settings = crate::utils::cached_settings_snapshot().unwrap_or_default();
+        for (key, val) in &imported {
+            if !val.is_null() && prev_settings.get(key) != Some(val) {
+                batch_diff.insert(key.clone(), val.clone());
+            }
+        }
+        for key in prev_settings.keys() {
+            if !imported.contains_key(key) {
+                batch_diff.insert(key.clone(), serde_json::Value::Null);
+            }
         }
 
-        let content = std::fs::read_to_string(&path_buf).map_err(|e| format!("Failed to read file: {}", e))?;
-        import_settings(app, content)?;
-        Ok(true)
-    } else {
-        Ok(false) // User cancelled dialog
+        let content = serde_json::to_string_pretty(&imported).map_err(|e| e.to_string())?;
+        crate::state::LAST_SELF_WRITE_MS.store(crate::utils::get_now_ms(), Ordering::Relaxed);
+        crate::utils::write_atomic_bytes(&path, content.as_bytes())?;
+        crate::state::LAST_SELF_WRITE_MS.store(crate::utils::get_now_ms(), Ordering::Relaxed);
+        crate::utils::replace_settings_cache(imported);
     }
+
+    crate::utils::sync_hook_atomics(app);
+
+    let legacy = crate::state::HOOK_LEGACY_MODE.load(Ordering::Relaxed);
+    let tray_enabled = crate::utils::get_setting_str(app, "nectar-tray-bar-enabled")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    if legacy {
+        for surface in [
+            crate::shell_windows::LAUNCHER_LABEL,
+            crate::shell_windows::START_LABEL,
+            crate::shell_windows::TRAYBAR_LABEL,
+        ] {
+            crate::shell_windows::hide_surface(app, surface);
+        }
+    }
+    if legacy || !tray_enabled {
+        crate::shell_windows::hide_surface(app, crate::shell_windows::TRAYBAR_LABEL);
+        crate::tray_host::stop();
+    } else {
+        crate::tray_host::start(app.clone());
+    }
+
+    if !batch_diff.is_empty() {
+        apply_setting_side_effects(app, &batch_diff);
+        let _ = app.emit("settings-batch-changed", serde_json::json!({ "entries": &batch_diff }));
+    }
+
+    re_register_appbars(app);
+    crate::hotkeys::reload();
+
+    Ok(())
 }
 
 #[tauri::command]
-pub fn import_settings(app: AppHandle, settings: String) -> Result<(), String> {
-    let imported: HashMap<String, serde_json::Value> =
-        serde_json::from_str(&settings).map_err(|e| format!("Invalid JSON: {}", e))?;
-
-    let path = app.path().app_config_dir().map_err(|e| e.to_string())?.join("settings.json");
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let content = serde_json::to_string_pretty(&imported).map_err(|e| e.to_string())?;
-    std::fs::write(&path, content).map_err(|e| e.to_string())?;
-
-    crate::utils::replace_settings_cache(imported.clone());
-
-    // Broadcast changes for every imported key so all windows re-sync
-    for (key, value) in &imported {
-        let _ = app.emit("settings-changed", serde_json::json!({ "key": key, "value": value }));
-    }
-
-    if imported.get("nectar-scale").is_some() {
-        re_register_appbars(&app, &imported);
-    }
-
-    Ok(())
+pub async fn import_settings(app: AppHandle, settings: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || import_settings_sync(&app, &settings))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 pub fn setup_settings_watcher(app: AppHandle) {
@@ -3787,6 +4396,7 @@ pub fn setup_settings_watcher(app: AppHandle) {
         Ok(p) => p,
         Err(_) => return,
     };
+    let _ = std::fs::create_dir_all(&config_dir);
     let settings_path = config_dir.join("settings.json");
 
     std::thread::spawn(move || {
@@ -3796,8 +4406,6 @@ pub fn setup_settings_watcher(app: AppHandle) {
             FILE_NOTIFY_CHANGE_LAST_WRITE,
             OPEN_EXISTING, ReadDirectoryChangesW,
         };
-        use windows::Win32::System::IO::OVERLAPPED;
-        use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 
         unsafe {
             let dir_path: Vec<u16> = config_dir.to_string_lossy()
@@ -3820,20 +4428,13 @@ pub fn setup_settings_watcher(app: AppHandle) {
                 _ => return,
             };
 
-            let h_event = match CreateEventW(None, false, false, None) {
-                Ok(e) => e,
-                Err(_) => {
-                    let _ = CloseHandle(dir_handle);
-                    return;
-                }
-            };
-
             let mut notify_buffer = [0u8; 4096];
             let mut bytes_returned = 0u32;
-            let mut overlapped = OVERLAPPED::default();
-            overlapped.hEvent = h_event;
 
             loop {
+                if crate::state::SHUTTING_DOWN.load(Ordering::Relaxed) {
+                    break;
+                }
                 let success = ReadDirectoryChangesW(
                     dir_handle,
                     notify_buffer.as_mut_ptr() as *mut _,
@@ -3841,26 +4442,29 @@ pub fn setup_settings_watcher(app: AppHandle) {
                     false,
                     FILE_NOTIFY_CHANGE_LAST_WRITE,
                     Some(&mut bytes_returned),
-                    Some(&mut overlapped),
+                    None,
                     None,
                 );
 
-                if success.is_err() {
+                if success.is_err() || crate::state::SHUTTING_DOWN.load(Ordering::Relaxed) {
                     break;
                 }
 
-                WaitForSingleObject(h_event, INFINITE);
-
                 std::thread::sleep(std::time::Duration::from_millis(200));
 
+                let since_self = crate::utils::get_now_ms() - crate::state::LAST_SELF_WRITE_MS.load(Ordering::Relaxed);
+                if (0..800).contains(&since_self) {
+                    continue;
+                }
+
+                let _file_guard = SETTINGS_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 if let Ok(new_content) = std::fs::read_to_string(&settings_path) {
                     if let Ok(new_settings) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&new_content) {
-                        // Collect diffs while holding the lock, then drop before emitting
                         let (changed, removed) = {
                             let mut cache = crate::state::SETTINGS_CACHE
                                 .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
                                 .lock()
-                                .unwrap();
+                                .unwrap_or_else(|e| e.into_inner());
 
                             let mut changed = Vec::new();
                             for (key, value) in &new_settings {
@@ -3877,7 +4481,9 @@ pub fn setup_settings_watcher(app: AppHandle) {
                             *cache = new_settings.clone();
                             (changed, removed)
                         };
-                        // Lock dropped — safe to emit without blocking save_setting
+                        drop(_file_guard);
+                        crate::utils::sync_hook_atomics(&app);
+                        crate::services::wake_audio_visualizer();
                         for (key, value) in &changed {
                             let _ = app.emit(
                                 "settings-external-changed",
@@ -3894,7 +4500,6 @@ pub fn setup_settings_watcher(app: AppHandle) {
                 }
             }
 
-            let _ = CloseHandle(h_event);
             let _ = CloseHandle(dir_handle);
         }
     });
@@ -3911,6 +4516,8 @@ mod pwa_icon_tests {
         assert!(is_aumid_path("shell:AppsFolder\\4DF9E0F8.Netflix_mcm4njqhnhss8!Netflix.App"));
         assert!(!is_aumid_path("C:\\Windows\\explorer.exe"));
         assert!(!is_aumid_path("msedge.exe"));
+        assert!(!is_aumid_path("services.msc"));
+        assert!(!is_aumid_path("devmgmt.msc"));
         assert!(!is_aumid_path(""));
     }
 
@@ -3932,6 +4539,34 @@ mod pwa_icon_tests {
         );
         assert_eq!(package_family_from_windows_apps_path("C:\\Windows\\explorer.exe"), None);
         assert_eq!(package_family_from_windows_apps_path("C:\\Program Files\\App\\app.exe"), None);
+    }
+
+    #[test]
+    fn theme_file_validation_enforces_schema_and_whitelist() {
+        let valid = r##"{
+            "schema": "nectar-theme-v1",
+            "name": "Nord Frosted",
+            "exportedAt": "2026-11-21T00:00:00Z",
+            "settings": {
+                "nectar-theme-style": "frosted",
+                "nectar-theme-color": "#112233",
+                "nectar-launcher-hotkey": "Alt+Space",
+                "nectar-caldav-password": "secret"
+            }
+        }"##;
+        let sanitized = validate_theme_file_json(valid).expect("valid theme should parse");
+        let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+        let settings = parsed["settings"].as_object().unwrap();
+        assert_eq!(settings.get("nectar-theme-style").and_then(|v| v.as_str()), Some("frosted"));
+        assert_eq!(settings.get("nectar-theme-color").and_then(|v| v.as_str()), Some("#112233"));
+        assert!(!settings.contains_key("nectar-launcher-hotkey"));
+        assert!(!settings.contains_key("nectar-caldav-password"));
+
+        let wrong_schema = r#"{"schema":"other","name":"x","settings":{"nectar-theme-style":"solid"}}"#;
+        assert!(validate_theme_file_json(wrong_schema).is_err());
+
+        let only_disallowed = r#"{"schema":"nectar-theme-v1","name":"x","settings":{"nectar-caldav-url":"https://x"}}"#;
+        assert!(validate_theme_file_json(only_disallowed).is_err());
     }
 
     #[test]
@@ -4022,6 +4657,60 @@ mod pwa_icon_tests {
             Some("C:\\Start Menu\\Netflix.lnk".into())
         );
     }
+
+    #[test]
+    fn batch_settings_merge_updates_removes_and_preserves_keys() {
+        use serde_json::json;
+
+        let mut settings = HashMap::new();
+        settings.insert("keep".to_string(), json!("yes"));
+        settings.insert("remove-me".to_string(), json!("old"));
+        settings.insert("nectar-theme-color".to_string(), json!("#007aff"));
+
+        let mut entries = HashMap::new();
+        entries.insert("remove-me".to_string(), serde_json::Value::Null);
+        entries.insert("nectar-theme-color".to_string(), json!("#ff5e8a"));
+        entries.insert("nectar-theme-saturation".to_string(), json!("0.36"));
+        entries.insert("nectar-theme-brightness".to_string(), json!("0.1"));
+
+        merge_settings_entries(&mut settings, &entries);
+
+        assert_eq!(settings.get("keep"), Some(&json!("yes")));
+        assert!(!settings.contains_key("remove-me"));
+        assert_eq!(settings.get("nectar-theme-color"), Some(&json!("#ff5e8a")));
+        assert_eq!(settings.get("nectar-theme-saturation"), Some(&json!("0.36")));
+        assert_eq!(settings.get("nectar-theme-brightness"), Some(&json!("0.1")));
+    }
+
+    #[test]
+    fn resolve_app_file_target_rejects_virtual_and_shell_schemes() {
+        assert_eq!(resolve_app_file_target("start", None, None, None, false), None);
+        assert_eq!(resolve_app_file_target("nectar-settings", None, None, None, false), None);
+        assert_eq!(resolve_app_file_target("ms-settings:display", None, None, None, false), None);
+        assert_eq!(resolve_app_file_target("https://example.com", None, None, None, false), None);
+        assert_eq!(resolve_app_file_target("shell:RecycleBinFolder", None, None, None, false), None);
+        assert_eq!(resolve_app_file_target("shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", None, None, None, false), None);
+    }
+
+    #[test]
+    fn resolve_windows_tool_spec_validates_known_and_unknown_tools() {
+        for tool in [
+            "terminal",
+            "terminal_admin",
+            "run_dialog",
+            "win_settings",
+            "explorer",
+            "installed_apps",
+            "device_manager",
+            "disk_management",
+            "control_panel",
+        ] {
+            assert!(resolve_windows_tool_spec(tool).is_some(), "missing spec for {tool}");
+        }
+        assert_eq!(resolve_windows_tool_spec("terminal_admin").map(|v| v.0), Some("runas"));
+        assert_eq!(resolve_windows_tool_spec("unknown_tool"), None);
+        assert_eq!(resolve_windows_tool_spec("  "), None);
+    }
 }
 
 #[tauri::command]
@@ -4047,8 +4736,8 @@ fn shelf_shell_thumbnail(path: &str) -> Option<String> {
     use windows::Win32::Foundation::SIZE;
     use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF, SIIGBF_BIGGERSIZEOK, SIIGBF_THUMBNAILONLY};
 
+    let _com = crate::utils::ComApartmentGuard::init_mta();
     unsafe {
-        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
         let factory: IShellItemImageFactory = SHCreateItemFromParsingName(&windows::core::HSTRING::from(path), None).ok()?;
         let hbitmap = factory
             .GetImage(SIZE { cx: 256, cy: 256 }, SIIGBF(SIIGBF_THUMBNAILONLY.0 | SIIGBF_BIGGERSIZEOK.0))
@@ -4191,29 +4880,16 @@ pub fn pointer_over_notch(window: Window) -> bool {
 
 #[tauri::command]
 pub async fn focus_agent_window(window: u64) {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-    use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP, VK_MENU};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindow, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
-    };
-    unsafe {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
         let hwnd = HWND(window as usize as *mut _);
-        if !IsWindow(Some(hwnd)).as_bool() {
+        if unsafe { !IsWindow(Some(hwnd)).as_bool() } {
             return;
         }
-        let _ = ShowWindow(hwnd, if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW });
-        keybd_event(VK_MENU.0 as u8, 0, Default::default(), 0);
-        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
-        let foreground = GetWindowThreadProcessId(GetForegroundWindow(), None);
-        let current = GetCurrentThreadId();
-        let attached = foreground != 0 && foreground != current && AttachThreadInput(current, foreground, true).as_bool();
-        let _ = BringWindowToTop(hwnd);
-        let _ = SetForegroundWindow(hwnd);
-        if attached {
-            let _ = AttachThreadInput(current, foreground, false);
-        }
-    }
+        crate::utils::force_foreground(hwnd);
+    })
+    .await;
 }
 
 #[tauri::command]
@@ -4234,21 +4910,25 @@ fn agent_sound_files(state: &str) -> Vec<std::path::PathBuf> {
 
 #[tauri::command]
 pub async fn pick_program(app: AppHandle) -> Result<Option<(String, String)>, String> {
-    let mut dialog = app.dialog().file().set_title("Choose a program").add_filter("Programs", &["exe", "lnk", "bat", "cmd", "url"]);
-    if let Some(dock) = app.get_webview_window("dock") {
-        dialog = dialog.set_parent(&dock);
-    }
-    let Some(path) = dialog.blocking_pick_file() else {
-        return Ok(None);
-    };
-    let path = path.into_path().map_err(|e| e.to_string())?;
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("App");
-    let mut chars = stem.chars();
-    let name = match chars.next() {
-        Some(first) if first.is_lowercase() => first.to_uppercase().chain(chars).collect(),
-        _ => stem.to_string(),
-    };
-    Ok(Some((name, path.to_string_lossy().into_owned())))
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut dialog = app.dialog().file().set_title("Choose a program").add_filter("Programs", &["exe", "lnk", "bat", "cmd", "url"]);
+        if let Some(dock) = app.get_webview_window("dock") {
+            dialog = dialog.set_parent(&dock);
+        }
+        let Some(path) = dialog.blocking_pick_file() else {
+            return Ok(None);
+        };
+        let path = path.into_path().map_err(|e| e.to_string())?;
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("App");
+        let mut chars = stem.chars();
+        let name = match chars.next() {
+            Some(first) if first.is_lowercase() => first.to_uppercase().chain(chars).collect(),
+            _ => stem.to_string(),
+        };
+        Ok(Some((name, path.to_string_lossy().into_owned())))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -4257,31 +4937,35 @@ pub async fn pick_agent_sound(app: AppHandle, state: String) -> Result<bool, Str
     if !AGENT_SOUND_STATES.contains(&state.as_str()) {
         return Err("Unknown state".into());
     }
-    let Some(path) = app
-        .dialog()
-        .file()
-        .set_title("Choose a sound")
-        .add_filter("Audio", &["mp3", "wav", "ogg", "m4a"])
-        .blocking_pick_file()
-    else {
-        return Ok(false);
-    };
-    let path = path.into_path().map_err(|e| e.to_string())?;
-    if std::fs::metadata(&path).map_err(|e| e.to_string())?.len() > MAX_SOUND_BYTES {
-        return Err("Sound is too large (maximum 3MB)".into());
-    }
-    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
-    if !["mp3", "wav", "ogg", "m4a"].contains(&ext.as_str()) {
-        return Err("Unsupported file type".into());
-    }
-    let dir = crate::agent_api::data_dir().ok_or("No data folder")?.join("sounds");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    for old in agent_sound_files(&state) {
-        let _ = std::fs::remove_file(old);
-    }
-    std::fs::copy(&path, dir.join(format!("{state}.{ext}"))).map_err(|e| e.to_string())?;
-    let _ = app.emit("agent-sound-changed", ());
-    Ok(true)
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(path) = app
+            .dialog()
+            .file()
+            .set_title("Choose a sound")
+            .add_filter("Audio", &["mp3", "wav", "ogg", "m4a"])
+            .blocking_pick_file()
+        else {
+            return Ok(false);
+        };
+        let path = path.into_path().map_err(|e| e.to_string())?;
+        if std::fs::metadata(&path).map_err(|e| e.to_string())?.len() > MAX_SOUND_BYTES {
+            return Err("Sound is too large (maximum 3MB)".into());
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+        if !["mp3", "wav", "ogg", "m4a"].contains(&ext.as_str()) {
+            return Err("Unsupported file type".into());
+        }
+        let dir = crate::agent_api::data_dir().ok_or("No data folder")?.join("sounds");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        for old in agent_sound_files(&state) {
+            let _ = std::fs::remove_file(old);
+        }
+        std::fs::copy(&path, dir.join(format!("{state}.{ext}"))).map_err(|e| e.to_string())?;
+        let _ = app.emit("agent-sound-changed", ());
+        Ok(true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -4313,13 +4997,21 @@ pub async fn agent_sound_custom() -> Vec<String> {
 }
 
 #[tauri::command]
-pub fn set_live_thumbnails(
+pub async fn set_live_thumbnails(
     window: tauri::Window,
     targets: Vec<crate::live_preview::LiveThumbnailTarget>,
     client_area_only: Option<bool>,
 ) -> Result<Vec<isize>, String> {
     let dest_hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
-    crate::live_preview::set_live_thumbnails(dest_hwnd, targets, client_area_only.unwrap_or(false))
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::live_preview::set_live_thumbnails(
+            dest_hwnd,
+            targets,
+            client_area_only.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -4328,11 +5020,955 @@ pub fn set_live_thumbnails_opacity(opacity: u8) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn clear_live_thumbnails() -> Result<(), String> {
-    crate::live_preview::clear_all_thumbnails()
+pub async fn clear_live_thumbnails(window: tauri::Window) -> Result<(), String> {
+    let dest_hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::live_preview::clear_thumbnails_for_dest(dest_hwnd)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn is_dwm_composition_enabled() -> Result<bool, String> {
-    Ok(crate::live_preview::is_composition_enabled())
+pub async fn is_dwm_composition_enabled() -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(crate::live_preview::is_composition_enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub const THEME_EXPORT_KEYS: [&str; 26] = [
+    "nectar-theme-style",
+    "nectar-theme-mode",
+    "nectar-theme-accent",
+    "nectar-theme-accent-color",
+    "nectar-theme-color",
+    "nectar-theme-opacity",
+    "nectar-theme-saturation",
+    "nectar-theme-brightness",
+    "nectar-glass-wallpaper",
+    "nectar-glass-blur",
+    "nectar-edge-intensity",
+    "nectar-radius-scale",
+    "nectar-ui-density",
+    "nectar-motion-speed",
+    "nectar-font-family",
+    "nectar-selection-color",
+    "nectar-legacy-mode",
+    "nectar-icon-tint-mode",
+    "nectar-icon-tint-source",
+    "nectar-icon-tint-color",
+    "nectar-icon-tint-strength",
+    "nectar-icon-tile-shape",
+    "nectar-motion-preset",
+    "nectar-menu-style",
+    "nectar-menu-hover-style",
+    "nectar-dock-indicator",
+];
+
+fn normalize_hex_accent(raw: Option<String>) -> Result<Option<String>, String> {
+    let Some(s) = raw else { return Ok(None); };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let valid = trimmed.len() == 7
+        && trimmed.starts_with('#')
+        && trimmed[1..].bytes().all(|b| b.is_ascii_hexdigit());
+    if !valid {
+        return Err("Invalid accent hex color".into());
+    }
+    Ok(Some(trimmed.to_ascii_lowercase()))
+}
+
+pub fn validate_theme_file_json(raw: &str) -> Result<String, String> {
+    const MAX_THEME_FILE_BYTES: usize = 64 * 1024;
+    if raw.len() > MAX_THEME_FILE_BYTES {
+        return Err("Theme file exceeds 64KB limit".into());
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("Invalid theme JSON: {e}"))?;
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| "Theme file root must be a JSON object".to_string())?;
+    let schema = obj
+        .get("schema")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing theme schema".to_string())?;
+    if schema != "nectar-theme-v1" {
+        return Err(format!("Unsupported theme schema: {schema}"));
+    }
+    let settings_obj = obj
+        .get("settings")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| "Missing theme settings object".to_string())?;
+
+    let mut clean_settings = serde_json::Map::new();
+    for key in THEME_EXPORT_KEYS {
+        if let Some(val) = settings_obj.get(key) {
+            let as_str = match val {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Bool(b) => Some(if *b { "true".into() } else { "false".into() }),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            };
+            if let Some(s) = as_str {
+                if s.len() <= 256 {
+                    clean_settings.insert(key.to_string(), serde_json::Value::String(s));
+                }
+            }
+        }
+    }
+
+    if clean_settings.is_empty() {
+        return Err("Theme file contains no supported appearance keys".into());
+    }
+
+    let raw_name = obj
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Custom Theme");
+    let clean_name: String = raw_name.chars().take(32).collect();
+    let exported_at = obj
+        .get("exportedAt")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && s.len() <= 64)
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::utils::get_now_ms().to_string());
+
+    let out = serde_json::json!({
+        "schema": "nectar-theme-v1",
+        "name": clean_name,
+        "exportedAt": exported_at,
+        "settings": serde_json::Value::Object(clean_settings),
+    });
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct RuntimeOptimizationState {
+    pub game_mode_active: bool,
+    pub media_accent: Option<String>,
+    pub updater_disabled: bool,
+    pub perf_profile: String,
+}
+
+#[tauri::command]
+pub fn get_runtime_state() -> RuntimeOptimizationState {
+    let perf_profile = match crate::state::PERF_PROFILE.load(Ordering::Relaxed) {
+        1 => "eco",
+        2 => "max",
+        _ => "balanced",
+    }
+    .to_string();
+    let media_accent = crate::state::MEDIA_ACCENT_RUNTIME
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
+    RuntimeOptimizationState {
+        game_mode_active: crate::state::GAME_MODE_ACTIVE.load(Ordering::Relaxed),
+        media_accent,
+        updater_disabled: crate::updater::is_disabled_for_fork(),
+        perf_profile,
+    }
+}
+
+#[tauri::command]
+pub fn broadcast_media_accent(app: AppHandle, hex: Option<String>) -> Result<(), String> {
+    let next = normalize_hex_accent(hex)?;
+    let changed = if let Ok(mut guard) = crate::state::MEDIA_ACCENT_RUNTIME.lock() {
+        if *guard == next {
+            false
+        } else {
+            *guard = next.clone();
+            true
+        }
+    } else {
+        false
+    };
+    if changed {
+        let _ = app.emit("media-accent-changed", next);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn export_theme_dialog(
+    app: AppHandle,
+    payload_json: String,
+    default_name: String,
+) -> Result<bool, String> {
+    let clean_json = validate_theme_file_json(&payload_json)?;
+    let stem: String = default_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect();
+    let base = if stem.is_empty() { "nectar-theme" } else { &stem };
+    let file_name = if base.ends_with(".json") {
+        base.to_string()
+    } else {
+        format!("{base}.nectar-theme.json")
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_title("Export Nectar Theme")
+            .set_file_name(&file_name)
+            .add_filter("Nectar Theme", &["json"]);
+        if let Some(settings) = app.get_webview_window("settings") {
+            dialog = dialog.set_parent(&settings);
+        }
+        let Some(path) = dialog.blocking_save_file() else {
+            return Ok(false);
+        };
+        let path_buf = path.into_path().map_err(|e| e.to_string())?;
+        std::fs::write(path_buf, clean_json).map_err(|e| e.to_string())?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn import_theme_dialog(app: AppHandle) -> Result<Option<String>, String> {
+    const MAX_THEME_FILE_BYTES: u64 = 64 * 1024;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_title("Import Nectar Theme")
+            .add_filter("Nectar Theme", &["json"]);
+        if let Some(settings) = app.get_webview_window("settings") {
+            dialog = dialog.set_parent(&settings);
+        }
+        let Some(path) = dialog.blocking_pick_file() else {
+            return Ok(None);
+        };
+        let path_buf = path.into_path().map_err(|e| e.to_string())?;
+        let metadata = std::fs::metadata(&path_buf).map_err(|e| e.to_string())?;
+        if metadata.len() > MAX_THEME_FILE_BYTES {
+            return Err("Theme file is too large (maximum 64KB)".into());
+        }
+        let raw = std::fs::read_to_string(&path_buf).map_err(|e| e.to_string())?;
+        let clean = validate_theme_file_json(&raw)?;
+        Ok(Some(clean))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn set_window_low_memory(window: tauri::WebviewWindow, low: bool) {
+    crate::webview_memory::set_low_memory(&window, low);
+}
+
+#[tauri::command]
+pub async fn reclaim_memory_now(app: AppHandle) -> Result<u32, String> {
+    if crate::state::PERF_PROFILE.load(Ordering::Relaxed) == 1
+        || crate::state::RAM_SAVER_ENABLED.load(Ordering::Relaxed)
+    {
+        for label in [
+            crate::shell_windows::START_LABEL,
+            crate::shell_windows::LAUNCHER_LABEL,
+            crate::shell_windows::TRAYBAR_LABEL,
+            "overlay",
+        ] {
+            if let Some(win) = app.get_webview_window(label) {
+                if !win.is_visible().unwrap_or(false) {
+                    crate::webview_memory::set_low_memory(&win, true);
+                }
+            }
+        }
+    }
+    tauri::async_runtime::spawn_blocking(crate::memory_saver::trim_now)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn apply_windows_icon_tint(
+    app: AppHandle,
+    options: crate::windows_icons::WindowsIconTintOptions,
+) -> Result<crate::windows_icons::WindowsIconTintReport, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::windows_icons::apply_tint(&app, options))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn restore_windows_icons(
+    app: AppHandle,
+) -> Result<crate::windows_icons::WindowsIconTintReport, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::windows_icons::restore(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn windows_icons_backup_status(app: AppHandle) -> crate::windows_icons::WindowsIconBackupStatus {
+    crate::windows_icons::backup_status(&app)
+}
+
+#[tauri::command]
+pub async fn get_window_topmost(hwnd: isize) -> bool {
+    tauri::async_runtime::spawn_blocking(move || unsafe {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongW, IsWindow, GWL_EXSTYLE, WS_EX_TOPMOST};
+        let target = HWND(hwnd as *mut _);
+        if target.0.is_null() || !IsWindow(Some(target)).as_bool() {
+            return false;
+        }
+        (GetWindowLongW(target, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0
+    })
+    .await
+    .unwrap_or(false)
+}
+
+#[tauri::command]
+pub async fn toggle_window_topmost(hwnd: isize) -> Result<bool, String> {
+    if crate::state::is_shell_chrome_hwnd(hwnd) {
+        return Err("shell_window".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || unsafe {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongW, IsWindow, SetWindowPos, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_TOPMOST,
+        };
+        let target = HWND(hwnd as *mut _);
+        if target.0.is_null() || !IsWindow(Some(target)).as_bool() {
+            return Err("invalid_window".into());
+        }
+        if !crate::utils::is_hwnd_responsive(target, 50) {
+            return Err("hung_window".into());
+        }
+        let currently_topmost = (GetWindowLongW(target, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0;
+        let want = !currently_topmost;
+        let z_insert = if want { HWND_TOPMOST } else { HWND_NOTOPMOST };
+        if SetWindowPos(
+            target,
+            Some(z_insert),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        .is_err()
+        {
+            return Err("elevated_window".into());
+        }
+        let actual_topmost = (GetWindowLongW(target, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0;
+        if actual_topmost != want {
+            return Err("elevated_window".into());
+        }
+        Ok(actual_topmost)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct JumpListFolder {
+    pub id: String,
+    pub path: String,
+    pub kind: String,
+}
+
+#[tauri::command]
+pub async fn get_explorer_jump_list() -> Vec<JumpListFolder> {
+    tauri::async_runtime::spawn_blocking(|| {
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::UI::Shell::{
+            SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads,
+            FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos, KNOWN_FOLDER_FLAG,
+        };
+        let _com = crate::utils::ComApartmentGuard::init_mta();
+        let mut out = Vec::new();
+        let entries: [(&str, *const windows::core::GUID); 6] = [
+            ("desktop", &FOLDERID_Desktop),
+            ("downloads", &FOLDERID_Downloads),
+            ("documents", &FOLDERID_Documents),
+            ("pictures", &FOLDERID_Pictures),
+            ("music", &FOLDERID_Music),
+            ("videos", &FOLDERID_Videos),
+        ];
+        for (kind, guid) in entries {
+            unsafe {
+                if let Ok(pwstr) = SHGetKnownFolderPath(guid, KNOWN_FOLDER_FLAG(0), None) {
+                    if let Ok(path) = pwstr.to_string() {
+                        let clean = path.trim().to_string();
+                        if !clean.is_empty() && std::path::Path::new(&clean).is_dir() {
+                            out.push(JumpListFolder {
+                                id: kind.to_string(),
+                                path: clean,
+                                kind: kind.to_string(),
+                            });
+                        }
+                    }
+                    CoTaskMemFree(Some(pwstr.0 as *const _));
+                }
+            }
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            let clean = profile.trim().to_string();
+            if !clean.is_empty() && std::path::Path::new(&clean).is_dir() {
+                out.push(JumpListFolder {
+                    id: "home".to_string(),
+                    path: clean,
+                    kind: "home".to_string(),
+                });
+            }
+        }
+        out
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn resolve_hwnd_image_path(hwnd: isize) -> Option<String> {
+    use std::path::Path;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow};
+
+    if hwnd == 0 {
+        return None;
+    }
+    unsafe {
+        let target = HWND(hwnd as *mut _);
+        if !IsWindow(Some(target)).as_bool() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(target, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 520];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(handle);
+        if !ok || len == 0 {
+            return None;
+        }
+        let img = String::from_utf16_lossy(&buf[..len as usize]);
+        let lower = img.to_ascii_lowercase();
+        if lower.ends_with("\\applicationframehost.exe") || !Path::new(&img).exists() {
+            return None;
+        }
+        Some(img)
+    }
+}
+
+pub(crate) fn resolve_app_file_target(
+    path: &str,
+    app_name: Option<&str>,
+    args: Option<&str>,
+    hwnd: Option<isize>,
+    allow_shortcut_fallback: bool,
+) -> Option<(String, Option<String>)> {
+    use std::path::Path;
+
+    let trimmed = path.trim().trim_matches('"');
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "start"
+        || lower == "nectar-settings"
+        || lower.starts_with("ms-")
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
+    {
+        return None;
+    }
+    if lower.starts_with("shell:") && !is_aumid_path(trimmed) {
+        return None;
+    }
+
+    let passed_args = args
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    if trimmed.is_empty() || is_aumid_path(trimmed) {
+        return hwnd
+            .and_then(resolve_hwnd_image_path)
+            .map(|img| (img, passed_args));
+    }
+
+    let candidate = pwa_launch_target(trimmed, app_name).unwrap_or_else(|| trimmed.to_string());
+    if candidate.to_ascii_lowercase().ends_with(".lnk") {
+        let _com = crate::utils::ComApartmentGuard::init_mta();
+        if let Some((target, lnk_args)) = crate::utils::resolve_shortcut(&candidate) {
+            let resolved = resolve_moved_squirrel_exe(&target);
+            if Path::new(&resolved).exists() {
+                let merged_args = passed_args.or_else(|| {
+                    let clean = lnk_args.trim();
+                    (!clean.is_empty()).then(|| clean.to_string())
+                });
+                return Some((resolved, merged_args));
+            }
+        }
+        if let Some(img) = hwnd.and_then(resolve_hwnd_image_path) {
+            return Some((img, passed_args));
+        }
+        if allow_shortcut_fallback && Path::new(&candidate).exists() {
+            return Some((candidate, passed_args));
+        }
+        return None;
+    }
+
+    let mut actual = candidate;
+    if !actual.contains('\\') && !actual.contains('/') {
+        if let Some(resolved) = crate::utils::resolve_executable_path(&actual) {
+            actual = resolved;
+        }
+    }
+    actual = resolve_moved_squirrel_exe(&actual);
+    if !Path::new(&actual).exists() {
+        if let Some(img) = hwnd.and_then(resolve_hwnd_image_path) {
+            return Some((img, passed_args));
+        }
+        return None;
+    }
+    Some((actual, passed_args))
+}
+
+fn shell_execute_ex_verb(
+    verb: &str,
+    file: &str,
+    args: Option<&str>,
+    dir: Option<&str>,
+    extra_mask: u32,
+) -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{GetLastError, ERROR_CANCELLED};
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let verb_w = crate::uninstall_registry::wide(verb);
+    let file_w = crate::uninstall_registry::wide(file);
+    let args_w = args
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(crate::uninstall_registry::wide);
+    let dir_w = dir
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(crate::uninstall_registry::wide);
+
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: extra_mask,
+        lpVerb: PCWSTR(verb_w.as_ptr()),
+        lpFile: PCWSTR(file_w.as_ptr()),
+        lpParameters: args_w.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr())),
+        lpDirectory: dir_w.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr())),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+
+    unsafe {
+        if let Err(err) = ShellExecuteExW(&mut info) {
+            let last = GetLastError();
+            if last == ERROR_CANCELLED
+                || err.code() == windows::core::HRESULT::from_win32(ERROR_CANCELLED.0)
+            {
+                return Err("cancelled".to_string());
+            }
+            return Err(format!("ShellExecuteExW({verb}) failed: {err}"));
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn launch_app_as_admin(
+    app_path: String,
+    app_name: Option<String>,
+    args: Option<String>,
+    hwnd: Option<isize>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some((target, resolved_args)) = resolve_app_file_target(
+            &app_path,
+            app_name.as_deref(),
+            args.as_deref(),
+            hwnd,
+            true,
+        ) else {
+            return Err("admin_unavailable".to_string());
+        };
+        let parent_dir = std::path::Path::new(&target)
+            .parent()
+            .filter(|d| d.is_dir())
+            .map(|d| d.to_string_lossy().to_string());
+        shell_execute_ex_verb(
+            "runas",
+            &target,
+            resolved_args.as_deref(),
+            parent_dir.as_deref(),
+            0,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn open_app_location(app_path: String, hwnd: Option<isize>) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some((target, _)) =
+            resolve_app_file_target(&app_path, None, None, hwnd, true)
+        else {
+            return Err("location_unavailable".to_string());
+        };
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let explorer_path = format!("{root}\\explorer.exe");
+        let explorer_bin = if std::path::Path::new(&explorer_path).exists() {
+            explorer_path.as_str()
+        } else {
+            "explorer.exe"
+        };
+        std::process::Command::new(explorer_bin)
+            .raw_arg(format!("/select,\"{}\"", target.replace('"', "")))
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub(crate) fn show_properties_blocking(target: String, is_shell_uri: bool) -> Result<(), String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let spawn_res = std::thread::Builder::new()
+        .name("nectar-props".into())
+        .spawn(move || {
+            use windows::core::PCWSTR;
+            use windows::Win32::Foundation::{S_FALSE, S_OK};
+            use windows::Win32::System::Com::{
+                CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+            };
+            use windows::Win32::UI::Shell::{
+                ILFree, SHObjectProperties, SHParseDisplayName, ShellExecuteExW,
+                SEE_MASK_IDLIST, SEE_MASK_INVOKEIDLIST, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+                SHOP_FILEPATH,
+            };
+            use windows::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage, MSG,
+                PM_REMOVE, QS_ALLINPUT, SW_SHOWNORMAL,
+            };
+
+            let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            let should_uninit = hr == S_OK || hr == S_FALSE;
+            let wide = crate::uninstall_registry::wide(&target);
+
+            let outcome = if is_shell_uri {
+                let mut pidl = std::ptr::null_mut();
+                let mut sfgao = 0u32;
+                let parsed = unsafe {
+                    SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, Some(&mut sfgao))
+                };
+                if parsed.is_ok() && !pidl.is_null() {
+                    let verb_w = crate::uninstall_registry::wide("properties");
+                    let mut info = SHELLEXECUTEINFOW {
+                        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+                        fMask: SEE_MASK_IDLIST | SEE_MASK_INVOKEIDLIST | SEE_MASK_NOASYNC,
+                        lpVerb: PCWSTR(verb_w.as_ptr()),
+                        lpIDList: pidl as *mut std::ffi::c_void,
+                        nShow: SW_SHOWNORMAL.0,
+                        ..Default::default()
+                    };
+                    let res = unsafe { ShellExecuteExW(&mut info) }
+                        .map_err(|e| format!("ShellExecuteExW(properties) failed: {e}"));
+                    unsafe { ILFree(Some(pidl as *const _)) };
+                    res
+                } else {
+                    shell_execute_ex_verb(
+                        "properties",
+                        &target,
+                        None,
+                        None,
+                        SEE_MASK_INVOKEIDLIST | SEE_MASK_NOASYNC,
+                    )
+                }
+            } else {
+                let ok = unsafe {
+                    SHObjectProperties(None, SHOP_FILEPATH, PCWSTR(wide.as_ptr()), PCWSTR::null())
+                        .as_bool()
+                };
+                if ok {
+                    Ok(())
+                } else {
+                    shell_execute_ex_verb(
+                        "properties",
+                        &target,
+                        None,
+                        None,
+                        SEE_MASK_INVOKEIDLIST | SEE_MASK_NOASYNC,
+                    )
+                }
+            };
+            let _ = tx.send(outcome.clone());
+
+            // Keep this dedicated STA alive briefly and pump COM/DDE callbacks before CoUninitialize.
+            if outcome.is_ok() {
+                let start = std::time::Instant::now();
+                let budget = std::time::Duration::from_millis(1200);
+                unsafe {
+                    let mut msg = MSG::default();
+                    while start.elapsed() < budget {
+                        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                            let _ = TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                        let rem = budget.saturating_sub(start.elapsed()).as_millis() as u32;
+                        if rem == 0 {
+                            break;
+                        }
+                        let _ = MsgWaitForMultipleObjects(None, false, rem.min(150), QS_ALLINPUT);
+                    }
+                }
+            }
+
+            if should_uninit {
+                unsafe { CoUninitialize() };
+            }
+        });
+
+    if let Err(e) = spawn_res {
+        return Err(e.to_string());
+    }
+    rx.recv().map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn open_app_properties(app_path: String, hwnd: Option<isize>) -> Result<(), String> {
+    let trimmed = app_path.trim().to_string();
+    let lower = trimmed.to_ascii_lowercase();
+    let shell_target = if lower == "recycle" {
+        Some("shell:RecycleBinFolder".to_string())
+    } else if lower.starts_with("shell:") && !is_aumid_path(&trimmed) {
+        Some(trimmed.clone())
+    } else {
+        None
+    };
+
+    let (target, is_shell_uri) = if let Some(uri) = shell_target {
+        (uri, true)
+    } else {
+        let resolved = tauri::async_runtime::spawn_blocking(move || {
+            resolve_app_file_target(&trimmed, None, None, hwnd, true)
+                .map(|(t, _)| t)
+                .ok_or_else(|| "properties_unavailable".to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        (resolved, false)
+    };
+
+    tauri::async_runtime::spawn_blocking(move || show_properties_blocking(target, is_shell_uri))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn empty_recycle_bin() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(crate::launcher::providers::empty_recycle_bin)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[derive(serde::Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowStateDto {
+    pub minimized: bool,
+    pub maximized: bool,
+    pub topmost: bool,
+}
+
+#[tauri::command]
+pub async fn get_window_state(hwnd: isize) -> WindowStateDto {
+    tauri::async_runtime::spawn_blocking(move || unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongW, IsIconic, IsWindow, IsZoomed, GWL_EXSTYLE, WS_EX_TOPMOST,
+        };
+        let target = HWND(hwnd as *mut _);
+        if hwnd == 0 || !IsWindow(Some(target)).as_bool() {
+            return WindowStateDto::default();
+        }
+        WindowStateDto {
+            minimized: IsIconic(target).as_bool(),
+            maximized: IsZoomed(target).as_bool(),
+            topmost: (GetWindowLongW(target, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0,
+        }
+    })
+    .await
+    .unwrap_or_default()
+}
+
+#[tauri::command]
+pub async fn window_action(
+    hwnd: isize,
+    all_hwnds: Option<Vec<isize>>,
+    action: String,
+) -> Result<(), String> {
+    if crate::state::is_shell_chrome_hwnd(hwnd) {
+        return Err("shell_window".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || unsafe {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            IsIconic, IsWindow, IsZoomed, PostMessageW, SendMessageTimeoutW, ShowWindow,
+            SC_MINIMIZE, SMTO_ABORTIFHUNG, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_CLOSE,
+            WM_SYSCOMMAND,
+        };
+
+        let mut seen = Vec::new();
+        for raw in std::iter::once(hwnd).chain(all_hwnds.unwrap_or_default()) {
+            if raw == 0 || crate::state::is_shell_chrome_hwnd(raw) || seen.contains(&raw) {
+                continue;
+            }
+            let candidate = HWND(raw as *mut _);
+            if IsWindow(Some(candidate)).as_bool() {
+                seen.push(raw);
+            }
+        }
+        let Some(&primary_raw) = seen.first() else {
+            return Err("invalid_window".into());
+        };
+        let primary = HWND(primary_raw as *mut _);
+
+        match action.as_str() {
+            "minimize" => {
+                for raw in seen {
+                    let h = HWND(raw as *mut _);
+                    let _ = ShowWindow(h, SW_MINIMIZE);
+                    if !IsIconic(h).as_bool() {
+                        let _ = SendMessageTimeoutW(
+                            h,
+                            WM_SYSCOMMAND,
+                            WPARAM(SC_MINIMIZE as usize),
+                            LPARAM(0),
+                            SMTO_ABORTIFHUNG,
+                            250,
+                            None,
+                        );
+                    }
+                }
+                Ok(())
+            }
+            "maximize" => {
+                let cmd = if IsZoomed(primary).as_bool() {
+                    SW_RESTORE
+                } else {
+                    SW_MAXIMIZE
+                };
+                let _ = ShowWindow(primary, cmd);
+                let _ = crate::utils::force_foreground(primary);
+                Ok(())
+            }
+            "restore" => {
+                let _ = ShowWindow(primary, SW_RESTORE);
+                let _ = crate::utils::force_foreground(primary);
+                Ok(())
+            }
+            "close_all" => {
+                for raw in seen {
+                    let h = HWND(raw as *mut _);
+                    let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+                Ok(())
+            }
+            other => Err(format!("unknown_window_action:{other}")),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub(crate) fn resolve_windows_tool_spec(
+    tool: &str,
+) -> Option<(&'static str, &'static str, Option<&'static str>)> {
+    match tool.trim() {
+        "terminal" => Some(("open", "__terminal__", None)),
+        "terminal_admin" => Some(("runas", "__terminal__", None)),
+        "run_dialog" => Some((
+            "open",
+            "explorer.exe",
+            Some("shell:::{2559a1f3-21d7-11d4-bdaf-00c04f60b9f0}"),
+        )),
+        "win_settings" => Some(("open", "ms-settings:", None)),
+        "explorer" => Some(("open", "explorer.exe", None)),
+        "installed_apps" => Some(("open", "ms-settings:appsfeatures", None)),
+        "device_manager" => Some(("open", "devmgmt.msc", None)),
+        "disk_management" => Some(("open", "diskmgmt.msc", None)),
+        "control_panel" => Some(("open", "control.exe", None)),
+        "network_connections" => Some(("open", "ms-settings:network", None)),
+        "event_viewer" => Some(("open", "eventvwr.msc", None)),
+        "computer_mgmt" => Some(("open", "compmgmt.msc", None)),
+        "power_options" => Some(("open", "ms-settings:powersleep", None)),
+        "notif_settings" => Some(("open", "ms-settings:notifications", None)),
+        "task_manager" => Some(("open", "taskmgr.exe", None)),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+pub async fn open_windows_tool(tool: String) -> Result<(), String> {
+    let Some((verb, target_spec, args)) = resolve_windows_tool_spec(&tool) else {
+        return Err(format!("unknown_windows_tool:{tool}"));
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let resolved_file = if target_spec == "__terminal__" {
+            std::env::var("LOCALAPPDATA")
+                .ok()
+                .map(|local| {
+                    std::path::Path::new(&local)
+                        .join(r"Microsoft\WindowsApps\wt.exe")
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .filter(|p| std::path::Path::new(p).exists())
+                .or_else(|| crate::utils::resolve_executable_path("wt.exe"))
+                .unwrap_or_else(|| "powershell.exe".to_string())
+        } else if target_spec == "explorer.exe" {
+            let candidate = format!("{root}\\explorer.exe");
+            if std::path::Path::new(&candidate).exists() {
+                candidate
+            } else {
+                "explorer.exe".to_string()
+            }
+        } else if target_spec.ends_with(".msc") || target_spec == "control.exe" || target_spec == "taskmgr.exe" {
+            let candidate = format!("{root}\\System32\\{target_spec}");
+            if std::path::Path::new(&candidate).exists() {
+                candidate
+            } else {
+                target_spec.to_string()
+            }
+        } else {
+            target_spec.to_string()
+        };
+        shell_execute_ex_verb(verb, &resolved_file, args, None, 0)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }

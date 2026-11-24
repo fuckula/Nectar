@@ -1,10 +1,11 @@
 import { emit } from "@tauri-apps/api/event";
-import { Compass, Download, FlaskConical, RefreshCw, FileDown, Upload, RotateCcw, Trash2 } from "lucide-react";
+import { Compass, Download, FlaskConical, RefreshCw, FileDown, Upload, RotateCcw, Trash2, Info } from "lucide-react";
 import { SettingRow } from "./SettingRow";
 import { useT } from "../i18n";
 
 interface AboutTabProps {
   appVersion: string;
+  updaterDisabled?: boolean;
   autoUpdate: boolean;
   toggleAutoUpdate: () => void;
   prereleaseChannel: boolean;
@@ -26,6 +27,7 @@ interface AboutTabProps {
 
 export function AboutTab({
   appVersion,
+  updaterDisabled = false,
   autoUpdate,
   toggleAutoUpdate,
   prereleaseChannel,
@@ -130,39 +132,62 @@ export function AboutTab({
         <img src="/nectar.png" className="about-logo" alt="Nectar Logo" />
         <h1 className="about-title">Nectar</h1>
         <p className="about-version">{t("about.version", { version: appVersion || "—" })}</p>
-        <button
-          className={`update-pill update-pill--${updateStatus || "idle"}`}
-          disabled={pillBusy}
-          onClick={() => (updateStatus === "available" ? installUpdate() : checkForUpdates())}
-        >
-          {getPillLabel()}
-        </button>
+        <span className="fork-badge">{t("about.forkBadge")}</span>
+        {updaterDisabled ? (
+          <span className="update-pill update-pill--fork">{t("about.forkUpdaterPill")}</span>
+        ) : (
+          <button
+            className={`update-pill update-pill--${updateStatus || "idle"}`}
+            disabled={pillBusy}
+            onClick={() => (updateStatus === "available" ? installUpdate() : checkForUpdates())}
+          >
+            {getPillLabel()}
+          </button>
+        )}
       </div>
 
       <div className="setting-group-label">{t("about.updates.group")}</div>
       <div className="setting-group">
-        <SettingRow icon={Download} label={t("about.autoUpdate")} desc={t("about.autoUpdate.desc")}>
-          <label className="toggle-switch">
-            <input type="checkbox" checked={autoUpdate} onChange={toggleAutoUpdate} />
-            <span className="slider"></span>
-          </label>
-        </SettingRow>
+        {updaterDisabled ? (
+          <SettingRow
+            icon={Info}
+            label={t("about.forkUpdater.title")}
+            desc={t("about.forkUpdater.desc")}
+            settingKey="about.forkUpdater"
+            divider={false}
+          />
+        ) : (
+          <>
+            <SettingRow icon={Download} label={t("about.autoUpdate")} desc={t("about.autoUpdate.desc")} settingKey="about.autoUpdate">
+              <label className="toggle-switch">
+                <input type="checkbox" checked={autoUpdate} onChange={toggleAutoUpdate} />
+                <span className="slider"></span>
+              </label>
+            </SettingRow>
 
-        <SettingRow icon={FlaskConical} label={t("about.prerelease")} desc={t("about.prerelease.desc")}>
-          <label className="toggle-switch">
-            <input type="checkbox" checked={prereleaseChannel} onChange={togglePrereleaseChannel} />
-            <span className="slider"></span>
-          </label>
-        </SettingRow>
+            <SettingRow icon={FlaskConical} label={t("about.prerelease")} desc={t("about.prerelease.desc")} settingKey="about.prerelease">
+              <label className="toggle-switch">
+                <input type="checkbox" checked={prereleaseChannel} onChange={togglePrereleaseChannel} />
+                <span className="slider"></span>
+              </label>
+            </SettingRow>
 
-        <SettingRow
-          icon={RefreshCw}
-          label={getUpdateLabel()}
-          desc={getUpdateDesc()}
-          action
-          divider={false}
-          onClick={() => (updateStatus === "available" ? installUpdate() : checkForUpdates())}
-        />
+            <div data-setting-key="about.update.check">
+              <SettingRow
+                icon={RefreshCw}
+                label={getUpdateLabel()}
+                desc={getUpdateDesc()}
+                action
+                divider={false}
+                onClick={() => {
+                  if (pillBusy) return;
+                  if (updateStatus === "available") installUpdate();
+                  else checkForUpdates();
+                }}
+              />
+            </div>
+          </>
+        )}
       </div>
 
       <div className="setting-group-label setting-group-label--spaced">

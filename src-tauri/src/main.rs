@@ -6,6 +6,7 @@ mod state;
 mod utils;
 mod capture;
 mod windows_accent;
+mod windows_icons;
 mod services;
 mod commands;
 mod monitors;
@@ -29,9 +30,14 @@ mod shelf;
 mod agent_api;
 mod memory_saver;
 mod webview_args;
+mod webview_memory;
 mod on_demand_windows;
 mod wallpaper;
 mod live_preview;
+mod tray_host;
+mod launcher;
+mod start_menu;
+mod shell_windows;
 
 use tauri::Manager;
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
@@ -51,6 +57,13 @@ unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> BOOL {
 
     }
     BOOL(0)
+}
+
+fn app_device_event_filter() -> tauri::DeviceEventFilter {
+    // Unregister tao's unused foreground Raw Input (RIDEV_REMOVE) so our global
+    // WH_KEYBOARD_LL hook keeps firing while Nectar WebView2 windows have focus
+    // on Windows 11 24H2/25H2 (tauri-apps/wry#1761).
+    tauri::DeviceEventFilter::Always
 }
 
 fn main() {
@@ -103,6 +116,7 @@ fn main() {
     startup::begin();
     setup_brightness_worker();
     let app = tauri::Builder::default()
+        .device_event_filter(app_device_event_filter())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_drag::init())
@@ -122,7 +136,12 @@ fn main() {
             shelf_text_file,
             pointer_over_notch,
             open_settings_window,
+            open_settings_window_with_tab,
             on_demand_windows::on_demand_window_ready,
+            on_demand_windows::hide_on_demand_window,
+            get_tray_host_status,
+            get_hotkey_status,
+            set_hotkeys_paused,
             open_calendar_window,
             open_tray_window,
             open_tray_at_cursor,
@@ -182,6 +201,7 @@ fn main() {
             set_window_keyboard_focus,
             get_drives,
             open_dock_extra,
+            empty_recycle_bin,
             audio_devices::get_audio_devices,
             audio_devices::set_default_audio_device,
             connections::get_lan_status,
@@ -214,6 +234,7 @@ fn main() {
             set_volume_mixer_rect,
             clear_volume_mixer_rect,
             save_setting,
+            save_settings_batch,
             load_settings,
             reset_settings,
             capture_window_thumbnail,
@@ -237,6 +258,11 @@ fn main() {
             sync_windows_accent,
             restore_windows_accent,
             windows_accent_backup_exists,
+            get_windows_selection_color,
+            sync_windows_selection_color,
+            restore_windows_selection_color,
+            windows_selection_backup_exists,
+            restart_explorer_for_theme,
             wallpaper::is_backdrop_covered,
             get_monitors,
             get_dock_mode_for_window,
@@ -252,9 +278,14 @@ fn main() {
             kill_process,
             export_settings,
             import_settings,
-            reset_settings,
             export_settings_dialog,
             import_settings_dialog,
+            get_runtime_state,
+            broadcast_media_accent,
+            export_theme_dialog,
+            import_theme_dialog,
+            set_window_low_memory,
+            reclaim_memory_now,
             updater::check_for_updates,
             updater::install_update,
             updater::get_update_state,
@@ -264,11 +295,54 @@ fn main() {
             calendar_sync::caldav_get_cache,
             ics::ics_add_link,
             ics::ics_remove_link,
-            ics::ics_detect
+            ics::ics_detect,
+            launcher::providers::search_launcher,
+            launcher::providers::execute_launcher_item,
+            launcher::providers::execute_launcher_action,
+            launcher::providers::get_launcher_history,
+            launcher::providers::clear_launcher_history,
+            launcher::providers::copy_text_to_clipboard,
+            start_menu::get_start_pins,
+            start_menu::save_start_pins,
+            start_menu::pin_to_start,
+            start_menu::unpin_from_start,
+            start_menu::get_start_all_apps,
+            start_menu::get_start_recommended,
+            start_menu::get_start_user_profile,
+            start_menu::execute_power_action,
+            start_menu::open_start_folder,
+            shell_windows::open_launcher,
+            shell_windows::hide_launcher,
+            shell_windows::take_pending_launcher_query,
+            shell_windows::toggle_start_menu_window,
+            shell_windows::hide_start_menu,
+            shell_windows::open_traybar_window,
+            shell_windows::hide_traybar,
+            shell_windows::set_traybar_blur_lock,
+            shell_windows::resize_shell_window,
+            shell_windows::get_tray_icons,
+            shell_windows::interact_tray_icon,
+            shell_windows::refresh_tray_icons,
+            shell_windows::open_native_tray,
+            shell_windows::shell_surface_ready,
+            commands::set_dock_hidden,
+            commands::update_dock_pill_rect,
+            wallpaper::extract_wallpaper_palette,
+            apply_windows_icon_tint,
+            restore_windows_icons,
+            windows_icons_backup_status,
+            get_window_topmost,
+            toggle_window_topmost,
+            get_explorer_jump_list,
+            launch_app_as_admin,
+            open_app_location,
+            open_app_properties,
+            get_window_state,
+            window_action,
+            open_windows_tool
         ])
         .setup(|app| {
             startup::mark("setup started");
-            hotkeys::start(app.handle().clone());
             init_taskbar_marker(app.handle());
             // Crash-recovery: if a previous session was force-killed while the native
             // taskbar was hidden, restore it now. Runs before the frontend re-hides it
@@ -281,8 +355,27 @@ fn main() {
                 restore_taskbar_after_crash();
                 NATIVE_TASKBAR_HIDDEN.store(false, Ordering::Relaxed);
             }
+            if std::env::var_os("NECTAR_WEBVIEW_RECOVERY_ATTEMPT").is_some() {
+                std::env::remove_var("NECTAR_WEBVIEW_RECOVERY_ATTEMPT");
+                crate::services::EARLY_WEBVIEW_RECOVERY_ATTEMPTED.store(true, Ordering::Relaxed);
+            }
 
             crate::utils::init_settings_cache(app.handle());
+            {
+                let ah = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    crate::windows_accent::repair_corrupt_accent_palette_if_needed(&ah);
+                });
+            }
+            crate::commands::migrate_dock_overlap_default(app.handle());
+            crate::utils::sync_hook_atomics(app.handle());
+            let _ = crate::state::THUMBNAIL_CACHE.set(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let _ = crate::state::FOCUS_TIMESTAMPS.set(std::sync::Mutex::new(std::collections::HashMap::new()));
+            // Set before start_menu::warm_up / trigger_app_scan so early scans never drop results.
+            let _ = crate::state::INSTALLED_APPS_CACHE.set(std::sync::Mutex::new(Vec::new()));
+            hotkeys::start(app.handle().clone());
+            tray_host::start(app.handle().clone());
+            start_menu::warm_up(app.handle().clone());
             agent_api::start(app.handle().clone());
 
             #[cfg(not(debug_assertions))]
@@ -309,6 +402,12 @@ fn main() {
             for label in ["main", "dock", "overlay"] {
                 if let Some(w) = app.get_webview_window(label) {
                     let _ = w.set_ignore_cursor_events(true);
+                    if let Ok(hwnd) = w.hwnd() {
+                        crate::state::register_shell_chrome_hwnd(hwnd.0 as isize);
+                        if label == "main" || label == "dock" {
+                            crate::utils::install_noactivate_subclass(hwnd);
+                        }
+                    }
                 }
             }
 
@@ -327,26 +426,22 @@ fn main() {
             if let Some(ov_win) = app.get_webview_window("overlay") {
                 let _ = ov_win.show();
                 let _ = ov_win.hide();
-                let overlay_handle = app.handle().clone();
+                let ov_for_close = ov_win.clone();
                 ov_win.on_window_event(move |e| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = e {
                         api.prevent_close();
-                        restore_taskbar_and_exit(&overlay_handle);
+                        let _ = ov_for_close.hide();
+                        crate::diagnostics::log("window: ignored CloseRequested on overlay");
                     }
                 });
             }
 
             watch_webview_processes(app.handle());
+            crate::diagnostics::start_main_thread_watchdog(app.handle());
             setup_mouse_hook(app.handle().clone());
             setup_display_change_monitor(app.handle().clone());
             setup_window_change_hook(app.handle().clone());
             attention::start(app.handle().clone());
-            {
-                let _ = crate::state::THUMBNAIL_CACHE.set(std::sync::Mutex::new(std::collections::HashMap::new()));
-                let _ = crate::state::FOCUS_TIMESTAMPS.set(std::sync::Mutex::new(std::collections::HashMap::new()));
-                // Set before the scan so it can store results.
-                let _ = crate::state::INSTALLED_APPS_CACHE.set(std::sync::Mutex::new(Vec::new()));
-            }
             setup_thumbnail_capture(app.handle().clone());
             trigger_app_scan();
             let tx = setup_system_worker(app.handle().clone());
@@ -359,6 +454,13 @@ fn main() {
             memory_saver::start_reclaim_worker(app.handle().clone());
             {
                 let ah = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    crate::shell_windows::prewarm_shell_surfaces(ah);
+                });
+            }
+            {
+                let ah = app.handle().clone();
                 std::thread::spawn(move || startup::migrate(&ah));
             }
             startup::mark("setup finished");
@@ -367,17 +469,26 @@ fn main() {
             if let Some(&h_event) = SINGLE_INSTANCE_EVENT_HANDLE.get() {
                 if h_event != 0 {
                     let app_handle = app.handle().clone();
-                    std::thread::spawn(move || {
+                    let join = std::thread::spawn(move || {
                         use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
                         use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
                         let h_event = HANDLE(h_event as *mut _);
                         loop {
                             let result = unsafe { WaitForSingleObject(h_event, INFINITE) };
-                            if result == WAIT_OBJECT_0 {
-                                crate::commands::open_settings_window(app_handle.clone());
+                            if result != WAIT_OBJECT_0
+                                || crate::state::SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+                            {
+                                break;
                             }
+                            crate::commands::open_settings_window(app_handle.clone());
                         }
                     });
+                    if let Ok(mut guard) = crate::state::SINGLE_INSTANCE_WAITER
+                        .get_or_init(|| std::sync::Mutex::new(None))
+                        .lock()
+                    {
+                        *guard = Some(join);
+                    }
                 }
             }
 
@@ -410,6 +521,7 @@ fn main() {
                         }
                         "restart" => {
                             crate::state::SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+                            crate::tray_host::stop();
                             for (label, w) in ah.webview_windows() {
                                 if crate::state::is_notch_label(&label) || crate::state::is_dock_label(&label) {
                                     if let Ok(hwnd) = w.hwnd() { unregister_appbar_native(hwnd); }
@@ -448,9 +560,21 @@ fn main() {
         .expect("error while building tauri application");
     app.run(|_, event| {
         if let tauri::RunEvent::Exit = event {
+            crate::tray_host::stop();
             set_taskbar_visibility(true, true);
             NATIVE_TASKBAR_HIDDEN.store(false, Ordering::Relaxed);
 
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn device_event_filter_disables_tao_raw_input_so_ll_hook_survives_focus() {
+        assert!(matches!(
+            super::app_device_event_filter(),
+            tauri::DeviceEventFilter::Always
+        ));
+    }
 }

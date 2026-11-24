@@ -61,7 +61,15 @@ const DEFAULT_CONFIG: WidgetConfig = {
 const MAX_PER_ZONE = 2;
 
 /* ── Draggable pool chip ── */
-function PoolChip({ id }: { id: string }) {
+function PoolChip({
+  id,
+  canAdd,
+  onAdd,
+}: {
+  id: string;
+  canAdd: boolean;
+  onAdd: (id: string) => void;
+}) {
   const t = useT();
   const def = WIDGET_DEFS.find((w) => w.id === id)!;
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({ id });
@@ -70,6 +78,16 @@ function PoolChip({ id }: { id: string }) {
     <div
       ref={setNodeRef}
       className={`widget-pill widget-pill--available ${isDragging ? "dragging" : ""}`}
+      style={!canAdd ? { opacity: 0.55 } : undefined}
+      onClick={() => {
+        if (canAdd) onAdd(id);
+      }}
+      onKeyDown={(e) => {
+        if (canAdd && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault();
+          onAdd(id);
+        }
+      }}
       {...listeners}
       {...attributes}
     >
@@ -163,6 +181,7 @@ function DropZone({
   const { setNodeRef, isOver } = useDroppable({ id });
   return (
     <div
+      id={id}
       ref={setNodeRef}
       className={`widget-config-zone ${isOver ? "widget-config-zone--over" : ""}`}
     >
@@ -207,6 +226,7 @@ export function StatusWidgetConfig({ value, onChange, hasBattery = true }: Statu
   const [config, setConfig] = useState<WidgetConfig>(() => sanitize(value || DEFAULT_CONFIG));
   const [activeId, setActiveId] = useState<string | null>(null);
   const draggedFromZone = useRef<"left" | "right" | null>(null);
+  const didDragRef = useRef(false);
 
   useEffect(() => {
     const next = sanitize(value || DEFAULT_CONFIG);
@@ -223,10 +243,24 @@ export function StatusWidgetConfig({ value, onChange, hasBattery = true }: Statu
 
   const allPlaced = new Set([...config.left, ...config.right]);
   const pool = availableDefs.filter((w) => !allPlaced.has(w.id)).map((w) => w.id);
+  const canAddFromPool =
+    config.left.length < MAX_PER_ZONE || config.right.length < MAX_PER_ZONE;
 
   const emit = (next: WidgetConfig) => {
     setConfig(next);
     onChange(next);
+  };
+
+  const addFromPool = (id: string) => {
+    if (didDragRef.current) return;
+    if (config.left.includes(id) || config.right.includes(id)) return;
+    if (config.left.length < MAX_PER_ZONE && config.left.length <= config.right.length) {
+      emit({ ...config, left: [...config.left, id] });
+    } else if (config.right.length < MAX_PER_ZONE) {
+      emit({ ...config, right: [...config.right, id] });
+    } else if (config.left.length < MAX_PER_ZONE) {
+      emit({ ...config, left: [...config.left, id] });
+    }
   };
 
   const remove = (id: string) => {
@@ -267,15 +301,27 @@ export function StatusWidgetConfig({ value, onChange, hasBattery = true }: Statu
 
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const id = event.active.id as string;
+    didDragRef.current = true;
     setActiveId(id);
     const zone = getZoneOf(id);
     draggedFromZone.current = zone === "pool" ? null : (zone as "left" | "right" | null);
   }, [config, pool]);
 
+  const handleDragCancel = useCallback(() => {
+    setActiveId(null);
+    draggedFromZone.current = null;
+    window.setTimeout(() => {
+      didDragRef.current = false;
+    }, 0);
+  }, []);
+
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
       const { active, over } = event;
       setActiveId(null);
+      window.setTimeout(() => {
+        didDragRef.current = false;
+      }, 0);
       if (!over) return;
 
       const itemId = active.id as string;
@@ -355,6 +401,7 @@ export function StatusWidgetConfig({ value, onChange, hasBattery = true }: Statu
       sensors={sensors}
       collisionDetection={rectIntersection}
       onDragStart={handleDragStart}
+      onDragCancel={handleDragCancel}
       onDragEnd={handleDragEnd}
     >
       <div className="widget-config">
@@ -379,7 +426,7 @@ export function StatusWidgetConfig({ value, onChange, hasBattery = true }: Statu
           <div className="widget-config-pool">
             <div className="widget-config-pool-chips">
               {pool.map((id) => (
-                <PoolChip key={id} id={id} />
+                <PoolChip key={id} id={id} canAdd={canAddFromPool} onAdd={addFromPool} />
               ))}
             </div>
           </div>

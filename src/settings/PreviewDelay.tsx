@@ -1,24 +1,19 @@
-import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { Timer } from "lucide-react";
 import { SettingRow } from "./SettingRow";
 import { Dropdown } from "./Dropdown";
 import { useT } from "../i18n";
+import { useSyncedSetting } from "./useSyncedSetting";
 
 const DELAYS = ["0", "100", "200", "300", "500", "800"];
 
+const parsePreviewDelay = (raw: unknown): string => {
+  const s = raw === null || raw === undefined ? "" : String(raw);
+  return DELAYS.includes(s) ? s : "300";
+};
+
 export function PreviewDelay() {
   const t = useT();
-  const [value, setValue] = useState(() => {
-    const saved = localStorage.getItem("nectar-dock-preview-delay");
-    return saved && DELAYS.includes(saved) ? saved : "300";
-  });
-
-  const change = (next: string) => {
-    setValue(next);
-    localStorage.setItem("nectar-dock-preview-delay", next);
-    invoke("save_setting", { key: "nectar-dock-preview-delay", value: next }).catch(() => { });
-  };
+  const [value, change] = useSyncedSetting("nectar-dock-preview-delay", parsePreviewDelay, (v) => v);
 
   return (
     <SettingRow icon={Timer} label={t("dock.previewDelay")} desc={t("dock.previewDelay.desc")}>

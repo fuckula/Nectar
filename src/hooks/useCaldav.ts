@@ -45,13 +45,26 @@ export function useCaldav(): CaldavState {
 
   useEffect(() => {
     let alive = true;
+    let unlistenFn: (() => void) | undefined;
+
     invoke<CaldavState>("caldav_get_cache")
-      .then((s) => alive && setState(s))
+      .then((s) => {
+        if (alive && s) setState(s);
+      })
       .catch(() => {});
-    const unlisten = listen<CaldavState>("caldav-updated", (e) => setState(e.payload));
+
+    listen<CaldavState>("caldav-updated", (e) => {
+      if (alive && e.payload) setState(e.payload);
+    })
+      .then((fn) => {
+        if (!alive) fn();
+        else unlistenFn = fn;
+      })
+      .catch(() => {});
+
     return () => {
       alive = false;
-      unlisten.then((fn) => fn());
+      unlistenFn?.();
     };
   }, []);
 

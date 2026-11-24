@@ -1,26 +1,19 @@
-import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeftRight } from "lucide-react";
 import { SettingRow } from "./SettingRow";
 import { Dropdown } from "./Dropdown";
 import { useT } from "../i18n";
+import { useSyncedSetting } from "./useSyncedSetting";
 
 type Side = "left" | "right";
 
-const read = (key: string, fallback: Side): Side => {
-  const saved = localStorage.getItem(key);
-  return saved === "left" || saved === "right" ? saved : fallback;
-};
-
-const save = (key: string, value: Side) => {
-  localStorage.setItem(key, value);
-  invoke("save_setting", { key, value }).catch(() => { });
-};
+const parseLeft = (raw: unknown): Side => (raw === "right" ? "right" : "left");
+const parseRight = (raw: unknown): Side => (raw === "left" ? "left" : "right");
+const identity = (v: Side) => v;
 
 export function EdgeSides() {
   const t = useT();
-  const [volume, setVolume] = useState<Side>(() => read("nectar-volume-side", "left"));
-  const [brightness, setBrightness] = useState<Side>(() => read("nectar-brightness-side", "right"));
+  const [volume, setVolume] = useSyncedSetting<Side>("nectar-volume-side", parseLeft, identity);
+  const [brightness, setBrightness] = useSyncedSetting<Side>("nectar-brightness-side", parseRight, identity);
   const opposite = (side: Side): Side => (side === "left" ? "right" : "left");
   const options = [
     { value: "left", label: t("overlays.side.left") },
@@ -30,20 +23,16 @@ export function EdgeSides() {
   const changeVolume = (value: string) => {
     const next = value as Side;
     setVolume(next);
-    save("nectar-volume-side", next);
     if (brightness === next) {
       setBrightness(opposite(next));
-      save("nectar-brightness-side", opposite(next));
     }
   };
 
   const changeBrightness = (value: string) => {
     const next = value as Side;
     setBrightness(next);
-    save("nectar-brightness-side", next);
     if (volume === next) {
       setVolume(opposite(next));
-      save("nectar-volume-side", opposite(next));
     }
   };
 
