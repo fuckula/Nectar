@@ -10,3 +10,5 @@ pub mod everything;
 pub mod fuzzy;
 #[path = "providers.rs"]
 pub mod providers;
+#[path = "currency.rs"]
+pub mod currency;

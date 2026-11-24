@@ -214,7 +214,6 @@ function loadPreviewSettings(): Record<string, unknown> {
     "nectar-launcher-position": "center",
     "nectar-launcher-max-results": "8",
     "nectar-launcher-show-recent": "true",
-    "nectar-launcher-file-search": "true",
     "nectar-launcher-everything": "true",
     "nectar-launcher-search-url": "https://www.google.com/search?q={query}",
     "nectar-launcher-fullscreen-suppress": "true",

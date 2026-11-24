@@ -1296,18 +1296,66 @@ fn classify_window_coverage(
     is_zoomed_or_ws_maximize: bool,
     client_covers_monitor: bool,
     frame_covers_monitor: bool,
-    quns_d3d_fullscreen: bool,
+    quns_fullscreen: bool,
 ) -> WindowCoverageClassification {
-    if is_zoomed_or_ws_maximize {
+    // A maximized window is fullscreen only when the shell itself reports a
+    // fullscreen app (QUNS_BUSY/QUNS_D3D): browser video fullscreen keeps the
+    // outer window maximized, so the geometry checks can never catch it.
+    if is_zoomed_or_ws_maximize && !quns_fullscreen {
         return WindowCoverageClassification {
             is_fullscreen: false,
             is_maximized: true,
         };
     }
     WindowCoverageClassification {
-        is_fullscreen: client_covers_monitor || frame_covers_monitor || quns_d3d_fullscreen,
-        is_maximized: false,
+        is_fullscreen: client_covers_monitor || frame_covers_monitor || quns_fullscreen,
+        is_maximized: is_zoomed_or_ws_maximize,
     }
+}
+
+/// Short language label (ENG/RUS/…) for a keyboard layout KLID. The low word of
+/// an HKL is the input-language identifier: the primary language is the low 10
+/// bits, the variant the upper bits.
+fn layout_label_from_klid(klid: usize) -> String {
+    // Primary language id is the low 10 bits of the KLID's language word.
+    let lang_id = klid & 0x3FF;
+    let label = match lang_id {
+        0x09 => "ENG",
+        0x19 => "RUS",
+        0x22 => "UKR",
+        0x3F => "KAZ",
+        0x15 => "POL",
+        0x1F => "TRK",
+        0x0C => "FRA",
+        0x07 => "GER",
+        0x0A => "SPA",
+        0x13 => "NLD",
+        0x10 => "ITA",
+        0x1D => "SVE",
+        0x16 => "POR",
+        0x01 => "ARA",
+        0x05 => "CZE",
+        0x11 => "JPN",
+        0x12 => "KOR",
+        0x04 => "CHI",
+        0x08 => "ELL",
+        0x0D => "HEB",
+        0x0B => "FIN",
+        0x06 => "DAN",
+        0x14 => "NOR",
+        0x0E => "HUN",
+        0x18 => "RON",
+        0x02 => "BUL",
+        0x23 => "BEL",
+        0x1A => "SRV",
+        0x1B => "SLK",
+        0x24 => "SLV",
+        0x25 => "EST",
+        0x26 => "LAV",
+        0x27 => "LIT",
+        _ => return String::new(),
+    };
+    label.to_string()
 }
 
 fn emit_to_notch_windows<T: serde::Serialize + Clone>(app: &AppHandle, event: &str, payload: T) {
@@ -1712,7 +1760,7 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
             GWL_EXSTYLE, GWL_STYLE, IsIconic, IsZoomed, WS_EX_NOACTIVATE,
             WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_MAXIMIZE,
         };
-        use windows::Win32::UI::Shell::{QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
+        use windows::Win32::UI::Shell::{QUNS_ACCEPTS_NOTIFICATIONS, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
         use windows::Win32::Graphics::Gdi::ClientToScreen;
         use windows::Win32::Foundation::{POINT, RECT};
 
@@ -1877,6 +1925,7 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
         let mut last_fg_maximized = false;
         let mut last_hwnd = HWND(std::ptr::null_mut());
         let mut last_fg_class_check = Instant::now();
+        let mut last_layout_klid: usize = 0;
         let mut is_known_shell = false;
         let mut is_shell_launcher_focused = false;
         let my_process_id = std::process::id();
@@ -1993,14 +2042,19 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
 
                                 let is_matches_screen = rect.left <= screen_rect.left && rect.top <= screen_rect.top &&
                                                         rect.right >= screen_rect.right && rect.bottom >= screen_rect.bottom;
-                                let quns_d3d_fs = SHQueryUserNotificationState()
-                                    .is_ok_and(|s| s == QUNS_RUNNING_D3D_FULL_SCREEN);
+                                let quns = SHQueryUserNotificationState().ok().unwrap_or(QUNS_ACCEPTS_NOTIFICATIONS);
+                                let quns_d3d_fs = quns == QUNS_RUNNING_D3D_FULL_SCREEN;
+                                // QUNS_BUSY means the shell itself sees a fullscreen app
+                                // running. Browser video fullscreen keeps the browser
+                                // window maximized, so geometry alone can never detect
+                                // it; the shell state is the only signal.
+                                let quns_fullscreen_app = quns == QUNS_BUSY;
 
                                 let cls = classify_window_coverage(
                                     is_maximized,
                                     is_client_fullscreen,
                                     is_matches_screen,
-                                    quns_d3d_fs,
+                                    quns_d3d_fs || quns_fullscreen_app,
                                 );
                                 current_is_fs = cls.is_fullscreen;
                                 fg_info = Some((screen_rect, rect, cls.is_fullscreen || cls.is_maximized));
@@ -2022,6 +2076,24 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                     let _ = handle_visibility.emit("game-mode-changed", serde_json::json!({ "active": gm_active }));
                     if !gm_active {
                         wake_audio_visualizer();
+                    }
+                }
+
+                // Keyboard layout indicator: read the foreground window's active
+                // layout (KLID) and notify the notch when it changes.
+                if !hwnd.is_invalid() {
+                    let thread_id =
+                        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, None);
+                    let hkl = windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout(thread_id);
+                    let klid = (hkl.0 as usize) & 0xFFFF;
+                    if klid != last_layout_klid {
+                        last_layout_klid = klid;
+                        let label = layout_label_from_klid(klid);
+                        emit_to_notch_windows(
+                            &handle_visibility,
+                            "keyboard-layout",
+                            serde_json::json!({ "label": label }),
+                        );
                     }
                 }
                 loop_sleep_ms = if current_is_fs
@@ -4118,6 +4190,10 @@ pub fn trigger_app_scan() {
         }
         unsafe { CoUninitialize(); }
 
+        // Games installed outside the Start Menu: Steam, Epic and GOG installs that
+        // never produce a shortcut FOLDERID_AppsFolder or the Start Menu scan would list.
+        collect_game_library_entries(&mut apps);
+
         if let Some(c) = INSTALLED_APPS_CACHE.get() {
             if let Ok(mut lock) = c.lock() {
                 *lock = apps;
@@ -4215,6 +4291,349 @@ fn collect_shortcuts(dir: &std::path::Path, apps: &mut Vec<AppInfo>, depth: i32)
             }
         }
     }
+}
+
+// ── Game library scanning ────────────────────────────────────────────────────
+// Steam, Epic and GOG installs often have no Start Menu shortcut and no
+// AppsFolder entry, so the launcher never saw them. Each store documents where
+// it keeps its install manifest; these readers turn those manifests into
+// AppInfo entries pointing at the game's primary executable.
+
+/// Pulls every `"path"` value out of a Steam `libraryfolders.vdf`. The file is
+/// Valve's quasi-JSON ("Quoted strings, no commas, `{}` blocks"), so a targeted
+/// scan for the quoted key is both sufficient and immune to block nesting.
+fn steam_library_paths(vdf: &str) -> Vec<String> {
+    const NEEDLE: &str = "\"path\"";
+    let mut out = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = vdf[search_from..].find(NEEDLE) {
+        let key_end = search_from + rel + NEEDLE.len();
+        let rest = &vdf[key_end..];
+        let value = rest.find('"').and_then(|o| {
+            rest[o + 1..]
+                .find('"')
+                .map(|c| rest[o + 1..o + 1 + c].to_string())
+        });
+        if let Some(path) = value {
+            // VDF writes paths with escaped backslashes; restore them.
+            let path = path.replace("\\\\", "\\");
+            search_from = (key_end + path.len() + 2).min(vdf.len());
+            if !path.is_empty() && !out.contains(&path) {
+                out.push(path);
+            }
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// appmanifest_*.acf carries `"name"` and `"installdir"` for one installed app.
+fn steam_manifest_fields(acf: &str) -> (Option<String>, Option<String>) {
+    fn quoted_field(hay: &str, key: &str) -> Option<String> {
+        let needle = format!("\"{key}\"");
+        let rel = hay.find(&needle)?;
+        let rest = &hay[rel + needle.len()..];
+        let o = rest.find('"')?;
+        let c = rest[o + 1..].find('"')?;
+        Some(rest[o + 1..o + 1 + c].to_string())
+    }
+    (
+        quoted_field(acf, "name"),
+        quoted_field(acf, "installdir"),
+    )
+}
+
+/// Picks the executable a Steam game launches through: prefer a name matching
+/// the install directory, else the largest .exe in the folder (heuristics used
+/// by launchers; games without a clear one are skipped rather than guessed).
+fn pick_primary_executable(dir: &std::path::Path) -> Option<(String, String)> {
+    let dir_name = dir.file_name()?.to_string_lossy().to_lowercase();
+    let mut best: Option<(u64, String)> = None;
+    let mut name_match: Option<String> = None;
+    let mut entries = std::fs::read_dir(dir).ok()?;
+    while let Some(Ok(entry)) = entries.next() {
+        let path = entry.path();
+        if !path.is_file() || !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
+            continue;
+        }
+        let Some(file) = path.file_name().map(|n| n.to_string_lossy().to_string()) else { continue };
+        let stem = file.strip_suffix(".exe").unwrap_or(&file).to_lowercase();
+        if is_uninstaller_target(&file) || is_helper_name(&file) {
+            continue;
+        }
+        if stem == dir_name || stem.replace([' ', '_'], "") == dir_name.replace([' ', '_'], "") {
+            name_match = Some(file.clone());
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if best.as_ref().is_none_or(|(s, _)| size > *s) {
+            best = Some((size, file));
+        }
+    }
+    let exe = name_match.or_else(|| best.map(|(_, f)| f))?;
+    Some((exe.clone(), format!(r"{}\{}", dir.display(), exe)))
+}
+
+fn push_unique_game(apps: &mut Vec<AppInfo>, name: String, path: String) {
+    if name.is_empty() || path.is_empty() {
+        return;
+    }
+    if apps.iter().any(|a| a.name.eq_ignore_ascii_case(&name) || a.path.eq_ignore_ascii_case(&path)) {
+        return;
+    }
+    let executable = std::path::Path::new(&path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string());
+    apps.push(AppInfo {
+        name,
+        path,
+        icon: None,
+        is_running: false,
+        hwnd: None,
+        executable,
+        all_hwnds: None,
+        args: None,
+    });
+}
+
+fn collect_steam_games(apps: &mut Vec<AppInfo>) {
+    // Steam's own install dir first (registry SteamPath, then the default location),
+    // then every extra library from libraryfolders.vdf.
+    let candidates: Vec<std::path::PathBuf> = [r"Software\Valve\Steam", r"SOFTWARE\WOW6432Node\Valve\Steam"]
+        .iter()
+        .filter_map(|key| read_reg_sz(key, "SteamPath"))
+        .map(|p| std::path::PathBuf::from(p.replace('/', "\\")))
+        .chain([std::path::PathBuf::from(r"C:\Program Files (x86)\Steam")])
+        .collect();
+    let Some(main_steam) = candidates.iter().find(|p| p.join("steamapps").is_dir()) else {
+        return;
+    };
+
+    let mut libraries: Vec<std::path::PathBuf> = vec![main_steam.join("steamapps")];
+    if let Ok(vdf) = std::fs::read_to_string(main_steam.join(r"steamapps\libraryfolders.vdf")) {
+        for path in steam_library_paths(&vdf) {
+            let lib = std::path::PathBuf::from(&path).join("steamapps");
+            if lib.is_dir() && !libraries.iter().any(|l| l == &lib) {
+                libraries.push(lib);
+            }
+        }
+    }
+
+    for lib in libraries {
+        let Ok(entries) = std::fs::read_dir(&lib) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_manifest = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("appmanifest_") && n.ends_with(".acf"));
+            if !is_manifest {
+                continue;
+            }
+            let Ok(acf) = std::fs::read_to_string(&path) else { continue };
+            let (Some(name), Some(installdir)) = steam_manifest_fields(&acf) else { continue };
+            // StateFlags bit 2 (0x4) = fully installed. Manifests of uninstalled
+            // or download-only apps stay behind; never index those.
+            let installed = match steam_manifest_state_flags(&acf) {
+                Some(flags) => flags & 0x4 != 0,
+                None => true,
+            };
+            if !installed || name == "Steamworks Common Redistributables" {
+                continue;
+            }
+            let game_dir = lib.join("common").join(&installdir);
+            if let Some((_exe, full)) = pick_primary_executable(&game_dir) {
+                push_unique_game(apps, name, full);
+            }
+        }
+    }
+}
+
+/// `"StateFlags"` from an appmanifest, or `None` when the field is absent.
+fn steam_manifest_state_flags(acf: &str) -> Option<u32> {
+    let needle = "\"StateFlags\"";
+    let rel = acf.find(needle)?;
+    let digits: String = acf[rel + needle.len()..]
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+fn collect_epic_games(apps: &mut Vec<AppInfo>) {
+    // Every Epic .item manifest is a JSON file with LaunchExecutable / InstallLocation / DisplayName.
+    let manifest_dirs = [
+        r"C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests".to_string(),
+    ];
+    for dir in manifest_dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("item")) {
+                continue;
+            }
+            let Ok(body) = std::fs::read_to_string(&path) else { continue };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else { continue };
+            let Some(name) = json["DisplayName"].as_str() else { continue };
+            let Some(install) = json["InstallLocation"].as_str() else { continue };
+            let Some(exe) = json["LaunchExecutable"].as_str() else { continue };
+            if exe.is_empty() || install.is_empty() || is_helper_name(exe) {
+                continue;
+            }
+            let full = format!("{}\\{}", install.trim_end_matches('\\'), exe);
+            push_unique_game(apps, name.to_string(), full);
+        }
+    }
+}
+
+fn collect_gog_games(apps: &mut Vec<AppInfo>) {
+    // GOG registers each installed game under HKLM\SOFTWARE\WOW6432Node\GOG.com\Games\<id>
+    // with "game" (display name), "path" (install dir) and "launchCommand" (quoted exe
+    // followed by optional arguments).
+    for (name, exe_path) in gog_registry_games() {
+        push_unique_game(apps, name, exe_path);
+    }
+}
+
+/// Reads a REG_SZ value, opening HKCU or HKLM (including the WOW6432Node view) as needed.
+fn read_reg_sz(key: &str, name: &str) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+        KEY_READ, REG_SZ,
+    };
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    unsafe {
+        let roots = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE];
+        for root in roots {
+            let key_w = wide(key);
+            let mut hkey = HKEY::default();
+            if RegOpenKeyExW(root, PCWSTR(key_w.as_ptr()), Some(0), KEY_READ, &mut hkey).is_err() {
+                continue;
+            }
+            let mut size = 0u32;
+            let mut kind = REG_SZ;
+            let name_w = wide(name);
+            let query = RegQueryValueExW(
+                hkey,
+                PCWSTR(name_w.as_ptr()),
+                None,
+                Some(&mut kind),
+                None,
+                Some(&mut size),
+            );
+            if query.is_err() || size == 0 {
+                let _ = RegCloseKey(hkey);
+                continue;
+            }
+            let mut buf = vec![0u8; size as usize];
+            let ok = RegQueryValueExW(
+                hkey,
+                PCWSTR(name_w.as_ptr()),
+                None,
+                Some(&mut kind),
+                Some(buf.as_mut_ptr()),
+                Some(&mut size),
+            )
+            .is_ok();
+            let _ = RegCloseKey(hkey);
+            if !ok {
+                continue;
+            }
+            let units: Vec<u16> = buf[..size as usize]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let value = String::from_utf16_lossy(&units);
+            let trimmed = value.trim_end_matches('\0').trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+        None
+    }
+}
+
+/// (display name, exe path) for every GOG-installed game.
+fn gog_registry_games() -> Vec<(String, String)> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+    };
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let mut out = Vec::new();
+    for key_path in [r"SOFTWARE\WOW6432Node\GOG.com\Games", r"SOFTWARE\GOG.com\Games"] {
+        unsafe {
+            let key_w = wide(key_path);
+            let mut hkey = HKEY::default();
+            if RegOpenKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(key_w.as_ptr()), Some(0), KEY_READ, &mut hkey).is_err() {
+                continue;
+            }
+            let mut index = 0u32;
+            loop {
+                let mut name_buf = [0u16; 64];
+                let mut name_len = name_buf.len() as u32;
+                let r = RegEnumKeyExW(
+                    hkey,
+                    index,
+                    Some(windows::core::PWSTR(name_buf.as_mut_ptr())),
+                    &mut name_len,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                if r.is_err() {
+                    break;
+                }
+                index += 1;
+                let subkey = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+                let full = format!("{key_path}\\{subkey}");
+                let name = read_reg_sz(&full, "game").or_else(|| read_reg_sz(&full, "gameName")).unwrap_or_else(|| subkey.clone());
+                // launchCommand is `"C:\...\game.exe" args`; the first quoted (or
+                // first whitespace-delimited) token is the executable.
+                let launch = read_reg_sz(&full, "launchCommand").map(|cmd| {
+                    let cmd = cmd.trim();
+                    if let Some(rest) = cmd.strip_prefix('"') {
+                        rest.split('"').next().unwrap_or(rest).to_string()
+                    } else {
+                        cmd.split_whitespace().next().unwrap_or(cmd).to_string()
+                    }
+                });
+                let exe = match launch {
+                    Some(p) if std::path::Path::new(&p).is_file() => p,
+                    _ => {
+                        let Some(dir) = read_reg_sz(&full, "path") else { continue };
+                        let Some(file) = read_reg_sz(&full, "exe") else { continue };
+                        let joined = if std::path::Path::new(&file).is_absolute() {
+                            file
+                        } else {
+                            format!("{}\\{}", dir.trim_end_matches('\\'), file)
+                        };
+                        if !std::path::Path::new(&joined).is_file() {
+                            continue;
+                        }
+                        joined
+                    }
+                };
+                out.push((name, exe));
+            }
+            let _ = RegCloseKey(hkey);
+        }
+    }
+    out
+}
+
+fn collect_game_library_entries(apps: &mut Vec<AppInfo>) {
+    collect_steam_games(apps);
+    collect_epic_games(apps);
+    collect_gog_games(apps);
 }
 
 pub fn sync_overlays(app: &AppHandle) {
@@ -5851,7 +6270,49 @@ fn recover_from_webview_failure(handle: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{dock_edge_hover_allowed, is_helper_name, is_launchable_entry, is_uninstaller_target, is_windows_shell_launcher_process, win_number_index};
+    use super::{dock_edge_hover_allowed, is_helper_name, is_launchable_entry, is_uninstaller_target, is_windows_shell_launcher_process, steam_library_paths, steam_manifest_fields, steam_manifest_state_flags, win_number_index};
+
+    #[test]
+    fn steam_library_vdf_yields_every_library_path() {
+        let vdf = r#""libraryfolders"
+{
+	"0"
+	{
+		"path"		"C:\\Program Files (x86)\\Steam"
+		"label"		""
+	}
+	"1"
+	{
+		"path"		"D:\\Games\\SteamLibrary"
+		"label"		""
+	}
+}"#;
+        assert_eq!(
+            steam_library_paths(vdf),
+            vec![
+                r"C:\Program Files (x86)\Steam".to_string(),
+                r"D:\Games\SteamLibrary".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn steam_manifest_reads_name_and_install_dir() {
+        let acf = "\"AppState\"\n{\n\t\"appid\"\t\t\"570\"\n\t\"name\"\t\t\"Dota 2\"\n\t\"installdir\"\t\t\"dota 2 beta\"\n}";
+        let (name, dir) = steam_manifest_fields(acf);
+        assert_eq!(name.as_deref(), Some("Dota 2"));
+        assert_eq!(dir.as_deref(), Some("dota 2 beta"));
+    }
+
+    #[test]
+    fn steam_manifest_state_flags_separate_installed_from_stale_manifests() {
+        let installed = "\"AppState\"\n{\n\t\"name\"\t\t\"X\"\n\t\"StateFlags\"\t\t4\n}";
+        let update_required = "\"AppState\"\n{\n\t\"StateFlags\"\t\t2\n}";
+        let missing = "\"AppState\"\n{\n\t\"name\"\t\t\"X\"\n}";
+        assert_eq!(steam_manifest_state_flags(installed), Some(4));
+        assert_eq!(steam_manifest_state_flags(update_required), Some(2));
+        assert_eq!(steam_manifest_state_flags(missing), None);
+    }
 
     #[test]
     fn fullscreen_dock_does_not_reveal_on_edge_or_hover() {
@@ -5994,16 +6455,16 @@ mod tests {
     }
 
     #[test]
-    fn borderless_maximized_window_is_never_classified_fullscreen() {
+    fn maximized_window_is_fullscreen_only_when_shell_reports_it() {
         // Electron / Chromium / modern WinUI borderless maximized window: IsZoomed=true, no WS_CAPTION.
         let cls = super::classify_window_coverage(true, true, true, false);
         assert!(cls.is_maximized);
         assert!(!cls.is_fullscreen);
 
-        // Even if QUNS is stale/noisy while a maximized window is active, maximized wins.
+        // Browser video fullscreen: the outer window stays maximized but the shell
+        // reports a fullscreen app (QUNS_BUSY), so the notch/dock must hide.
         let cls_with_quns = super::classify_window_coverage(true, true, true, true);
-        assert!(cls_with_quns.is_maximized);
-        assert!(!cls_with_quns.is_fullscreen);
+        assert!(cls_with_quns.is_fullscreen);
 
         // True borderless fullscreen (F11 / game): not zoomed, covers monitor.
         let fs_browser = super::classify_window_coverage(false, true, false, false);

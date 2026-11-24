@@ -1052,8 +1052,11 @@ export default function StartMenu() {
                 }
               />
 
-              {showRecommended && recommended.length > 0 && (
-                <div className="start-recommended-block">
+              {showRecommended && (
+                <div
+                  className="start-recommended-block"
+                  style={{ "--start-rec-rows": Math.max(1, Math.ceil(recCount / 2)) } as React.CSSProperties}
+                >
                   <div className="start-section-bar">
                     <span className="start-section-title">{t("start.recommended")}</span>
                   </div>

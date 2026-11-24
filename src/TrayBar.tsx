@@ -853,12 +853,10 @@ export default function TrayBar() {
       .catch((err) => setStatusNote(String(err)));
   };
 
-  const restHint = editPins
-    ? t("traybar.editModeHint")
-    : trayHostStatus === "blocked_by_zbid" && icons.length === 0
-      ? ""
-      : t("traybar.idleHint");
-  const showFooterBar = Boolean(statusNote || hoveredIcon || restHint);
+  // The idle hint bar is gone: the footer only appears with real content
+  // (a status note, a hovered icon, or the edit-mode instructions).
+  const footerText = statusNote || hoveredIcon ? null : editPins ? t("traybar.editModeHint") : null;
+  const showFooterBar = Boolean(statusNote || hoveredIcon || footerText);
 
   const selectedIconSrc = selectedItem
     ? customIcons[trayCustomIconKey(selectedItem.key)] || selectedItem.icon
@@ -1256,7 +1254,7 @@ export default function TrayBar() {
 
         {/* Fixed-height footer slot prevents hover-induced ResizeObserver height oscillation */}
         {showFooterBar && (
-          <div className={`traybar-tooltip-bar${!hoveredIcon && !statusNote ? " idle" : ""}`}>
+          <div className="traybar-tooltip-bar">
             {statusNote ? (
               <span className="traybar-tip-title">{statusNote}</span>
             ) : hoveredIcon ? (
@@ -1273,9 +1271,7 @@ export default function TrayBar() {
                   <span className="traybar-tip-exe">{hoveredIcon.exe_name}</span>
                 )}
               </>
-            ) : (
-              <span className="traybar-tip-idle">{restHint}</span>
-            )}
+            ) : null}
           </div>
         )}
       </div>

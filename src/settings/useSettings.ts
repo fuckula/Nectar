@@ -67,7 +67,7 @@ const readFiniteInt = (fallback: number) => (v: unknown): number => {
   const n = typeof v === "number" ? Math.trunc(v) : parseInt(String(v), 10);
   return Number.isFinite(n) ? n : fallback;
 };
-const DEFAULT_STATUS_WIDGETS: WidgetConfig = { left: ["weather"], right: ["battery"] };
+const DEFAULT_STATUS_WIDGETS: WidgetConfig = { left: ["weather"], right: ["layout", "battery"] };
 
 function parseStatusWidgets(val: unknown): WidgetConfig {
   try {
@@ -187,7 +187,7 @@ export function useSettings() {
   const [showCityDropdown, setShowCityDropdown] = useState(false);
   const [statusWidgets, setStatusWidgets] = useState<WidgetConfig>({
     left: ["weather"],
-    right: ["battery"],
+    right: ["layout", "battery"],
   });
   const [dockEnabled, setDockEnabled] = useState(true);
   const [dockPreviewEnabled, setDockPreviewEnabled] = useState(true);

@@ -398,20 +398,6 @@ body {
   font-size: 11px;
 }
 
-.traybar-tooltip-bar.idle {
-  border-color: transparent;
-  background: var(--shell-card-bg);
-}
-
-.traybar-tip-idle {
-  flex: 1;
-  min-width: 0;
-  opacity: 0.68;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .traybar-icon-btn:focus-visible,
 .traybar-tool-btn:focus-visible,
 .traybar-refresh-pill:focus-visible {

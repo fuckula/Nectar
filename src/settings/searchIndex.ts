@@ -43,7 +43,7 @@ export const SEARCH_ENTRIES: SearchEntry[] = [
   ]),
   ...group("launcher", [
     "launcher.settings.enabled", "launcher.settings.hotkey", "launcher.settings.position", "launcher.settings.width", "launcher.settings.showChips", "launcher.settings.maxResults",
-    "launcher.settings.fullscreenSuppress", "launcher.settings.showRecent", "launcher.settings.fileSearch", "launcher.settings.everything",
+    "launcher.settings.fullscreenSuppress", "launcher.settings.showRecent", "launcher.settings.everything",
     "launcher.settings.webUrl", "launcher.settings.clearHistory",
   ]),
   ...group("start", [
@@ -117,7 +117,6 @@ export const KEYWORDS: Record<string, string> = {
   "launcher.settings.maxResults": "rows limit count максимум результатов",
   "launcher.settings.fullscreenSuppress": "games fullscreen block полноэкранный режим",
   "launcher.settings.showRecent": "mru recents history недавние история",
-  "launcher.settings.fileSearch": "files folders search файлы папки поиск",
   "launcher.settings.everything": "voidtools ipc fast index поиск файлов",
   "launcher.settings.webUrl": "browser google search engine веб поиск ссылка",
   "launcher.settings.clearHistory": "erase reset recent queries очистить историю",

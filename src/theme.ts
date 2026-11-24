@@ -484,8 +484,10 @@ export async function applyTheme(
 
   const op = Math.max(0.25, Math.min(1.0, opacity));
   const opExpanded = Math.min(1.0, Math.max(op + 0.18, 0.86));
-  // Large panels (calendar, command center, start menu, launcher) need a dense fill so underlying windows stay readable without DWM blur.
-  const opPanel = Math.min(1.0, Math.max(op + 0.28, 0.94));
+  // Large panels (calendar, command center, start menu, launcher) follow the
+  // user's opacity with a small boost for legibility instead of clamping to
+  // near-opaque, so liquid themes stay transparent at rest as well as on hover.
+  const opPanel = Math.min(1.0, Math.max(op + 0.12, 0.55));
   let surface = '#000000';
   let preloadedSystemAccent: string | undefined;
   root.style.setProperty('--nectar-opacity', String(op));

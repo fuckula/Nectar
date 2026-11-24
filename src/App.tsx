@@ -47,6 +47,7 @@ import {
   MemoryStick,
   HardDrive,
   ArrowUpDown,
+  Languages,
   Wifi,
   WifiOff,
   EthernetPort,
@@ -549,7 +550,8 @@ function App() {
   const [netWidgetMode, setNetWidgetMode] = useState(() => localStorage.getItem("nectar-net-widget-mode") === "status" ? "status" : "speed");
   const [netUpSpeed, setNetUpSpeed] = useState(0);
   const [netDownSpeed, setNetDownSpeed] = useState(0);
-  const [statusWidgets, setStatusWidgets] = useState<WidgetConfig>({ left: ["weather"], right: ["battery"] });
+  const [statusWidgets, setStatusWidgets] = useState<WidgetConfig>({ left: ["weather"], right: ["layout", "battery"] });
+  const [keyboardLayout, setKeyboardLayout] = useState("");
 
   const [windowLabel, setWindowLabel] = useState<string>("");
   useEffect(() => {
@@ -1189,6 +1191,11 @@ function App() {
       }
     }));
 
+    register(listen<{ label: string }>("keyboard-layout", (event) => {
+      if (cancelled) return;
+      setKeyboardLayout(event.payload?.label ?? "");
+    }));
+
     register(listen("shell-surface-opening", () => {
       if (!cancelled) collapseNotch(true);
     }));
@@ -1271,7 +1278,7 @@ function App() {
       "nectar-net-widget-mode": (v) => setNetWidgetMode(v === "status" ? "status" : "speed"),
       "nectar-status-widgets": (value) => {
         if (value === null || value === undefined) {
-          setStatusWidgets({ left: ["weather"], right: ["battery"] });
+          setStatusWidgets({ left: ["weather"], right: ["layout", "battery"] });
           return;
         }
         try {
@@ -2385,6 +2392,14 @@ function App() {
           <div className="passive-feature" key="battery" {...tip(batteryTooltip(isCharging, batteryLevel, batterySecondsLeft))}>
             <BatteryIcon charging={isCharging} level={batteryLevel} threshold={lowBatteryThreshold} />
             <span className="label">{batteryLevel}%</span>
+          </div>
+        );
+      case "layout":
+        if (!keyboardLayout) return null;
+        return (
+          <div className="passive-feature" key="layout" {...tip(t("widgets.layout.tip"))}>
+            <Languages size={12} strokeWidth={2} />
+            <span className="label">{keyboardLayout}</span>
           </div>
         );
       case "cpu":

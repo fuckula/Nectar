@@ -17,7 +17,7 @@ use crate::state::COMMAND_SENDER;
 use crate::types::{AppInfo, SystemCommand};
 use crate::utils::{get_now_ms, get_setting_str, resolve_shortcut};
 
-use super::{app_index, calc, everything, fuzzy};
+use super::{app_index, calc, currency, everything, fuzzy};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CF_UNICODETEXT: u32 = 13;
@@ -971,9 +971,6 @@ pub async fn search_launcher(app: AppHandle, query: String) -> Result<LauncherSe
     let show_recent = get_setting_str(&app, "nectar-launcher-show-recent")
         .map(|v| v != "false")
         .unwrap_or(true);
-    let file_search_enabled = get_setting_str(&app, "nectar-launcher-file-search")
-        .map(|v| v != "false")
-        .unwrap_or(true);
     let use_everything = get_setting_str(&app, "nectar-launcher-everything")
         .map(|v| v != "false")
         .unwrap_or(true);
@@ -1200,7 +1197,14 @@ pub async fn search_launcher(app: AppHandle, query: String) -> Result<LauncherSe
 
             let mut results: Vec<LauncherItem> = Vec::new();
 
-            // Inline calculator detection
+            // Inline currency conversion ("100 usd to eur"); explicit amount +
+            // two currency tokens, so it never fires on plain typing.
+            if let Some(conv) = currency::parse_conversion(trimmed) {
+                if let Some(item) = currency::conversion_item(&conv) {
+                    results.push(item);
+                }
+            }
+
             let calc_card = calc::evaluate(trimmed).map(|c| {
                 results.push(LauncherItem {
                     id: format!("calc:{}", c.expression),
@@ -1305,51 +1309,11 @@ pub async fn search_launcher(app: AppHandle, query: String) -> Result<LauncherSe
                 }
             }
 
-            // Secondary file search for queries >= 2 chars
-            if file_search_enabled && trimmed.chars().count() >= 2 {
-                let q_owned = trimmed.to_string();
-                let limit = (max_results / 2).max(3);
-                if let Ok((hits, _)) = tauri::async_runtime::spawn_blocking(move || {
-                    everything::search_files(&q_owned, limit, use_everything, gen)
-                })
-                .await
-                {
-                    for hit in hits {
-                        let mut item = file_hit_to_item(hit);
-                        // Keep apps ranked slightly ahead of passive file matches on equal fuzzy scores.
-                        item.score = (item.score - 650).max(50);
-                        results.push(item);
-                    }
-                }
-            }
+            // Plain typing stays apps/system/calc only. File search and web search
+            // need their explicit prefix ("? " files, "g "/"yt "/"gh "/"wiki " web).
 
             results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.len().cmp(&b.title.len())));
-            results.truncate(max_results.saturating_sub(1).max(1));
-
-            // Always offer bottom web-search fallback for non-empty general queries
-            if results.len() < max_results {
-                let url = build_search_url(&custom_search_url, trimmed);
-                results.push(LauncherItem {
-                    id: format!("web:fallback:{trimmed}"),
-                    kind: "web".to_string(),
-                    title: format!("Search the web for \"{trimmed}\""),
-                    subtitle: url.clone(),
-                    badge: "Web".to_string(),
-                    icon: None,
-                    target: url,
-                    args: None,
-                    hwnd: None,
-                    score: -100,
-                    match_indices: Vec::new(),
-                    requires_confirm: false,
-                    actions: vec![LauncherAction {
-                        id: "open".to_string(),
-                        label: "Open in browser".to_string(),
-                        shortcut: Some("Enter".to_string()),
-                        destructive: false,
-                    }],
-                });
-            }
+            results.truncate(max_results);
 
             Ok(LauncherSearchResponse {
                 mode: if calc_card.is_some() { "calc" } else { "all" }.to_string(),

@@ -6,7 +6,6 @@ import {
   MoveHorizontal,
   ListFilter,
   History,
-  FolderSearch,
   Zap,
   Globe,
   MonitorOff,
@@ -55,9 +54,7 @@ export function LauncherTab({ legacyMode = false }: { legacyMode?: boolean }) {
   const [showRecent, setShowRecent] = useState(
     () => localStorage.getItem("nectar-launcher-show-recent") !== "false"
   );
-  const [fileSearch, setFileSearch] = useState(
-    () => localStorage.getItem("nectar-launcher-file-search") !== "false"
-  );
+  // "Search files inline" removed: plain queries never search files; "? " prefix does.
   const [useEverything, setUseEverything] = useState(
     () => localStorage.getItem("nectar-launcher-everything") !== "false"
   );
@@ -109,12 +106,6 @@ export function LauncherTab({ legacyMode = false }: { legacyMode?: boolean }) {
         if (s["nectar-launcher-show-recent"] !== undefined) {
           setShowRecent(String(s["nectar-launcher-show-recent"]) !== "false");
         }
-        if (s["nectar-launcher-file-search"] !== undefined) {
-          setFileSearch(String(s["nectar-launcher-file-search"]) !== "false");
-        }
-        if (s["nectar-launcher-everything"] !== undefined) {
-          setUseEverything(String(s["nectar-launcher-everything"]) !== "false");
-        }
         if (s["nectar-launcher-search-url"] != null) {
           setSearchUrl(
             String(s["nectar-launcher-search-url"]) || "https://www.google.com/search?q={query}"
@@ -137,7 +128,6 @@ export function LauncherTab({ legacyMode = false }: { legacyMode?: boolean }) {
     "nectar-launcher-position": (v) => setPosition(String(v || "center")),
     "nectar-launcher-max-results": (v) => setMaxResults(String(v || "8")),
     "nectar-launcher-show-recent": (v) => setShowRecent(v !== false && v !== "false"),
-    "nectar-launcher-file-search": (v) => setFileSearch(v !== false && v !== "false"),
     "nectar-launcher-everything": (v) => setUseEverything(v !== false && v !== "false"),
     "nectar-launcher-search-url": (v) =>
       setSearchUrl(String(v || "https://www.google.com/search?q={query}")),
@@ -272,17 +262,6 @@ export function LauncherTab({ legacyMode = false }: { legacyMode?: boolean }) {
               type="checkbox"
               checked={showRecent}
               onChange={() => toggleBool("nectar-launcher-show-recent", showRecent, setShowRecent)}
-            />
-            <span className="slider"></span>
-          </label>
-        </SettingRow>
-
-        <SettingRow icon={FolderSearch} label={t("launcher.settings.fileSearch")} desc={t("launcher.settings.fileSearch.desc")}>
-          <label className="toggle-switch">
-            <input
-              type="checkbox"
-              checked={fileSearch}
-              onChange={() => toggleBool("nectar-launcher-file-search", fileSearch, setFileSearch)}
             />
             <span className="slider"></span>
           </label>
