@@ -398,6 +398,14 @@ body {
   font-size: 11px;
 }
 
+/* Slot with nothing to show: invisible but still 30px tall so the surface
+   height never depends on hover state. */
+.traybar-tooltip-bar.empty {
+  border-color: transparent;
+  background: transparent;
+  visibility: hidden;
+}
+
 .traybar-icon-btn:focus-visible,
 .traybar-tool-btn:focus-visible,
 .traybar-refresh-pill:focus-visible {

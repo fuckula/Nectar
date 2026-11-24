@@ -1252,28 +1252,30 @@ export default function TrayBar() {
           </div>
         )}
 
-        {/* Fixed-height footer slot prevents hover-induced ResizeObserver height oscillation */}
-        {showFooterBar && (
-          <div className="traybar-tooltip-bar">
-            {statusNote ? (
-              <span className="traybar-tip-title">{statusNote}</span>
-            ) : hoveredIcon ? (
-              <>
-                {pinnedSet.has(hoveredIcon.key) && (
-                  <span className="traybar-tip-pin" title={t("traybar.pinnedCount")}>
-                    <Pin size={11} strokeWidth={2.2} />
-                  </span>
-                )}
-                <span className="traybar-tip-title">
-                  {customLabels[hoveredIcon.key] || hoveredIcon.title || hoveredIcon.exe_name}
+        {/* Fixed-height footer slot, always mounted: toggling it on hover changes the
+            surface height, the ResizeObserver resizes the host window and the hover is
+            lost, which oscillates. Content swaps inside a stable 30px slot instead. */}
+        <div className={`traybar-tooltip-bar${showFooterBar ? "" : " empty"}`}>
+          {statusNote ? (
+            <span className="traybar-tip-title">{statusNote}</span>
+          ) : hoveredIcon ? (
+            <>
+              {pinnedSet.has(hoveredIcon.key) && (
+                <span className="traybar-tip-pin" title={t("traybar.pinnedCount")}>
+                  <Pin size={11} strokeWidth={2.2} />
                 </span>
-                {hoveredIcon.exe_name && (
-                  <span className="traybar-tip-exe">{hoveredIcon.exe_name}</span>
-                )}
-              </>
-            ) : null}
-          </div>
-        )}
+              )}
+              <span className="traybar-tip-title">
+                {customLabels[hoveredIcon.key] || hoveredIcon.title || hoveredIcon.exe_name}
+              </span>
+              {hoveredIcon.exe_name && (
+                <span className="traybar-tip-exe">{hoveredIcon.exe_name}</span>
+              )}
+            </>
+          ) : footerText ? (
+            <span className="traybar-tip-title">{footerText}</span>
+          ) : null}
+        </div>
       </div>
     </div>
   );
